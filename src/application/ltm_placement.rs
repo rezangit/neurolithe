@@ -12,18 +12,6 @@ use anyhow::{Result, anyhow, bail};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-/// Max L2 distance for a document to count as matching a concept node; beyond
-/// it, the document falls to the inbox.
-///
-/// Tuned from **measured** distances on real data (`placement_debug` over the
-/// live corpus): document→concept L2 distances cluster in ~[0.91, 1.16] (median
-/// 1.05) for unit-normalized `text-embedding-004`, i.e. cosine ~0.33–0.59 — much
-/// larger than a category label suggests. 1.10 (cosine ≈ 0.40) files the
-/// confident majority under their nearest branch while leaving the ambiguous
-/// tail in the inbox. Earlier guesses (0.5, then 0.85) were below the whole
-/// distribution and filed 100% to the inbox (field-report §3).
-const DEFAULT_MAX_DISTANCE: f64 = 1.10;
-
 /// Embed every concept node that lacks a placement vector, deriving the vector
 /// from the concept's curated identity (`name: summary`) — **not** its rolling
 /// summary, so filing targets stay stable as documents accumulate. Idempotent:
@@ -94,10 +82,13 @@ pub struct LtmPlacement {
 }
 
 impl LtmPlacement {
-    pub fn new(repo: Arc<dyn LtmRepository>) -> Self {
+    /// `max_distance`: the placement threshold — a document attaches to its
+    /// nearest concept only within this vector distance (resolved per embedding
+    /// model or from `[ltm] placement_max_distance`; see `domain::thresholds`).
+    pub fn new(repo: Arc<dyn LtmRepository>, max_distance: f64) -> Self {
         Self {
             repo,
-            max_distance: DEFAULT_MAX_DISTANCE,
+            max_distance,
             max_summary_len: DEFAULT_MAX_SUMMARY_LEN,
         }
     }
@@ -390,7 +381,10 @@ mod tests {
             .unwrap();
         repo.add_edge(&TreeEdge::new(root, inbox)).unwrap();
 
-        let svc = LtmPlacement::new(repo.clone() as Arc<dyn LtmRepository>);
+        let svc = LtmPlacement::new(
+            repo.clone() as Arc<dyn LtmRepository>,
+            crate::domain::thresholds::TEXT_EMBEDDING_004.placement_max_distance,
+        );
         Fixture {
             svc,
             repo,

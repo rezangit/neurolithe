@@ -94,10 +94,17 @@ fn merge_payload(existing: &serde_json::Value, new: &serde_json::Value) -> serde
 }
 
 impl ConflictResolver {
+    /// The legacy `text-embedding-004` thresholds. Production code resolves
+    /// thresholds per embedding model and uses [`Self::from_thresholds`].
     pub fn new() -> Self {
+        Self::from_thresholds(&crate::domain::thresholds::Thresholds::text_embedding_004())
+    }
+
+    /// A resolver using the resolved (config / per-model) thresholds.
+    pub fn from_thresholds(thresholds: &crate::domain::thresholds::Thresholds) -> Self {
         Self {
-            assimilation_threshold: 0.15,  // very close match → same fact
-            accommodation_threshold: 0.35, // somewhat close → related, update
+            assimilation_threshold: thresholds.assimilation.value,
+            accommodation_threshold: thresholds.accommodation.value,
         }
     }
 
@@ -323,5 +330,52 @@ mod tests {
         assert_eq!(node.payload["fact"], "Bob likes tea");
         assert_eq!(node.payload["tags"], json!(["pref", "drink"]));
         assert_eq!(node.support_count, 2);
+    }
+
+    fn thresholds(assimilation: f64, accommodation: f64) -> crate::domain::thresholds::Thresholds {
+        crate::domain::thresholds::Thresholds::resolve(
+            "unknown:model",
+            crate::domain::thresholds::ThresholdOverrides {
+                placement_max_distance: None,
+                assimilation: Some(assimilation),
+                accommodation: Some(accommodation),
+            },
+        )
+        .unwrap()
+        .0
+    }
+
+    /// The resolver uses the resolved thresholds, not built-in constants: a
+    /// neighbour at 0.25 is modified under 0.15/0.35 but is a separate fact
+    /// under 0.10/0.20, and a neighbour at 0.10 is only assimilated when the
+    /// assimilation threshold covers it.
+    #[test]
+    fn resolved_thresholds_drive_the_decision() {
+        let (repo, _) = setup(json!({ "fact": "Alice lives in Paris" }));
+        let strict = ConflictResolver::from_thresholds(&thresholds(0.10, 0.20));
+        let result = strict
+            .resolve(
+                &repo,
+                &E_NEAR,
+                &tenant(),
+                &json!({ "fact": "Alice lives in Lyon" }),
+            )
+            .unwrap();
+        assert!(matches!(result, AdaptationResult::AccommodateCreate));
+
+        let (repo, id) = setup(json!({ "fact": "Bob likes tea" }));
+        let tight = ConflictResolver::from_thresholds(&thresholds(0.05, 0.20));
+        let result = tight
+            .resolve(
+                &repo,
+                &E_SAME,
+                &tenant(),
+                &json!({ "fact": "Bob enjoys tea" }),
+            )
+            .unwrap();
+        assert!(
+            matches!(result, AdaptationResult::AccommodatedModify(m) if m == id),
+            "0.10 is beyond assimilation 0.05 but within accommodation 0.20"
+        );
     }
 }

@@ -133,6 +133,32 @@ pub struct StoreConfig {
     /// the generic default spine. Only read for `[ltm]`; ignored under `[stm]`.
     #[serde(default)]
     pub spine: Vec<crate::domain::ltm::SpineSeed>,
+    /// `[ltm] placement_max_distance` — a document is filed under its nearest
+    /// concept only within this vector distance (else the inbox). Unset → the
+    /// embedding model's default (see `domain::thresholds`). `[ltm]` only.
+    #[serde(default)]
+    pub placement_max_distance: Option<f64>,
+    /// `[stm] assimilation_threshold` — a new fact this close to an existing
+    /// one is the same fact (reinforced). Unset → model default. `[stm]` only.
+    #[serde(default)]
+    pub assimilation_threshold: Option<f64>,
+    /// `[stm] accommodation_threshold` — this close (but beyond assimilation),
+    /// the new fact refines the existing one. Must exceed the assimilation
+    /// threshold. Unset → model default. `[stm]` only.
+    #[serde(default)]
+    pub accommodation_threshold: Option<f64>,
+}
+
+impl AppConfig {
+    /// The explicitly configured distance thresholds (each optional); the rest
+    /// are resolved per embedding model by `Thresholds::resolve`.
+    pub fn threshold_overrides(&self) -> crate::domain::thresholds::ThresholdOverrides {
+        crate::domain::thresholds::ThresholdOverrides {
+            placement_max_distance: self.ltm.placement_max_distance,
+            assimilation: self.stm.assimilation_threshold,
+            accommodation: self.stm.accommodation_threshold,
+        }
+    }
 }
 
 impl StoreConfig {
@@ -523,6 +549,46 @@ impl AppConfig {
                 problems.push(format!("{name} must be a positive number (got {v})"));
             }
         }
+        // Distance thresholds: optional, but when set they must be usable, and
+        // each belongs to one section (a misplaced key would be silently unused).
+        for (name, v) in [
+            (
+                "ltm.placement_max_distance",
+                self.ltm.placement_max_distance,
+            ),
+            (
+                "stm.assimilation_threshold",
+                self.stm.assimilation_threshold,
+            ),
+            (
+                "stm.accommodation_threshold",
+                self.stm.accommodation_threshold,
+            ),
+        ] {
+            if let Some(v) = v
+                && !(v.is_finite() && v > 0.0)
+            {
+                problems.push(format!("{name} must be a finite number > 0 (got {v})"));
+            }
+        }
+        if let (Some(a), Some(c)) = (
+            self.stm.assimilation_threshold,
+            self.stm.accommodation_threshold,
+        ) && a >= c
+        {
+            problems.push(format!(
+                "stm.assimilation_threshold ({a}) must be smaller than stm.accommodation_threshold ({c})"
+            ));
+        }
+        if self.stm.placement_max_distance.is_some() {
+            problems.push("placement_max_distance belongs under [ltm], not [stm]".into());
+        }
+        if self.ltm.assimilation_threshold.is_some() || self.ltm.accommodation_threshold.is_some() {
+            problems.push(
+                "assimilation_threshold / accommodation_threshold belong under [stm], not [ltm]"
+                    .into(),
+            );
+        }
         if self.llm.request_timeout_secs == 0 {
             problems.push("llm.request_timeout_secs must be > 0".into());
         }
@@ -770,6 +836,65 @@ mod tests {
 
     /// The chat LLM is optional: `none` needs no model; `local` is not a chat
     /// provider; a real chat provider needs a model name.
+    /// Distance thresholds: unset by default, read from their sections (env
+    /// override too), validated (finite, > 0, assimilation < accommodation),
+    /// and a key in the wrong section is rejected rather than silently ignored.
+    #[test]
+    fn test_threshold_keys_parse_and_validate() {
+        let cfg = valid();
+        assert_eq!(
+            cfg.threshold_overrides(),
+            crate::domain::thresholds::ThresholdOverrides::default()
+        );
+
+        let env: HashMap<String, String> = [
+            ("NEUROLITHE__LTM__PLACEMENT_MAX_DISTANCE", "0.9"),
+            ("NEUROLITHE__STM__ASSIMILATION_THRESHOLD", "0.2"),
+            ("NEUROLITHE__STM__ACCOMMODATION_THRESHOLD", "0.4"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let cfg = AppConfig::build(None, Some(env)).unwrap();
+        let o = cfg.threshold_overrides();
+        assert_eq!(o.placement_max_distance, Some(0.9));
+        assert_eq!(o.assimilation, Some(0.2));
+        assert_eq!(o.accommodation, Some(0.4));
+        cfg.validate().expect("valid thresholds");
+
+        for (set, needle) in [
+            (
+                (|c: &mut AppConfig| c.ltm.placement_max_distance = Some(0.0))
+                    as fn(&mut AppConfig),
+                "ltm.placement_max_distance must be a finite number > 0",
+            ),
+            (
+                |c: &mut AppConfig| c.stm.assimilation_threshold = Some(f64::NAN),
+                "stm.assimilation_threshold must be a finite number > 0",
+            ),
+            (
+                |c: &mut AppConfig| {
+                    c.stm.assimilation_threshold = Some(0.4);
+                    c.stm.accommodation_threshold = Some(0.3);
+                },
+                "must be smaller than stm.accommodation_threshold",
+            ),
+            (
+                |c: &mut AppConfig| c.stm.placement_max_distance = Some(1.0),
+                "placement_max_distance belongs under [ltm]",
+            ),
+            (
+                |c: &mut AppConfig| c.ltm.accommodation_threshold = Some(0.3),
+                "belong under [stm]",
+            ),
+        ] {
+            let mut cfg = valid();
+            set(&mut cfg);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{err}");
+        }
+    }
+
     #[test]
     fn test_validate_chat_provider_rules() {
         let cfg = valid();

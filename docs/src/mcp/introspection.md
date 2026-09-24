@@ -12,4 +12,4 @@ and never call an LLM.
 | `inspect_node` | `id` (required), `child_limit` (1–500, default 50), `child_offset`, `summary_max_chars` (0 = full, default 200) | One LTM node: summary, parents, children and document leaves (paged), plus `child_count` / `leaf_count` totals |
 | `subtree` | `node` (required), `depth` (1–10, default 2) | A branch of concepts below a node |
 | `trace_dataId` | `dataId` (required) | Where a document lives: its LTM leaf, ancestor branch, and how many STM facts carry it |
-| `placement_debug` | `sample` (1–500, default 30) | For a sample of document leaves, the distance to their nearest concept, for tuning the placement threshold |
+| `placement_debug` | `sample` (1–500, default 30) | `{thresholds, probes}`: the effective distance thresholds, each with its `source` (`config` / `model_default` / `fallback`), and for a sample of document leaves the distance to their nearest concept. Used to tune the thresholds (see Configuration → Distance thresholds) |

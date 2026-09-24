@@ -287,6 +287,7 @@ mod tests {
             Arc::new(StubLlm),
             DIM,
             TENANT,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         let reset = ResetService::new(
             stm.clone() as Arc<dyn MemoryRepository>,

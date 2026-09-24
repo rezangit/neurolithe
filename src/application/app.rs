@@ -27,6 +27,7 @@ impl NeurolitheApp {
         llm_client: Arc<dyn LlmClient>,
         default_half_life_days: f64,
         working_half_life_days: f64,
+        thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
             memory_repo: memory_repo.clone(),
@@ -37,6 +38,9 @@ impl NeurolitheApp {
                 llm_client.clone(),
                 default_half_life_days,
                 working_half_life_days,
+                crate::domain::cognition::conflict_resolver::ConflictResolver::from_thresholds(
+                    thresholds,
+                ),
             ),
             session_manager: SessionManager::new(
                 memory_repo.clone(),
@@ -269,6 +273,7 @@ mod tests {
             Arc::new(StubLlm { fail }),
             7.0,
             30.0 / 1440.0,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         )
     }
 
@@ -342,6 +347,7 @@ mod tests {
             Arc::new(NoLlm),
             7.0,
             30.0 / 1440.0,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         let ctx = app
             .push_dialogue("t1", "s1", "remember this", "reality")
@@ -377,5 +383,78 @@ mod tests {
         fn chat_available(&self) -> bool {
             false
         }
+    }
+
+    /// Extracts the dialogue itself as one fact; "alpha …" embeds at E and
+    /// "beta …" at L2 0.25 from it.
+    struct TwoFacts;
+
+    #[async_trait]
+    impl LlmClient for TwoFacts {
+        async fn extract_facts(
+            &self,
+            dialogue: &str,
+            _c: &[CclDefinition],
+        ) -> Result<Vec<ExtractedFact>> {
+            Ok(vec![ExtractedFact {
+                fact: dialogue.to_string(),
+                ccl: "reality".into(),
+                tags: vec![],
+                relationships: vec![],
+            }])
+        }
+        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
+            Ok("d".into())
+        }
+        async fn embed_text(&self, t: &str) -> Result<Vec<f32>> {
+            Ok(if t.starts_with("beta") {
+                vec![1.0, 0.25, 0.0, 0.0]
+            } else {
+                vec![1.0, 0.0, 0.0, 0.0]
+            })
+        }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            Ok("summary".into())
+        }
+    }
+
+    async fn facts_after_two_pushes(accommodation: f64) -> usize {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&conn, 4).unwrap();
+        let thresholds = crate::domain::thresholds::Thresholds::resolve(
+            "unknown:model",
+            crate::domain::thresholds::ThresholdOverrides {
+                placement_max_distance: None,
+                assimilation: Some(0.1),
+                accommodation: Some(accommodation),
+            },
+        )
+        .unwrap()
+        .0;
+        let app = NeurolitheApp::new(
+            Arc::new(SqliteMemoryRepository::new(conn)),
+            Arc::new(TwoFacts),
+            7.0,
+            1.0,
+            &thresholds,
+        );
+        app.push_dialogue("t", "s", "alpha fact", "reality")
+            .await
+            .unwrap();
+        app.push_dialogue("t", "s", "beta fact", "reality")
+            .await
+            .unwrap();
+        let export: serde_json::Value =
+            serde_json::from_str(&app.export_tenant("t").await.unwrap()).unwrap();
+        export["extracted_facts"].as_array().unwrap().len()
+    }
+
+    /// The thresholds passed to the app reach the sleep worker's conflict
+    /// resolver: two facts 0.25 apart merge under accommodation 0.35 but stay
+    /// separate under 0.20.
+    #[tokio::test]
+    async fn thresholds_reach_the_sleep_workers_resolver() {
+        assert_eq!(facts_after_two_pushes(0.35).await, 1, "merged");
+        assert_eq!(facts_after_two_pushes(0.20).await, 2, "kept apart");
     }
 }

@@ -20,6 +20,7 @@ use crate::application::workspace::{
 };
 use crate::domain::ltm::LtmRepository;
 use crate::domain::ports::{EmbeddingIdentity, LlmClient, MemoryRepository, embedding_identity};
+use crate::domain::thresholds::Thresholds;
 use crate::infrastructure::config::AppConfig;
 use crate::infrastructure::database::{
     LTM_FILE, MemoryStores, STM_FILE, delete_workspace_dir, export_workspace, list_workspace_dirs,
@@ -54,6 +55,8 @@ pub fn build_llm(config: &AppConfig) -> Arc<dyn LlmClient> {
 pub struct WorkspaceRepos {
     pub stm: Arc<dyn MemoryRepository>,
     pub ltm: Arc<dyn LtmRepository>,
+    /// The process's effective distance thresholds (resolved once).
+    pub thresholds: Thresholds,
 }
 
 /// Log the notes (migration backups, warnings) from opening a workspace.
@@ -95,6 +98,8 @@ pub struct SqliteWorkspaceHost {
     llm: Arc<dyn LlmClient>,
     /// Resolved once, on first open.
     identity: tokio::sync::OnceCell<EmbeddingIdentity>,
+    /// Resolved once from the identity + config (logged when resolved).
+    thresholds: tokio::sync::OnceCell<Thresholds>,
 }
 
 impl SqliteWorkspaceHost {
@@ -103,6 +108,7 @@ impl SqliteWorkspaceHost {
             config,
             llm,
             identity: tokio::sync::OnceCell::new(),
+            thresholds: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -118,11 +124,40 @@ impl SqliteWorkspaceHost {
             .cloned()
     }
 
+    /// The effective distance thresholds for this process: config values,
+    /// else the embedding model's defaults, else the generic fallback (which
+    /// logs one warning suggesting calibration). Resolved and logged once.
+    pub async fn thresholds(&self) -> Result<Thresholds> {
+        self.thresholds
+            .get_or_try_init(|| async {
+                let identity = self.identity().await?;
+                let (thresholds, warning) =
+                    Thresholds::resolve(&identity.model, self.config.threshold_overrides())?;
+                if let Some(warning) = warning {
+                    tracing::warn!("{warning}");
+                }
+                tracing::info!(
+                    "distance thresholds for {}: placement {} ({:?}), assimilation {} ({:?}), accommodation {} ({:?})",
+                    thresholds.embedding_model,
+                    thresholds.placement_max_distance.value,
+                    thresholds.placement_max_distance.source,
+                    thresholds.assimilation.value,
+                    thresholds.assimilation.source,
+                    thresholds.accommodation.value,
+                    thresholds.accommodation.source,
+                );
+                Ok::<_, anyhow::Error>(thresholds)
+            })
+            .await
+            .cloned()
+    }
+
     /// Open (creating on demand) a workspace's stores — migrating them and
     /// checking the embedder identity — and seed its spine from config.
     pub async fn open_repos(&self, name: &str) -> Result<WorkspaceRepos> {
         validate_name(name)?;
         let identity = self.identity().await?;
+        let thresholds = self.thresholds().await?;
         let (MemoryStores { stm, ltm, lease }, notes) =
             open_workspace_stores(&self.dir(name), &identity)?;
         log_open_notes(&notes);
@@ -131,7 +166,11 @@ impl SqliteWorkspaceHost {
             Arc::new(SqliteMemoryRepository::new(stm).with_lease(lease.clone()));
         let ltm: Arc<dyn LtmRepository> = Arc::new(SqliteLtmRepository::new(ltm).with_lease(lease));
         ltm.seed_spine_from(&self.config.ltm.spine_or_default())?;
-        Ok(WorkspaceRepos { stm, ltm })
+        Ok(WorkspaceRepos {
+            stm,
+            ltm,
+            thresholds,
+        })
     }
 
     /// Give the spine placement vectors so documents file under a concept
@@ -151,6 +190,7 @@ impl SqliteWorkspaceHost {
             self.llm.clone(),
             self.config.decay.default_half_life_days,
             self.config.decay.working_half_life_days(),
+            &repos.thresholds,
         ));
         self.services_with_app(repos, app)
     }
@@ -167,6 +207,7 @@ impl SqliteWorkspaceHost {
             introspection: Arc::new(IntrospectionService::new(
                 repos.stm.clone(),
                 repos.ltm.clone(),
+                repos.thresholds.clone(),
             )),
             // Same recall service as the bus door: STM hybrid search +
             // reference-returning LTM recall.
@@ -175,7 +216,7 @@ impl SqliteWorkspaceHost {
                 LtmRetrieval::new(repos.ltm.clone()),
                 self.llm.clone(),
             ),
-            documents: DocumentService::new(repos.ltm.clone(), self.llm.clone()),
+            documents: DocumentService::new(repos.ltm.clone(), self.llm.clone(), &repos.thresholds),
         }
     }
 }
@@ -487,6 +528,7 @@ mod full {
             llm.clone(),
             config.decay.default_half_life_days,
             config.decay.working_half_life_days(),
+            &repos.thresholds,
         ));
         let ingestion = Arc::new(IngestionService::new(
             stm_repo.clone(),
@@ -494,6 +536,7 @@ mod full {
             llm.clone(),
             dim,
             FEEDER_TENANT,
+            &repos.thresholds,
         ));
 
         // Inbox gardener: re-home inbox documents that now match a concept using
@@ -517,6 +560,7 @@ mod full {
             ingestion.clone(),
             llm.clone(),
             dim,
+            &repos.thresholds,
         ));
         let feeder_stats = Arc::new(FeederStats::default());
 
@@ -714,6 +758,53 @@ mod tests {
             .await
             .unwrap();
         (Rc::new(manager), config)
+    }
+
+    /// Thresholds are resolved once from config + the embedder's model and
+    /// reach the services: a configured placement distance is reported (as
+    /// `config`) by `placement_debug`, and the unset values come from the
+    /// fallback (the stub embedder's model id is unknown).
+    #[tokio::test]
+    async fn test_thresholds_resolved_from_config_reach_services() {
+        use crate::domain::thresholds::{FALLBACK, ThresholdSource};
+        let home = tempfile::tempdir().unwrap();
+        let mut config = config_in(home.path());
+        config.ltm.placement_max_distance = Some(0.42);
+        let host = SqliteWorkspaceHost::new(config.clone(), Arc::new(StubLlm));
+
+        let repos = host.open_repos("default").await.unwrap();
+        let t = &repos.thresholds;
+        assert_eq!(t.placement_max_distance.value, 0.42);
+        assert_eq!(t.placement_max_distance.source, ThresholdSource::Config);
+        assert_eq!(t.assimilation.value, FALLBACK.assimilation);
+        assert_eq!(t.assimilation.source, ThresholdSource::Fallback);
+        assert_eq!(host.thresholds().await.unwrap(), *t, "resolved once");
+
+        let services = host.services(&repos);
+        let debug = services.introspection.placement_debug(5).unwrap();
+        assert_eq!(debug.thresholds, *t);
+        let json = serde_json::to_value(&debug).unwrap();
+        assert_eq!(
+            json["thresholds"]["placement_max_distance"]["source"],
+            "config"
+        );
+        assert_eq!(json["thresholds"]["assimilation"]["source"], "fallback");
+        assert!(json["probes"].is_array());
+    }
+
+    /// An invalid combination (config assimilation above the model/fallback
+    /// accommodation) fails at startup with a clear message.
+    #[tokio::test]
+    async fn test_invalid_resolved_thresholds_fail_at_open() {
+        let home = tempfile::tempdir().unwrap();
+        let mut config = config_in(home.path());
+        config.stm.assimilation_threshold = Some(5.0);
+        let host = SqliteWorkspaceHost::new(config, Arc::new(StubLlm));
+        let err = match host.open_repos("default").await {
+            Ok(_) => panic!("must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("must be smaller"), "{err}");
     }
 
     fn scalar(path: &Path, sql: &str) -> i64 {

@@ -55,6 +55,8 @@ pub struct WriteService {
     llm: Arc<dyn LlmClient>,
     /// STM embedding dimension, for zero-vector graph-anchor (subject) nodes.
     stm_vector_dim: usize,
+    /// Resolved placement threshold for LTM notes (see `domain::thresholds`).
+    placement_max_distance: f64,
 }
 
 impl WriteService {
@@ -64,6 +66,7 @@ impl WriteService {
         ingestion: Arc<IngestionService>,
         llm: Arc<dyn LlmClient>,
         stm_vector_dim: usize,
+        thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
             stm,
@@ -71,6 +74,7 @@ impl WriteService {
             ingestion,
             llm,
             stm_vector_dim,
+            placement_max_distance: thresholds.placement_max_distance.value,
         }
     }
 
@@ -207,7 +211,7 @@ impl WriteService {
         let data_id = format!("note_{}", Uuid::now_v7());
         let embedding = self.llm.embed_text(text).await?;
 
-        let placement = LtmPlacement::new(self.ltm.clone());
+        let placement = LtmPlacement::new(self.ltm.clone(), self.placement_max_distance);
         let doc = DocumentToPlace {
             name: leaf_name(text),
             summary: text.to_string(),
@@ -303,6 +307,7 @@ mod tests {
             Arc::new(StubLlm),
             DIM,
             AGENT_TENANT,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         ));
         let write = WriteService::new(
             stm.clone() as Arc<dyn MemoryRepository>,
@@ -310,6 +315,7 @@ mod tests {
             ingest.clone(),
             Arc::new(StubLlm),
             DIM,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         Harness {
             write,

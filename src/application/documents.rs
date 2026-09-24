@@ -53,14 +53,24 @@ pub struct RememberedDocument {
 /// Files documents into LTM (see module docs).
 pub struct DocumentService {
     ltm: Arc<dyn LtmRepository>,
+    /// Resolved placement threshold (see `domain::thresholds`).
+    placement_max_distance: f64,
     /// Embeddings are required; summaries are used only when
     /// [`LlmClient::chat_available`].
     llm: Arc<dyn LlmClient>,
 }
 
 impl DocumentService {
-    pub fn new(ltm: Arc<dyn LtmRepository>, llm: Arc<dyn LlmClient>) -> Self {
-        Self { ltm, llm }
+    pub fn new(
+        ltm: Arc<dyn LtmRepository>,
+        llm: Arc<dyn LlmClient>,
+        thresholds: &crate::domain::thresholds::Thresholds,
+    ) -> Self {
+        Self {
+            ltm,
+            placement_max_distance: thresholds.placement_max_distance.value,
+            llm,
+        }
     }
 
     pub async fn remember(&self, doc: RememberDocument) -> Result<RememberedDocument> {
@@ -92,7 +102,8 @@ impl DocumentService {
 
         // Upsert: file the new version, then drop every older copy and re-roll
         // the parents they leave (see `LtmPlacement::replace`).
-        let (placed, replaced) = LtmPlacement::new(self.ltm.clone()).replace(&DocumentToPlace {
+        let (placed, replaced) = LtmPlacement::new(self.ltm.clone(), self.placement_max_distance)
+            .replace(&DocumentToPlace {
             name: title,
             summary,
             embedding,
@@ -193,6 +204,9 @@ mod tests {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             Ok(if text.contains("invoice") {
                 vec![1.0, 0.0, 0.0, 0.0]
+            } else if text.contains("receipt") {
+                // L2 0.5 from the `documents` concept.
+                vec![1.0, 0.5, 0.0, 0.0]
             } else {
                 vec![0.0, 0.0, 0.0, 1.0]
             })
@@ -232,7 +246,15 @@ mod tests {
             summarize_fails,
             summaries: AtomicUsize::new(0),
         });
-        (DocumentService::new(repo.clone(), stub.clone()), repo, stub)
+        (
+            DocumentService::new(
+                repo.clone(),
+                stub.clone(),
+                &crate::domain::thresholds::Thresholds::text_embedding_004(),
+            ),
+            repo,
+            stub,
+        )
     }
 
     fn doc(title: &str, text: &str, data_id: Option<&str>) -> RememberDocument {
@@ -392,7 +414,10 @@ mod tests {
     #[tokio::test]
     async fn upsert_heals_duplicate_leaves() {
         let (svc, repo, _) = setup(false, false);
-        let placement = LtmPlacement::new(repo.clone());
+        let placement = LtmPlacement::new(
+            repo.clone(),
+            crate::domain::thresholds::TEXT_EMBEDDING_004.placement_max_distance,
+        );
         for name in ["copy a", "copy b"] {
             placement
                 .place(&DocumentToPlace {
@@ -420,6 +445,36 @@ mod tests {
         assert_eq!(left[0].id, Some(out.leaf_id));
         assert!(out.updated);
         assert!(!children_named(&repo, "inbox").summary.contains("copy a"));
+    }
+
+    /// The resolved placement threshold decides filing: a document at distance
+    /// 0.5 from `documents` files there under 1.10, but into the inbox under 0.3.
+    #[tokio::test]
+    async fn placement_threshold_reaches_remember_document() {
+        let (loose, _, _) = setup(false, false);
+        let out = loose
+            .remember(doc("r", "a receipt", Some("r1")))
+            .await
+            .unwrap();
+        assert_eq!(out.concept_path, vec!["root", "documents"]);
+
+        let (svc, repo, stub) = setup(false, false);
+        let strict = crate::domain::thresholds::Thresholds::resolve(
+            "unknown:model",
+            crate::domain::thresholds::ThresholdOverrides {
+                placement_max_distance: Some(0.3),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        drop(svc);
+        let svc = DocumentService::new(repo.clone(), stub.clone(), &strict);
+        let out = svc
+            .remember(doc("r", "a receipt", Some("r2")))
+            .await
+            .unwrap();
+        assert_eq!(out.concept_path, vec!["root", "inbox"]);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
-//! Regression tests for defects found in the 2026-09 QA review
-//! (`project-review/reports/03-qa.md`) and later review rounds. Each test
+//! Regression tests for defects found in the 2026-09 QA review and later
+//! review rounds. Each test
 //! asserts the CORRECT behaviour and is tagged with its issue ID.
 mod common;
 

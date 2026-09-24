@@ -47,6 +47,7 @@ impl SleepWorker {
         llm_client: Arc<dyn LlmClient>,
         default_half_life_days: f64,
         working_half_life_days: f64,
+        conflict_resolver: ConflictResolver,
     ) -> Self {
         Self {
             memory_repo,
@@ -55,7 +56,7 @@ impl SleepWorker {
                 default_half_life_days,
                 working_half_life_days,
             ),
-            conflict_resolver: ConflictResolver::new(),
+            conflict_resolver,
         }
     }
 
@@ -253,7 +254,7 @@ mod tests {
         let llm = Arc::new(FloodLlm {
             embeds: AtomicUsize::new(0),
         });
-        let worker = SleepWorker::new(repo.clone(), llm.clone(), 7.0, 1.0);
+        let worker = SleepWorker::new(repo.clone(), llm.clone(), 7.0, 1.0, ConflictResolver::new());
         let tenant = TenantId("t".into());
         let ep = repo
             .store_episode(&Episode {

@@ -64,8 +64,19 @@ provider = "none"
 # tree. Both live in <home>/workspaces/<name>/; their vector size follows the
 # embedder and is recorded in each store.
 
+# Distance thresholds (optional). Defaults are picked per embedding model; see
+# docs/src/configuration.md ("Distance thresholds"). Calibrate placement with
+# the `placement_debug` MCP tool, which reports the values in effect.
+# [ltm]
+# placement_max_distance = 0.96   # file under the nearest concept within this L2 distance
+# [stm]
+# assimilation_threshold = 0.40   # a new fact this close IS the existing fact
+# accommodation_threshold = 0.58  # this close: the new fact refines the existing one
+
 # LTM spine: the curated top branches documents are filed under (plus an
 # implicit "inbox"). Default: "notes" and "documents". `path` is "/"-separated.
+# Define your own branches, each with a descriptive `description`: with the
+# generic default spine nearly every document lands in "inbox".
 # [[ltm.spine]]
 # path = "work/projects"
 # description = "Active projects: plans, decisions, status."

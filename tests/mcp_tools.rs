@@ -204,7 +204,17 @@ fn ltm_introspection_tools_walk_the_tree() {
 
     let dbg = h.call("placement_debug", json!({"sample": 5}));
     dbg.assert_ok();
-    let _ = dbg.json();
+    let dbg = dbg.json();
+    // The effective thresholds and where each came from, next to the probes.
+    for key in ["placement_max_distance", "assimilation", "accommodation"] {
+        let t = &dbg["thresholds"][key];
+        assert!(t["value"].as_f64().is_some_and(|v| v > 0.0), "{dbg}");
+        assert!(
+            ["config", "model_default", "fallback"].contains(&t["source"].as_str().unwrap_or("")),
+            "{dbg}"
+        );
+    }
+    assert!(dbg["probes"].is_array(), "{dbg}");
 }
 
 #[test]

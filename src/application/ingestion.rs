@@ -85,11 +85,12 @@ impl IngestionService {
         llm: Arc<dyn LlmClient>,
         embedding_dim: usize,
         tenant: impl Into<String>,
+        thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
-            placement: LtmPlacement::new(ltm),
+            placement: LtmPlacement::new(ltm, thresholds.placement_max_distance.value),
             distiller: Distiller::new(llm, embedding_dim),
-            conflict_resolver: ConflictResolver::new(),
+            conflict_resolver: ConflictResolver::from_thresholds(thresholds),
             stm,
             tenant: TenantId(tenant.into()),
         }
@@ -302,6 +303,7 @@ pub(crate) mod tests {
             llm,
             DIM,
             TENANT,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         Harness {
             svc,

@@ -87,6 +87,82 @@ Seeding is additive: new branches are added to an existing tree, and existing
 branches keep their documents. Describe each branch well, because the
 description is what documents are matched against.
 
+With the generic default spine, placement is essentially "inbox": every
+document is about equally far from `notes` and `documents`, so few are filed
+under either. For filing to work, define descriptive `[[ltm.spine]]` branches,
+each with a `description` of what belongs there. See also
+[Distance thresholds](#distance-thresholds).
+
+## Distance thresholds
+
+Three vector-distance thresholds decide what NeuroLithe does with a new piece of
+memory. Their right values depend on the embedding model, because every model
+has its own distance scale:
+
+| Key | Section | Decides |
+|---|---|---|
+| `placement_max_distance` | `[ltm]` | A document is filed under its nearest spine concept only within this distance; otherwise it goes to `inbox`. |
+| `assimilation_threshold` | `[stm]` | A new fact at or below this distance from an existing fact *is* that fact: the existing one is reinforced and keeps its text. |
+| `accommodation_threshold` | `[stm]` | At or below this distance (but beyond assimilation), the new fact *refines* the existing one, which takes the new text. Beyond it, a new fact is created. Must be larger than `assimilation_threshold`. |
+
+All three are optional. For each one, NeuroLithe uses the first of:
+
+1. the value in your config;
+2. the embedding model's default from the table below;
+3. the generic fallback (the `bge-small-en-v1.5` values). NeuroLithe then logs
+   one warning at startup that suggests calibrating.
+
+| Embedding model (canonical id) | placement | assimilation | accommodation |
+|---|---|---|---|
+| `local:bge-small-en-v1.5` (default), `local:bge-small-en-v1.5-q` | 0.96 | 0.40 | 0.58 |
+| `text-embedding-004` (any provider, e.g. `vertex:`) | 1.10 | 0.15 | 0.35 |
+| anything else | fallback: 0.96 | 0.40 | 0.58 |
+
+The `bge-small-en-v1.5` values were calibrated with the real model on a small
+English test set (accurate to about ±0.02). At these values, 70% of clear
+documents are filed correctly, paraphrases merge, and distinct facts about the
+same entity are not overwritten.
+
+> **Placement needs a descriptive spine.** With the generic default spine
+> (`notes`, `documents`), every document is about equally far from both
+> concepts (≈ 0.96), so placement is essentially "everything goes to `inbox`",
+> whatever the threshold. For filing to work, define your own
+> [`[[ltm.spine]]`](#the-long-term-memory-spine) branches, each with a
+> `description` that says what belongs there.
+
+Distances are sqlite-vec L2 distances (for unit-length embeddings,
+L2 = √(2 − 2·cosine)). All values must be finite and greater than 0. A key in
+the wrong section is rejected, so it can't be silently ignored.
+
+```toml
+[ltm]
+placement_max_distance = 0.9
+
+[stm]
+assimilation_threshold = 0.25
+accommodation_threshold = 0.40
+```
+
+### Calibrating with `placement_debug`
+
+The `placement_debug` MCP tool reports the effective `thresholds`, each with its
+`source` (`config`, `model_default` or `fallback`). It also reports `probes`: for
+a sample of stored documents, the distance to their nearest concept. To tune
+placement:
+
+1. Store a representative set of documents (for example with
+   `remember_document`).
+2. Call `placement_debug` with `sample` 100–500 and look at the `distance`
+   values.
+3. Set `placement_max_distance` just above the distances of documents that
+   clearly belong to their concept. Documents with larger distances go to
+   `inbox`. A value below almost all probes files everything into `inbox`.
+4. Restart. The resolved values are also logged at startup.
+
+The STM thresholds are tuned the same way, on the distance between facts you
+would or wouldn't want merged. Keep `assimilation_threshold` small (near
+duplicates only), because merged facts lose their separate wording.
+
 ## Kafka mode
 
 `[kafka]`, `[kafka.topics]` and `[kafka.client]` configure the optional daemon.

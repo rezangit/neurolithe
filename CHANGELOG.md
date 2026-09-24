@@ -59,6 +59,7 @@ MCP tool surface all change. See *Upgrading* below.
   `RUST_LOG`, then `[log] level`.
 - **Graceful shutdown** on SIGINT/SIGTERM in both modes, with a WAL
   checkpoint. The daemon also drains its Kafka loops, commits and flushes.
+- **Configurable distance thresholds**: `[ltm] placement_max_distance`, `[stm] assimilation_threshold` and `[stm] accommodation_threshold`, with per-embedding-model defaults (`bge-small-en-v1.5`, `text-embedding-004`) and a warned fallback for other models. `placement_debug` now returns `{thresholds, probes}` and shows where each value came from.
 
 ### Changed
 
