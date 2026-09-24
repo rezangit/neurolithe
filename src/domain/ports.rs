@@ -69,20 +69,35 @@ pub trait MemoryRepository {
         data_id: &str,
     ) -> Result<Option<i64>>;
 
-    /// Find nodes semantically similar to the given embedding (for conflict resolution)
+    /// Find active nodes of one tenant within `threshold` vector distance of
+    /// `embedding`, nearest first, each paired with its distance (for conflict
+    /// resolution). Returns at most `limit` nodes.
     fn find_similar_nodes(
         &self,
         embedding: &[f32],
         tenant_id: &TenantId,
         threshold: f64,
         limit: usize,
-    ) -> Result<Vec<MemoryNode>>;
+    ) -> Result<Vec<(MemoryNode, f64)>>;
 
-    /// Update existing node by incrementing support_count and resetting relevance (for assimilation)
+    /// Reinforce a node (support_count + 1, relevance back to 1.0), optionally
+    /// replacing its payload. The payload must keep the same fact text — the
+    /// stored embedding is left untouched. Use [`Self::update_node_content`]
+    /// when the text changes.
     fn update_node_support(
         &self,
         node_id: i64,
         new_payload: Option<&serde_json::Value>,
+    ) -> Result<()>;
+
+    /// Replace a node's payload **and** its embedding atomically (reinforcing
+    /// it like [`Self::update_node_support`]). Used when a merge changes the
+    /// fact text, so the vector keeps describing what the node now says.
+    fn update_node_content(
+        &self,
+        node_id: i64,
+        payload: &serde_json::Value,
+        embedding: &[f32],
     ) -> Result<()>;
 
     /// Delete all data for a given tenant

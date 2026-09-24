@@ -10,7 +10,6 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/rezangit/neurolithe/actions"><img src="https://img.shields.io/github/actions/workflow/status/rezangit/neurolithe/ci.yml?branch=master&color=cyan" alt="Build Status"></a>
   <a href="https://github.com/rezangit/neurolithe/releases"><img src="https://img.shields.io/github/v/release/rezangit/neurolithe?color=cyan" alt="Release"></a>
   <a href="https://github.com/rezangit/neurolithe/blob/master/LICENSE"><img src="https://img.shields.io/badge/License-MIT-cyan.svg" alt="License"></a>
   <a href="https://docs.neurolithe.com"><img src="https://img.shields.io/badge/docs-neurolithe.com-cyan.svg" alt="Docs"></a>
@@ -160,7 +159,22 @@ We welcome contributions! NeuroLithe is built using **Domain-Driven Design (DDD)
    git checkout -b feature/your-feature-name
    ```
 
-3. **Pull Requests:** Open a Pull Request outlining *what* changed and *why*. Ensure all tests pass (`cargo test`) before requesting a review.
+3. **Pull Requests:** Open a Pull Request outlining *what* changed and *why*. Make sure the quality gate passes before requesting a review.
+
+### Quality gate (no CI, run it locally)
+
+```bash
+scripts/check.sh           # fmt --check, clippy -D warnings, tests (default + kafka features)
+scripts/check.sh --quick   # default features only
+ln -sf ../../scripts/pre-commit .git/hooks/pre-commit   # optional: quick gate on every commit
+```
+
+`scripts/cargo.sh` runs the pinned toolchain (`rust-toolchain.toml`) natively, or in Docker
+(`rust:1.94`) when no host toolchain is installed. The end-to-end tests in `tests/` spawn the
+real `neurolithe mcp` binary over STDIO against an in-process fake OpenAI-compatible LLM, so
+they need no API key or network.
+
+For local runs, copy `neurolithe.example.toml` to `neurolithe.toml`. That file is git-ignored.
 
 ## 📝 License
 

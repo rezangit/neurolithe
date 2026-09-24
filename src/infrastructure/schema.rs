@@ -115,6 +115,18 @@ pub fn init_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::Resu
     );
     conn.execute(&vec_query, [])?;
 
+    // Only active, meaningfully-embedded nodes belong in the KNN index (ARC-17).
+    // Stores written before that rule may still hold vectors for archived nodes
+    // and zero-vector graph anchors (`kind = subject`); they occupy top-k slots
+    // and push real matches out. Purge them — idempotent, a no-op once clean.
+    conn.execute(
+        "DELETE FROM vec_nodes WHERE node_id IN (
+            SELECT id FROM nodes
+            WHERE status != 'active' OR json_extract(payload, '$.kind') = 'subject'
+        )",
+        [],
+    )?;
+
     // 5. The FTS5 Index (Full-Text Keyword Search)
     conn.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS fts_nodes USING fts5(

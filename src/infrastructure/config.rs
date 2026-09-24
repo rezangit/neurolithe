@@ -51,6 +51,14 @@ pub struct LlmConfig {
     /// `us-central1` when unset.
     #[serde(default)]
     pub embedding_location: Option<String>,
+    /// Total per-request timeout (seconds) for LLM/embedding HTTP calls. A hung
+    /// provider must not freeze the (serial) MCP loop forever (DEV-5).
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+}
+
+fn default_request_timeout_secs() -> u64 {
+    120
 }
 
 impl LlmConfig {
@@ -176,7 +184,79 @@ impl AppConfig {
         // Load .env file if it exists
         let _ = dotenvy::dotenv();
 
-        Self::build(std::path::Path::new("neurolithe.toml").exists())
+        let config = Self::build(std::path::Path::new("neurolithe.toml").exists(), None)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Reject configurations that would panic or silently misbehave at runtime
+    /// (DEV-12, ARC-23): a zero scheduler interval panics `tokio::time::interval`,
+    /// a non-positive half-life makes decay NaN/inf, a zero vector dimension
+    /// cannot back a sqlite-vec table, and Anthropic has no embeddings API.
+    /// Collects every problem so one run reports them all.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let mut problems: Vec<String> = Vec::new();
+
+        if self.sweep.interval_secs == 0 {
+            problems.push("sweep.interval_secs must be > 0".into());
+        }
+        if self.metrics.interval_secs == 0 {
+            problems.push("metrics.interval_secs must be > 0".into());
+        }
+        for (name, v) in [
+            (
+                "decay.default_half_life_days",
+                self.decay.default_half_life_days,
+            ),
+            (
+                "decay.working_half_life_minutes",
+                self.decay.working_half_life_minutes,
+            ),
+        ] {
+            if !(v.is_finite() && v > 0.0) {
+                problems.push(format!("{name} must be a positive number (got {v})"));
+            }
+        }
+        for (name, store) in [("stm", &self.stm), ("ltm", &self.ltm)] {
+            if store.vector_dimension == 0 {
+                problems.push(format!("{name}.vector_dimension must be > 0"));
+            }
+            if store.path.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                problems.push(format!("{name}.path must not be empty"));
+            }
+        }
+        if self.llm.request_timeout_secs == 0 {
+            problems.push("llm.request_timeout_secs must be > 0".into());
+        }
+        if self.llm.model.trim().is_empty() {
+            problems.push("llm.model must not be empty".into());
+        }
+        if self.llm.embedding_model.trim().is_empty() {
+            problems.push("llm.embedding_model must not be empty".into());
+        }
+        match self.llm.effective_embedding_provider() {
+            LlmProvider::Anthropic => problems.push(
+                "llm.embedding_provider resolves to 'anthropic', which has no embeddings API; \
+                 set llm.embedding_provider to openai, gemini, vertex, or custom"
+                    .into(),
+            ),
+            LlmProvider::Vertex
+                if self
+                    .llm
+                    .embedding_project
+                    .as_deref()
+                    .is_none_or(|p| p.trim().is_empty()) =>
+            {
+                problems.push("llm.embedding_project is required for the vertex embedder".into())
+            }
+            _ => {}
+        }
+
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("invalid configuration:\n  - {}", problems.join("\n  - "))
+        }
     }
 
     /// Build the config from defaults → optional `neurolithe.toml` → env vars.
@@ -184,7 +264,13 @@ impl AppConfig {
     /// `include_file` is split out so tests can exercise the pure
     /// defaults/env path without a stray `neurolithe.toml` in the CWD skewing
     /// the result.
-    fn build(include_file: bool) -> anyhow::Result<Self> {
+    /// `env` replaces the process environment as the override source when
+    /// given — tests inject variables this way instead of mutating global
+    /// process state with `set_var`, which races other parallel tests (QA-14).
+    fn build(
+        include_file: bool,
+        env: Option<std::collections::HashMap<String, String>>,
+    ) -> anyhow::Result<Self> {
         let mut builder = config::Config::builder()
             .set_default("llm.provider", "openai")?
             .set_default("llm.model", "gpt-4o-mini")?
@@ -216,8 +302,11 @@ impl AppConfig {
         }
 
         // Environment variables override file config (e.g. NEUROLITHE__LLM__PROVIDER=gemini)
-        builder =
-            builder.add_source(config::Environment::with_prefix("NEUROLITHE").separator("__"));
+        builder = builder.add_source(
+            config::Environment::with_prefix("NEUROLITHE")
+                .separator("__")
+                .source(env.map(|m| m.into_iter().collect())),
+        );
 
         let config = builder.build()?;
         let app_config: AppConfig = config.try_deserialize()?;
@@ -229,18 +318,19 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
+    /// An empty injected environment: the pure-defaults path, isolated from
+    /// whatever `NEUROLITHE__*` vars the test process happens to carry.
+    fn no_env() -> Option<HashMap<String, String>> {
+        Some(HashMap::new())
+    }
 
     /// Config parses with the V2 defaults (independent STM 1536 / LTM 768
-    /// dimensions, Kafka/Pithos/scheduler sections) and env vars override a
-    /// single store's dimension in isolation without touching the other.
-    ///
-    /// Defaults and env-override are asserted in one test on purpose: the env
-    /// path mutates process-global vars, and merging avoids a race with a
-    /// separate parallel defaults test.
+    /// dimensions, Kafka/Pithos/scheduler sections) and the defaults validate.
     #[test]
-    fn test_defaults_and_env_override() {
-        // --- pure defaults (build(false) ignores any neurolithe.toml) ---
-        let cfg = AppConfig::build(false).expect("config should load from defaults");
+    fn test_defaults() {
+        let cfg = AppConfig::build(false, no_env()).expect("config should load from defaults");
 
         assert_eq!(cfg.stm.vector_dimension, 1536);
         assert_eq!(cfg.ltm.vector_dimension, 768);
@@ -251,6 +341,7 @@ mod tests {
         assert_eq!(cfg.pithos.base_url, "http://192.168.4.48:8080");
         assert_eq!(cfg.sweep.interval_secs, 300);
         assert_eq!(cfg.metrics.interval_secs, 60);
+        assert_eq!(cfg.llm.request_timeout_secs, 120);
         assert!(cfg.feeder.enabled);
         assert!(cfg.bus_query.enabled);
         // Per-layer decay defaults.
@@ -260,28 +351,83 @@ mod tests {
         // STM and LTM dimensions are independent — changing one never implies
         // the other.
         assert_ne!(cfg.stm.vector_dimension, cfg.ltm.vector_dimension);
+        cfg.validate().expect("defaults must validate");
+    }
 
-        // --- env override of a single store's dimension ---
-        // SAFETY: single-threaded test; vars are removed before returning.
-        unsafe {
-            std::env::set_var("NEUROLITHE__LTM__VECTOR_DIMENSION", "1024");
-            std::env::set_var("NEUROLITHE__FEEDER__ENABLED", "false");
-            std::env::set_var("NEUROLITHE__DECAY__WORKING_HALF_LIFE_MINUTES", "5");
-        }
+    /// Env vars override a single store's dimension in isolation. The overrides
+    /// are injected (no `set_var`), so this cannot race other tests (QA-14).
+    #[test]
+    fn test_env_override_is_injected_not_global() {
+        let env: HashMap<String, String> = [
+            ("NEUROLITHE__LTM__VECTOR_DIMENSION", "1024"),
+            ("NEUROLITHE__FEEDER__ENABLED", "false"),
+            ("NEUROLITHE__DECAY__WORKING_HALF_LIFE_MINUTES", "5"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
 
-        let cfg = AppConfig::build(false).expect("config should load with env overrides");
+        let cfg = AppConfig::build(false, Some(env)).expect("config should load with overrides");
 
         // LTM override applied; STM untouched (dimensions are independent).
         assert_eq!(cfg.ltm.vector_dimension, 1024);
         assert_eq!(cfg.stm.vector_dimension, 1536);
         assert!(!cfg.feeder.enabled);
-        // Decay working half-life overridden via env.
         assert_eq!(cfg.decay.working_half_life_minutes, 5.0);
+        // The process environment was never touched.
+        assert!(std::env::var("NEUROLITHE__LTM__VECTOR_DIMENSION").is_err());
+    }
 
-        unsafe {
-            std::env::remove_var("NEUROLITHE__LTM__VECTOR_DIMENSION");
-            std::env::remove_var("NEUROLITHE__FEEDER__ENABLED");
-            std::env::remove_var("NEUROLITHE__DECAY__WORKING_HALF_LIFE_MINUTES");
+    fn valid() -> AppConfig {
+        AppConfig::build(false, no_env()).unwrap()
+    }
+
+    /// DEV-12: a zero interval (panics `tokio::time::interval`) and a zero or
+    /// non-finite half-life (NaN decay) are rejected up front, all reported.
+    #[test]
+    fn test_validate_rejects_zero_intervals_and_half_lives() {
+        let mut cfg = valid();
+        cfg.sweep.interval_secs = 0;
+        cfg.metrics.interval_secs = 0;
+        cfg.decay.default_half_life_days = 0.0;
+        cfg.decay.working_half_life_minutes = f64::NAN;
+        cfg.ltm.vector_dimension = 0;
+        cfg.llm.request_timeout_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        for needle in [
+            "sweep.interval_secs",
+            "metrics.interval_secs",
+            "decay.default_half_life_days",
+            "decay.working_half_life_minutes",
+            "ltm.vector_dimension",
+            "llm.request_timeout_secs",
+        ] {
+            assert!(err.contains(needle), "missing '{needle}' in: {err}");
         }
+    }
+
+    /// ARC-23: an embedder that cannot embed is a config error, not a runtime
+    /// surprise on the first query.
+    #[test]
+    fn test_validate_rejects_unusable_embedders() {
+        let mut cfg = valid();
+        cfg.llm.provider = LlmProvider::Anthropic;
+        cfg.llm.embedding_provider = None; // falls back to anthropic
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("anthropic")
+        );
+
+        let mut cfg = valid();
+        cfg.llm.embedding_provider = Some(LlmProvider::Vertex);
+        cfg.llm.embedding_project = None;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("embedding_project")
+        );
     }
 }

@@ -6,8 +6,14 @@
 //! (ADR-0004). NeuroLithe never writes — Pithos stays the source of truth.
 
 use crate::domain::ports::{ArtifactStore, FetchOutcome};
+use crate::infrastructure::llm::build_http_client;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use std::time::Duration;
+
+/// Total per-request budget for a Pithos fetch. A hung archive must not stall
+/// the (single-threaded) feeder forever (SEC-11 / REV-3).
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct PithosClient {
     base_url: String,
@@ -18,10 +24,20 @@ pub struct PithosClient {
 
 impl PithosClient {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::with_timeout(base_url, token, DEFAULT_REQUEST_TIMEOUT)
+    }
+
+    /// Like [`new`](Self::new) with an explicit total request timeout. Uses the
+    /// shared client builder, so connect + total timeouts always apply.
+    pub fn with_timeout(
+        base_url: impl Into<String>,
+        token: impl Into<String>,
+        request_timeout: Duration,
+    ) -> Self {
         Self {
             base_url: base_url.into(),
             token: token.into(),
-            http: reqwest::Client::new(),
+            http: build_http_client(request_timeout),
         }
     }
 }
@@ -156,5 +172,33 @@ mod tests {
             req.contains("authorization: bearer secret-tok"),
             "request was: {req}"
         );
+    }
+
+    /// REV-3 / SEC-11: an archive that accepts the connection but never
+    /// answers must time out instead of hanging the feeder forever (the old
+    /// `reqwest::Client::new()` had no timeout at all).
+    #[tokio::test]
+    async fn test_hung_archive_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _hold = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let client = PithosClient::with_timeout(
+            format!("http://127.0.0.1:{port}"),
+            "",
+            Duration::from_millis(300),
+        );
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.fetch_text("pt://archive/d/text"),
+        )
+        .await
+        .expect("fetch must time out on its own, not hang");
+        assert!(res.is_err(), "a hung archive is a (retryable) error");
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 }
