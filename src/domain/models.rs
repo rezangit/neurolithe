@@ -3,13 +3,11 @@ use serde::{Deserialize, Serialize};
 /// The default cognitive layer for knowledge facts (documents, extracted facts).
 pub const REALITY_CCL: &str = "reality";
 
-/// The single tenant every JARVIS door defaults to. The Kafka feeder ingests
-/// documents under this tenant, so **both** delivery doors — the `memory.query`
-/// bus API (Metis) and the MCP server (agent/CT-scan) — must default here or a
-/// query reads an empty store (the field-report §1 bug: the MCP door had drifted
-/// to `"default"` while the feeder wrote `"jarvis"`). Callers wanting another
-/// tenant pass it explicitly. Keep this as the one source of truth.
-pub const DEFAULT_TENANT: &str = "jarvis";
+/// The one tenant every row carries. Isolation is physical — each workspace is
+/// its own pair of store files — so tenancy is no longer an API concept. The
+/// `tenant_id` DB columns stay for now (Phase 3 removes them); schema migration
+/// v2 rewrites any legacy value to this one.
+pub const WORKSPACE_TENANT: &str = "default";
 
 /// The working-memory layer: short-lived situational notes the agent leaves for
 /// itself (STM-WORKING-MEMORY). Decays on a much shorter half-life than
@@ -82,7 +80,7 @@ pub struct TimeFilter {
 
 /// Token-optimized output for query_memory. Deliberately hides internal
 /// node ids/scores, but **does** carry the external `data_id` (the archive
-/// reference), so a search hit can be handed straight to Ledger/Pithos to fetch
+/// reference), so a search hit can be handed straight to its source system to fetch
 /// the original — the search → trace → fetch pipeline the agent needs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryResult {

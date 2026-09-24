@@ -1,18 +1,27 @@
-//! Command consumer — drives soft/hard reset from the `memory.command` topic.
+//! Command consumer — drives writes and soft/hard reset from the commands topic
+//! (`[kafka.topics] commands`, default `memory.command`).
 //!
-//! Parses each command and dispatches to [`ResetService`]. On a hard reset it
-//! then rewinds the feeder (via [`FeederRewind`]) so `document.completed`
-//! replays and the stores are re-derived. The command channel is short-retention
-//! (not a replay source); each command is processed once.
+//! Parses each command and dispatches to [`ResetService`] / [`WriteService`].
+//! On a hard reset it then rewinds the feeder (via [`FeederRewind`]) so the
+//! documents topic replays and the stores are re-derived. The command channel
+//! is short-retention (not a replay source); each command is processed once.
 //!
-//! Like the feeder loop, the rdkafka plumbing here has a deferred live-broker
-//! smoke test — the reset logic itself is unit-tested in `reset_service`.
+//! Security: anyone who can produce to this topic can write, forget and soft
+//! reset. Restrict it with broker ACLs (and SASL/TLS via `[kafka.client]`).
+//! Hard reset additionally needs `NEUROLITHE_RESET_TOKEN` (≥16 chars) and is
+//! disabled without it.
+//!
+//! The rdkafka plumbing needs a live broker; the reset logic itself is
+//! unit-tested in `reset_service`.
 
 use crate::application::reset_service::{MemoryCommand, ResetKind, ResetService};
 use crate::application::write_service::WriteService;
+use crate::infrastructure::config::KafkaConfig;
+use crate::infrastructure::kafka_client::{
+    StopSignal, command_group, commit_on_shutdown, consumer_config, recv_or_stop,
+};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::Message;
 use rdkafka::util::Timeout;
@@ -21,8 +30,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Rewinds the feeder's consumer group to the earliest offset, so a hard reset
-/// replays `document.completed` and re-derives LTM (+ STM). Implemented by the
-/// daemon, which owns the feeder consumer (slice 11).
+/// replays the documents topic and re-derives LTM (+ STM). Implemented by the
+/// daemon, which owns the feeder consumer.
 #[async_trait]
 pub trait FeederRewind: Send + Sync {
     async fn rewind_to_earliest(&self) -> Result<()>;
@@ -71,7 +80,7 @@ impl FeederRewind for NoopRewind {
 /// Re-embeds the curated spine after a hard reset. `hard_reset` re-seeds the
 /// spine but seeding creates concept nodes *without* vectors; without this step
 /// placement would be blind and the replay would file every document into the
-/// inbox (the field-report §3 bug, re-introduced by every reset). Implemented by
+/// inbox (re-introduced by every reset). Implemented by
 /// the daemon, which owns the embedder + LTM store.
 ///
 /// `?Send`: the concrete implementor holds the SQLite-backed LTM repo (`!Sync`),
@@ -103,20 +112,22 @@ pub struct CommandConsumer {
 
 impl CommandConsumer {
     pub fn new(
-        brokers: &str,
-        group_id: &str,
+        kafka: &KafkaConfig,
         reset: Arc<ResetService>,
         write: Arc<WriteService>,
         rewind: Arc<dyn FeederRewind>,
         spine_embedder: Arc<dyn SpineEmbedder>,
     ) -> Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("group.id", group_id)
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
+        let consumer: StreamConsumer = consumer_config(kafka, &command_group(kafka), "earliest")
             .create()
-            .context("creating memory.command consumer")?;
+            .context("creating commands consumer")?;
+
+        if !reset.hard_reset_enabled() {
+            tracing::warn!(
+                "hard reset is disabled (NEUROLITHE_RESET_TOKEN unset or shorter \
+                 than 16 chars)"
+            );
+        }
 
         Ok(Self {
             consumer,
@@ -124,27 +135,30 @@ impl CommandConsumer {
             write,
             rewind,
             spine_embedder,
-            topic: "memory.command".into(),
+            topic: kafka.topics.commands.clone(),
         })
     }
 
-    /// Consume forever: parse -> apply -> (rewind on hard) -> commit.
-    pub async fn run(&self) -> Result<()> {
+    /// Consume until `stop` fires: parse -> apply -> (rewind on hard) -> commit,
+    /// then commit offsets synchronously.
+    pub async fn run(&self, mut stop: StopSignal) -> Result<()> {
         self.consumer
             .subscribe(&[&self.topic])
-            .context("subscribing to memory.command")?;
+            .with_context(|| format!("subscribing to {}", self.topic))?;
 
-        loop {
-            match self.consumer.recv().await {
-                Err(e) => eprintln!("[neurolithe] command consumer error: {e}"),
+        while let Some(next) = recv_or_stop(&self.consumer, &mut stop).await {
+            match next {
+                Err(e) => tracing::warn!("command consumer error: {e}"),
                 Ok(msg) => {
                     self.process(&msg).await;
                     if let Err(e) = self.consumer.commit_message(&msg, CommitMode::Async) {
-                        eprintln!("[neurolithe] command commit failed: {e}");
+                        tracing::warn!("command commit failed: {e}");
                     }
                 }
             }
         }
+        commit_on_shutdown(&self.consumer, "command consumer");
+        Ok(())
     }
 
     async fn process(&self, msg: &rdkafka::message::BorrowedMessage<'_>) {
@@ -154,7 +168,7 @@ impl CommandConsumer {
         let command = match MemoryCommand::parse(payload) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("[neurolithe] invalid memory.command: {e}");
+                tracing::warn!("invalid command on {}: {e}", self.topic);
                 return;
             }
         };
@@ -169,22 +183,22 @@ impl CommandConsumer {
                     // replay files documents under concepts, not the inbox.
                     Ok(ResetKind::Hard) => {
                         if let Err(e) = self.spine_embedder.embed_spine().await {
-                            eprintln!("[neurolithe] spine re-embed after hard reset failed: {e}");
+                            tracing::warn!("spine re-embed after hard reset failed: {e}");
                         }
                         if let Err(e) = self.rewind.rewind_to_earliest().await {
-                            eprintln!("[neurolithe] feeder rewind after hard reset failed: {e}");
+                            tracing::warn!("feeder rewind after hard reset failed: {e}");
                         }
                     }
                     Ok(ResetKind::Soft) => {}
                     // e.g. confirmation token mismatch — refuse and keep running.
-                    Err(e) => eprintln!("[neurolithe] reset refused: {e}"),
+                    Err(e) => tracing::warn!("reset refused: {e}"),
                 }
             }
             MemoryCommand::Remember(_) | MemoryCommand::Forget(_) => {
                 // A write failure is logged, not retried in-loop; redelivery
                 // re-applies (the commandId isn't marked until success).
                 if let Err(e) = self.write.handle(&command).await {
-                    eprintln!("[neurolithe] memory write failed: {e}");
+                    tracing::warn!("memory write failed: {e}");
                 }
             }
         }

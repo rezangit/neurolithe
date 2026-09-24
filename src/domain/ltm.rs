@@ -2,8 +2,8 @@
 //!
 //! LTM is a poly-hierarchy (DAG) of concept nodes with documents attached as
 //! leaves by `dataId` reference. It never decays. The actual content stays in
-//! Ledger/Pithos; LTM holds *meaning* (rolling summaries + embeddings) and the
-//! `dataId` pointer only. See `V2-DESIGN.md` §3 and `JARVIS-MEMORY-TREE.md`.
+//! the source system; LTM holds *meaning* (rolling summaries + embeddings) and the
+//! `dataId` pointer only.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -102,12 +102,54 @@ pub struct Provenance {
 }
 
 /// A document attached to a leaf tree node by `dataId` reference. The bytes
-/// live in Ledger/Pithos; LTM stores only the pointer + provenance.
+/// live in the source system; LTM stores only the pointer + provenance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Leaf {
     pub tree_node_id: i64,
     pub data_id: String,
     pub provenance: Provenance,
+}
+
+/// One curated spine branch to seed, from config `[ltm.spine]`. `path` is
+/// `/`-separated and relative to the root (e.g. `"work/projects"`); missing
+/// intermediate branches are created with an empty description. The inbox is
+/// always created and need not be listed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpineSeed {
+    pub path: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+impl SpineSeed {
+    pub fn new(path: &str, description: &str) -> Self {
+        Self {
+            path: path.to_string(),
+            description: description.to_string(),
+        }
+    }
+
+    /// The path's branch names, ignoring empty segments and surrounding space.
+    pub fn segments(&self) -> Vec<&str> {
+        self.path
+            .split('/')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+}
+
+/// The generic default spine: `root` → `inbox` (implicit), `notes`,
+/// `documents`. Deliberately minimal — the tree grows from use, and users
+/// shape it via `[ltm.spine]`.
+pub fn default_spine() -> Vec<SpineSeed> {
+    vec![
+        SpineSeed::new("notes", "Notes, ideas, decisions, and facts worth keeping."),
+        SpineSeed::new(
+            "documents",
+            "Documents, references, and longer texts filed for later recall.",
+        ),
+    ]
 }
 
 /// Persistence port for the LTM knowledge tree. Synchronous, like
@@ -135,6 +177,10 @@ pub trait LtmRepository {
 
     /// The leaf node carrying a given `data_id`, if any.
     fn get_node_by_data_id(&self, data_id: &str) -> Result<Option<TreeNode>>;
+
+    /// **Every** leaf node carrying `data_id`, oldest first. Normally at most
+    /// one; more only after an interrupted replace, which callers then heal.
+    fn get_nodes_by_data_id(&self, data_id: &str) -> Result<Vec<TreeNode>>;
 
     /// Concept nodes (`spine`/`grown`) whose summary embedding is within
     /// `max_distance` of `embedding`, nearest first. Used by placement to find
@@ -200,9 +246,15 @@ pub trait LtmRepository {
     /// or a new spine branch, avoiding a full replay.
     fn inbox_leaf_embeddings(&self) -> Result<Vec<(i64, Vec<f32>)>>;
 
-    /// Seed the curated spine (root + main branches + inbox) once. Idempotent —
-    /// a no-op if the tree already has nodes. Re-run after a hard reset.
-    fn seed_spine(&self) -> Result<()>;
+    /// Ensure `root`, the inbox, and every branch in `seeds` exist, creating
+    /// only the missing ones (additive & idempotent — existing branches keep
+    /// their leaves and summaries). Re-run after a hard reset.
+    fn seed_spine_from(&self, seeds: &[SpineSeed]) -> Result<()>;
+
+    /// [`seed_spine_from`](Self::seed_spine_from) with [`default_spine`].
+    fn seed_spine(&self) -> Result<()> {
+        self.seed_spine_from(&default_spine())
+    }
 
     /// Wipe the entire tree (nodes, edges, leaves, vectors), keeping the schema.
     /// Used by hard reset; the caller re-seeds the spine afterward.

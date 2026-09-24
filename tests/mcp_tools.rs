@@ -1,5 +1,6 @@
-//! Happy-path coverage of every MCP tool, black-box over STDIO against the
-//! fake LLM. Known-bug regressions live in `mcp_regressions.rs`.
+//! Happy-path coverage of the memory tools, black-box over STDIO against the
+//! fake LLM, in a fresh home's default workspace. Workspace tools live in
+//! `mcp_workspaces.rs`; known-bug regressions in `mcp_regressions.rs`.
 mod common;
 
 use common::{Harness, extracted_fact_text};
@@ -20,11 +21,11 @@ fn store_memory_then_query_memory_finds_it() {
     let mut h = Harness::start();
     h.call(
         "store_memory",
-        json!({"tenant_id": "t1", "fact_text": "Alice works at Acme", "tags": ["job"]}),
+        json!({"fact_text": "Alice works at Acme", "tags": ["job"]}),
     )
     .assert_ok();
 
-    let res = h.call("query_memory", json!({"tenant_id": "t1", "query": "Alice"}));
+    let res = h.call("query_memory", json!({"query": "Alice"}));
     res.assert_ok();
     let facts = facts_in(&res.json());
     assert!(
@@ -42,39 +43,16 @@ fn store_memory_then_query_memory_finds_it() {
 }
 
 #[test]
-fn query_memory_is_isolated_per_tenant() {
-    let mut h = Harness::start();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t1", "fact_text": "Bob likes green tea"}),
-    )
-    .assert_ok();
-    let res = h.call(
-        "query_memory",
-        json!({"tenant_id": "t2", "query": "Bob tea"}),
-    );
-    res.assert_ok();
-    assert!(
-        !facts_in(&res.json()).iter().any(|f| f.contains("Bob")),
-        "tenant t2 sees t1 data: {}",
-        res.text
-    );
-}
-
-#[test]
 fn query_memory_respects_k() {
     let mut h = Harness::start();
     for i in 0..4 {
         h.call(
             "store_memory",
-            json!({"tenant_id": "t1", "fact_text": format!("Carol fact number {i}")}),
+            json!({"fact_text": format!("Carol fact number {i}")}),
         )
         .assert_ok();
     }
-    let res = h.call(
-        "query_memory",
-        json!({"tenant_id": "t1", "query": "Carol", "k": 1}),
-    );
+    let res = h.call("query_memory", json!({"query": "Carol", "k": 1}));
     res.assert_ok();
     assert!(
         facts_in(&res.json()).len() <= 1,
@@ -87,14 +65,11 @@ fn query_memory_respects_k() {
 fn unicode_and_fts_operators_round_trip() {
     let mut h = Harness::start();
     let fact = r#"Ünïcödé 日本語 🧠 "quoted" OR NOT AND * ( ) -- ;DROP TABLE nodes"#;
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t1", "fact_text": fact}),
-    )
-    .assert_ok();
+    h.call("store_memory", json!({"fact_text": fact}))
+        .assert_ok();
     let res = h.call(
         "query_memory",
-        json!({"tenant_id": "t1", "query": r#"日本語 🧠 " OR ( * NEAR"#}),
+        json!({"query": r#"日本語 🧠 " OR ( * NEAR"#}),
     );
     res.assert_ok();
     assert!(
@@ -109,7 +84,7 @@ fn push_dialogue_returns_context_window() {
     let mut h = Harness::start();
     let res = h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s1", "new_message": "I moved to Berlin"}),
+        json!({"session_id": "s1", "new_message": "I moved to Berlin"}),
     );
     res.assert_ok();
     let ctx = res.json();
@@ -137,13 +112,13 @@ fn push_dialogue_keeps_session_history() {
     for msg in ["first turn", "second turn"] {
         h.call(
             "push_dialogue",
-            json!({"tenant_id": "t1", "session_id": "s-hist", "new_message": msg}),
+            json!({"session_id": "s-hist", "new_message": msg}),
         )
         .assert_ok();
     }
     let res = h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s-hist", "new_message": "third turn"}),
+        json!({"session_id": "s-hist", "new_message": "third turn"}),
     );
     let recent = res.json()["recent_messages"].clone();
     for msg in ["first turn", "second turn", "third turn"] {
@@ -157,72 +132,17 @@ fn push_dialogue_keeps_session_history() {
 #[test]
 fn recall_ltm_returns_a_json_array() {
     let mut h = Harness::start();
-    let res = h.call("recall_ltm", json!({"tenant_id": "t1", "query": "receipt"}));
+    let res = h.call("recall_ltm", json!({"query": "receipt"}));
     res.assert_ok();
     assert!(res.json().is_array(), "{}", res.text);
-}
-
-#[test]
-fn export_tenant_contains_stored_facts() {
-    let mut h = Harness::start();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t-exp", "fact_text": "Dana plays chess", "tags": ["hobby"]}),
-    )
-    .assert_ok();
-    let res = h.call("export_tenant", json!({"tenant_id": "t-exp"}));
-    res.assert_ok();
-    let export = res.json();
-    assert_eq!(export["tenant_id"], "t-exp");
-    assert!(
-        h.exported_facts("t-exp")
-            .contains(&"Dana plays chess".to_string())
-    );
-    assert!(h.exported_facts("t-other").is_empty());
-}
-
-#[test]
-fn delete_tenant_removes_only_that_tenant() {
-    let mut h = Harness::start();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t-del", "fact_text": "Eve is deleted"}),
-    )
-    .assert_ok();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t-keep", "fact_text": "Frank is kept"}),
-    )
-    .assert_ok();
-
-    h.call(
-        "delete_tenant",
-        json!({"tenant_id": "t-del", "confirm": "t-del"}),
-    )
-    .assert_ok();
-
-    assert!(h.exported_facts("t-del").is_empty());
-    assert_eq!(
-        h.exported_facts("t-keep"),
-        vec!["Frank is kept".to_string()]
-    );
-    let res = h.call(
-        "query_memory",
-        json!({"tenant_id": "t-del", "query": "Eve"}),
-    );
-    res.assert_ok();
-    assert!(facts_in(&res.json()).is_empty(), "{}", res.text);
 }
 
 #[test]
 fn stm_list_pages_and_filters() {
     let mut h = Harness::start();
     for fact in ["apple pie", "banana bread", "cherry tart"] {
-        h.call(
-            "store_memory",
-            json!({"tenant_id": "t1", "fact_text": fact}),
-        )
-        .assert_ok();
+        h.call("store_memory", json!({"fact_text": fact}))
+            .assert_ok();
     }
     assert_eq!(h.stm_facts().len(), 3);
 
@@ -252,11 +172,8 @@ fn memory_stats_and_health_reflect_stored_facts() {
     before.assert_ok();
     assert_eq!(before.json()["stm_active_nodes"], 0);
 
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t1", "fact_text": "Gina"}),
-    )
-    .assert_ok();
+    h.call("store_memory", json!({"fact_text": "Gina"}))
+        .assert_ok();
 
     let stats = h.call("memory_stats", json!({})).json();
     assert_eq!(stats["stm_active_nodes"], 1, "{stats}");
@@ -318,43 +235,63 @@ fn extracted_facts_are_queryable_after_push_dialogue() {
     let mut h = Harness::start();
     h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s1", "new_message": "Hank owns a red bike"}),
+        json!({"session_id": "s1", "new_message": "Hank owns a red bike"}),
     )
     .assert_ok();
     let expected = extracted_fact_text("Hank owns a red bike");
     let found = common::eventually(Duration::from_secs(5), || {
-        let res = h.call(
-            "query_memory",
-            json!({"tenant_id": "t1", "query": "Hank bike"}),
-        );
+        let res = h.call("query_memory", json!({"query": "Hank bike"}));
         !res.is_error && facts_in(&res.json()).contains(&expected)
     });
     assert!(found, "QA-1: extracted fact never became queryable");
 }
 
-/// Session buffers are keyed per (tenant_id, session_id): two tenants using the
-/// same session_id never see each other's turns.
 #[test]
-fn push_dialogue_sessions_are_isolated_per_tenant() {
+fn workspace_export_contains_stored_facts() {
     let mut h = Harness::start();
     h.call(
-        "push_dialogue",
-        json!({"tenant_id": "t-a", "session_id": "shared", "new_message": "secret from A"}),
+        "store_memory",
+        json!({"fact_text": "Dana plays chess", "tags": ["hobby"]}),
+    )
+    .assert_ok();
+    let res = h.call("workspace_export", json!({}));
+    res.assert_ok();
+    let export = res.json();
+    assert_eq!(export["workspace"], "default", "{export}");
+    assert!(export["ltm_leaves"].is_array(), "{export}");
+    let fact = &export["stm_facts"][0];
+    assert_eq!(fact["payload"]["fact"], "Dana plays chess", "{export}");
+    assert_eq!(fact["payload"]["tags"], json!(["hobby"]), "{export}");
+    for key in [
+        "ccl",
+        "status",
+        "relevance_score",
+        "support_count",
+        "created_at",
+    ] {
+        assert!(fact.get(key).is_some(), "export fact lacks {key}: {fact}");
+    }
+}
+
+/// Phase 2 removed tenancy: a stale `tenant_id` argument is ignored and the
+/// data lands in (and is read from) the active workspace.
+#[test]
+fn stale_tenant_id_argument_is_ignored() {
+    let mut h = Harness::start();
+    h.call(
+        "store_memory",
+        json!({"tenant_id": "someone-else", "fact_text": "Ivy likes jazz"}),
     )
     .assert_ok();
     let res = h.call(
-        "push_dialogue",
-        json!({"tenant_id": "t-b", "session_id": "shared", "new_message": "hello from B"}),
+        "query_memory",
+        json!({"tenant_id": "other", "query": "Ivy jazz"}),
     );
     res.assert_ok();
-    let recent = res.json()["recent_messages"].clone();
     assert!(
-        !recent.to_string().contains("secret from A"),
-        "tenant B sees tenant A's session: {recent}"
+        facts_in(&res.json()).contains(&"Ivy likes jazz".to_string()),
+        "{}",
+        res.text
     );
-    assert!(
-        recent
-            .as_array()
-            .is_some_and(|m| m.iter().any(|x| x == "hello from B"))
-    );
+    assert_eq!(h.exported_facts(None), vec!["Ivy likes jazz".to_string()]);
 }

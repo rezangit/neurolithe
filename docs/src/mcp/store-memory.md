@@ -1,36 +1,21 @@
 # Tool: store_memory
 
-Explicitly store a crucial fact immediately, bypassing the background extraction pipeline.
+Explicitly store a fact in short-term memory right away, bypassing extraction.
+Works without a chat LLM (only the embedder is used).
 
-## Input Schema
+## Input
 
-```json
-{
-  "fact_text": "string (required)",
-  "tags": ["string"] ,
-  "ccl": "string (optional, default: 'reality')",
-  "tenant_id": "string (optional, default: 'default')"
-}
-```
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `fact_text` | string | yes | The fact, non-blank (≤ 16 KiB) |
+| `tags` | string[] | no | Up to 64 tags |
+| `ccl` | string | no | Cognitive context layer, default `reality` |
 
 ## Output
 
-```json
-{
-  "content": [{"type": "text", "text": "Memory fact explicitly stored."}],
-  "isError": false
-}
-```
+Text: `Memory fact explicitly stored.` On failure, an `isError` result.
 
 ## Behavior
 
-1. Embeds the fact text into a vector via the configured LLM
-2. Creates a `MemoryNode` with `is_explicit = true`
-3. Stores the node and its embedding in the database
-4. Does **not** run the Sleep Pipeline (fact is already structured)
-
-## Use Cases
-
-- Storing critical user preferences that shouldn't wait for extraction
-- Correcting existing knowledge ("User now lives in Tokyo, not Berlin")
-- Agent self-notes ("User prefers formal communication style")
+The fact is embedded and stored as-is (`is_explicit = true`) in the active
+workspace's STM. Like any STM fact, it decays unless it is read or reinforced.

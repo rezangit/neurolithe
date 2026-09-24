@@ -11,11 +11,10 @@ Retrieval is **reference-returning**: `recall_ltm` / `query_memory` hand back a
 the original bytes. Close the loop with a fetch surface so an agent can go
 `search → dataId → read the source`.
 
-- For standalone users: an optional `fetch` capability (e.g. read the artifact
-  from a configured store / local path by `dataId`).
-- For JARVIS: a **Ledger MCP server** (`get_document`, `get_document_text`,
-  `get_document_file`, `search_documents`) — lives in the Ledger service, not
-  here. Bonus: have `trace_dataId` include a ready-made fetch URI.
+- An optional `fetch` capability (e.g. read the artifact from a configured
+  store / local path by `dataId`), or a companion document-store MCP server
+  that owns the originals. Bonus: have `trace_dataId` include a ready-made
+  fetch URI.
 
 ## 2. Sharper concept placement
 
@@ -33,9 +32,8 @@ category labels. Two rough edges observed:
 
 ## 3. Smart tree growth (AI-grown concepts)
 
-V2 only does best-match-or-inbox; it never grows the tree. Add growth rules from
-[`design-docs/V2-DESIGN.md`](design-docs/V2-DESIGN.md) §10 / the memory-tree
-brainstorm: split a fat node, merge similar branches, and **spawn new concepts**
+V2 only does best-match-or-inbox; it never grows the tree. Add growth rules:
+split a fat node, merge similar branches, and **spawn new concepts**
 from clusters of inbox documents (reusing the conflict-resolver's
 assimilate/modify/create idea at the branch level). This is the real fix for the
 inbox tail and for concept coarseness.
@@ -58,5 +56,5 @@ canonical document outranks incidental mentions of the same terms.
 ## 6. STM ↔ LTM hydration
 
 When an agent focuses a branch, optionally pre-load that branch's summaries into
-STM so fast recall covers the current topic (design §10, `hydrate(branch)`), with
+STM so fast recall covers the current topic (`hydrate(branch)`), with
 a smart policy for what to pull and when.

@@ -1,10 +1,10 @@
 //! Regression tests for defects found in the 2026-09 QA review
-//! (`project-review/reports/03-qa.md`). Each test asserts the CORRECT behaviour
-//! and is tagged with its issue ID; it fails until the matching fix lands.
+//! (`project-review/reports/03-qa.md`) and later review rounds. Each test
+//! asserts the CORRECT behaviour and is tagged with its issue ID.
 mod common;
 
 use common::{
-    API_KEY, FakeLlm, Harness, MALFORMED_EXTRACTION, McpProcess, extracted_fact_text, write_config,
+    API_KEY, FakeLlm, Harness, Home, MALFORMED_EXTRACTION, McpProcess, extracted_fact_text,
 };
 use serde_json::json;
 use std::time::Duration;
@@ -21,7 +21,7 @@ fn qa1_push_dialogue_persists_extracted_facts() {
     let mut h = Harness::start();
     h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s1", "new_message": "I moved to Berlin"}),
+        json!({"session_id": "s1", "new_message": "I moved to Berlin"}),
     )
     .assert_ok();
 
@@ -45,7 +45,7 @@ fn qa1_push_dialogue_persists_relationship_entities() {
     let mut h = Harness::start();
     h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s1",
+        json!({"session_id": "s1",
                "new_message": "I work with Ivy [rel:Ivy]"}),
     )
     .assert_ok();
@@ -61,99 +61,26 @@ fn qa1_push_dialogue_persists_relationship_entities() {
     );
 }
 
-// --- QA-2 / QA-3: delete_tenant --------------------------------------------
+// --- QA-3: deleting a store that owns edges --------------------------------
 
-/// QA-2: `delete_tenant` without `tenant_id` silently deleted the built-in
-/// default tenant. A destructive tool must require an explicit target.
+/// QA-3: deleting tenant data that owned edges failed on the foreign keys and
+/// rolled back. Tenancy is gone in Phase 2; the erasure path is now
+/// `workspace_delete`, which must remove a workspace with a graph (nodes +
+/// edges) completely. A workspace re-created under the same name starts empty.
 #[test]
-fn qa2_delete_tenant_requires_tenant_id() {
+fn qa3_workspace_delete_with_edges_removes_everything() {
     let mut h = Harness::start();
-    // Stored in the default tenant (no tenant_id).
-    h.call("store_memory", json!({"fact_text": "Default-tenant fact"}))
+    h.call("workspace_create", json!({"name": "graph"}))
         .assert_ok();
-
-    let res = h.call("delete_tenant", json!({}));
-    assert!(
-        res.is_error,
-        "QA-2: delete_tenant without tenant_id must be rejected, got: {}",
-        res.text
-    );
-    assert!(
-        h.stm_facts().contains(&"Default-tenant fact".to_string()),
-        "QA-2: default tenant data was deleted"
-    );
-}
-
-/// QA-2 / SEC-07: a destructive delete also needs `confirm` equal to
-/// `tenant_id`. A missing, empty, mismatched or wrong-typed `confirm` is
-/// rejected with `isError` and deletes nothing.
-#[test]
-fn qa2_delete_tenant_requires_matching_confirm() {
-    let mut h = Harness::start();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t-guard", "fact_text": "Guarded fact"}),
-    )
-    .assert_ok();
-
-    for args in [
-        json!({"tenant_id": "t-guard"}),
-        json!({"tenant_id": "t-guard", "confirm": ""}),
-        json!({"tenant_id": "t-guard", "confirm": "t-other"}),
-        json!({"tenant_id": "t-guard", "confirm": "T-GUARD"}),
-        json!({"tenant_id": "t-guard", "confirm": true}),
-    ] {
-        let res = h.call("delete_tenant", args.clone());
-        assert!(
-            res.is_error,
-            "QA-2: delete_tenant accepted {args}: {}",
-            res.text
-        );
-        assert_eq!(
-            h.exported_facts("t-guard"),
-            vec!["Guarded fact".to_string()],
-            "QA-2: data deleted by rejected call {args}"
-        );
-        let q = h.call(
-            "query_memory",
-            json!({"tenant_id": "t-guard", "query": "Guarded"}),
-        );
-        q.assert_ok();
-        assert!(
-            q.text.contains("Guarded fact"),
-            "QA-2: fact no longer queryable after rejected call {args}: {}",
-            q.text
-        );
-    }
-
-    // The matching confirm still works.
-    h.call(
-        "delete_tenant",
-        json!({"tenant_id": "t-guard", "confirm": "t-guard"}),
-    )
-    .assert_ok();
-    assert!(h.exported_facts("t-guard").is_empty());
-}
-
-/// QA-3: `delete_tenant` never deleted `edges`, so with foreign keys ON any
-/// tenant owning an edge failed to delete (whole transaction rolled back).
-#[test]
-fn qa3_delete_tenant_with_edges_succeeds() {
-    let mut h = Harness::start();
+    h.call("workspace_switch", json!({"name": "graph"}))
+        .assert_ok();
     h.call(
         "push_dialogue",
-        json!({"tenant_id": "t-edges", "session_id": "s1",
-               "new_message": "Jack lives in Oslo [rel:Oslo]"}),
-    )
-    .assert_ok();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t-keep", "fact_text": "Kim stays"}),
+        json!({"session_id": "s1", "new_message": "Jack lives in Oslo [rel:Oslo]"}),
     )
     .assert_ok();
 
-    // Precondition (needs QA-1), via the public surface: the extracted fact
-    // is recallable and carries the RELATED_TO → Oslo edge as a connection.
+    // Precondition via the public surface: the fact carries the Oslo edge.
     let fact = extracted_fact_text("Jack lives in Oslo [rel:Oslo]");
     let has_edge = common::eventually(EVENTUALLY, || {
         oslo_connections(&mut h, &fact)
@@ -162,37 +89,36 @@ fn qa3_delete_tenant_with_edges_succeeds() {
     });
     assert!(
         has_edge,
-        "QA-3 precondition (blocked by QA-1): no Oslo edge; connections = {:?}",
+        "QA-3 precondition: no Oslo edge; connections = {:?}",
         oslo_connections(&mut h, &fact)
     );
-    // Ground truth in the store (REV-8): an edge row exists before the delete.
-    let edges_before = stm_edge_count(&h);
-    assert!(edges_before >= 1, "QA-3 precondition: {edges_before} edges");
+    let ws_dir = h.home.workspace_dir("graph");
+    assert!(
+        stm_edge_count(&ws_dir) >= 1,
+        "QA-3 precondition: no edge rows"
+    );
 
-    let res = h.call(
-        "delete_tenant",
-        json!({"tenant_id": "t-edges", "confirm": "t-edges"}),
-    );
-    assert!(!res.is_error, "QA-3: delete failed: {}", res.text);
-    assert!(
-        h.exported_facts("t-edges").is_empty(),
-        "QA-3: tenant data survived delete"
-    );
-    assert!(
-        oslo_connections(&mut h, &fact).is_empty(),
-        "QA-3: connections survived delete"
-    );
-    // Only t-edges owned edges (store_memory creates none), so none may remain.
-    assert_eq!(stm_edge_count(&h), 0, "QA-3: orphan edges left behind");
-    assert_eq!(h.exported_facts("t-keep"), vec!["Kim stays".to_string()]);
+    h.call("workspace_switch", json!({"name": "default"}))
+        .assert_ok();
+    h.call(
+        "workspace_delete",
+        json!({"name": "graph", "confirm": "graph"}),
+    )
+    .assert_ok();
+    assert!(!ws_dir.exists(), "QA-3: workspace dir survived delete");
+
+    h.call("workspace_create", json!({"name": "graph"}))
+        .assert_ok();
+    h.call("workspace_switch", json!({"name": "graph"}))
+        .assert_ok();
+    assert!(h.exported_facts(None).is_empty(), "QA-3: data came back");
+    assert!(oslo_connections(&mut h, &fact).is_empty());
+    assert_eq!(stm_edge_count(&ws_dir), 0, "QA-3: edges came back");
 }
 
-/// Connections on the `query_memory` hit whose fact is `fact` (tenant t-edges).
+/// Connections on the active workspace's `query_memory` hit whose fact is `fact`.
 fn oslo_connections(h: &mut Harness, fact: &str) -> Vec<serde_json::Value> {
-    let res = h.call(
-        "query_memory",
-        json!({"tenant_id": "t-edges", "query": "Jack Oslo"}),
-    );
+    let res = h.call("query_memory", json!({"query": "Jack Oslo"}));
     if res.is_error {
         return Vec::new();
     }
@@ -206,12 +132,11 @@ fn oslo_connections(h: &mut Harness, fact: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Rows in the STM `edges` table, read-only (safe alongside the live server
-/// under WAL). The public surface can show an edge exists but cannot prove
-/// that none are left after a delete, so this is the ground truth.
-fn stm_edge_count(h: &Harness) -> i64 {
+/// Rows in a workspace's STM `edges` table, read-only (safe alongside the live
+/// server under WAL): the ground truth a public query cannot give after a delete.
+fn stm_edge_count(workspace_dir: &std::path::Path) -> i64 {
     let conn = rusqlite::Connection::open_with_flags(
-        h.path().join("stm.sqlite"),
+        workspace_dir.join("stm.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("open stm.sqlite read-only");
@@ -226,9 +151,9 @@ fn stm_edge_count(h: &Harness) -> i64 {
 fn qa9_store_memory_rejects_empty_fact() {
     let mut h = Harness::start();
     for args in [
-        json!({"tenant_id": "t1", "fact_text": ""}),
-        json!({"tenant_id": "t1", "fact_text": "   "}),
-        json!({"tenant_id": "t1"}),
+        json!({"fact_text": ""}),
+        json!({"fact_text": "   "}),
+        json!({}),
     ] {
         let res = h.call("store_memory", args.clone());
         assert!(res.is_error, "QA-9: accepted {args}: {}", res.text);
@@ -241,10 +166,7 @@ fn qa9_store_memory_rejects_empty_fact() {
 #[test]
 fn qa9_query_memory_rejects_empty_query_cleanly() {
     let mut h = Harness::start();
-    for args in [
-        json!({"tenant_id": "t1", "query": ""}),
-        json!({"tenant_id": "t1"}),
-    ] {
+    for args in [json!({"query": ""}), json!({})] {
         let res = h.call("query_memory", args.clone());
         assert!(res.is_error, "QA-9: accepted {args}: {}", res.text);
         let lower = res.text.to_lowercase();
@@ -279,10 +201,7 @@ fn qa9_push_dialogue_requires_session_and_message() {
 fn qa12_store_memory_rejects_oversized_fact() {
     let mut h = Harness::start();
     let huge = "x".repeat(2 * 1024 * 1024);
-    let res = h.call(
-        "store_memory",
-        json!({"tenant_id": "t1", "fact_text": huge}),
-    );
+    let res = h.call("store_memory", json!({"fact_text": huge}));
     assert!(res.is_error, "QA-12: 2 MiB fact accepted");
     assert!(h.stm_facts().is_empty());
 }
@@ -295,9 +214,16 @@ fn qa12_store_memory_rejects_oversized_fact() {
 #[test]
 fn qa10_missing_api_key_never_sends_placeholder() {
     let llm = FakeLlm::start();
-    let dir = tempfile::tempdir().unwrap();
-    write_config(dir.path(), &llm.base_url());
-    let mut server = McpProcess::spawn(dir.path(), &[]);
+    let home = Home::new(&llm.base_url());
+    let home_str = home.path().display().to_string();
+    // Only NEUROLITHE_HOME: no API key variables at all.
+    let mut server = McpProcess::spawn_with(
+        std::path::Path::new(common::bin()),
+        &["mcp"],
+        home.cwd.path(),
+        home.cwd.path(),
+        &[("NEUROLITHE_HOME", home_str.as_str())],
+    );
 
     let exited = server.wait_exit(Duration::from_millis(500));
     let failed_clearly = match exited {
@@ -329,11 +255,8 @@ fn qa10_missing_api_key_never_sends_placeholder() {
 #[test]
 fn qa10_configured_api_key_is_sent() {
     let mut h = Harness::start();
-    h.call(
-        "store_memory",
-        json!({"tenant_id": "t1", "fact_text": "Lena"}),
-    )
-    .assert_ok();
+    h.call("store_memory", json!({"fact_text": "Lena"}))
+        .assert_ok();
     let auths: Vec<_> = h
         .llm
         .requests()
@@ -365,45 +288,47 @@ fn qa7_round(round: usize) {
     const PROCS: usize = 4;
     const WRITES: usize = 15;
     let llm = FakeLlm::start();
-    let dir = tempfile::tempdir().unwrap();
-    write_config(dir.path(), &llm.base_url());
+    let home = Home::new(&llm.base_url());
 
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(PROCS));
-    let workers: Vec<_> = (0..PROCS)
-        .map(|w| {
-            let path = dir.path().to_path_buf();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || -> Result<(), String> {
-                barrier.wait();
-                let mut server = McpProcess::spawn_with_key(&path);
-                if let Some(code) = server.wait_exit(Duration::from_millis(300)) {
-                    return Err(format!(
-                        "round {round} worker {w} exited at startup ({code:?}): {}",
-                        server.stderr()
-                    ));
-                }
-                server.initialize();
-                for i in 0..WRITES {
-                    let res = server.call_tool(
-                        "store_memory",
-                        json!({"tenant_id": "t1", "fact_text": format!("worker {w} fact {i}")}),
-                    );
-                    if res.is_error {
-                        return Err(format!("round {round} worker {w} write {i}: {}", res.text));
+    let barrier = std::sync::Barrier::new(PROCS);
+    let errors: Vec<String> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..PROCS)
+            .map(|w| {
+                let (home, barrier) = (&home, &barrier);
+                scope.spawn(move || -> Result<(), String> {
+                    barrier.wait();
+                    let mut server = home.spawn_mcp(&[], &[]);
+                    if let Some(code) = server.wait_exit(Duration::from_millis(300)) {
+                        return Err(format!(
+                            "round {round} worker {w} exited at startup ({code:?}): {}",
+                            server.stderr()
+                        ));
                     }
-                }
-                Ok(())
+                    server.initialize();
+                    for i in 0..WRITES {
+                        let res = server.call_tool(
+                            "store_memory",
+                            json!({"fact_text": format!("worker {w} fact {i}")}),
+                        );
+                        if res.is_error {
+                            return Err(format!(
+                                "round {round} worker {w} write {i}: {}",
+                                res.text
+                            ));
+                        }
+                    }
+                    Ok(())
+                })
             })
-        })
-        .collect();
-
-    let errors: Vec<String> = workers
-        .into_iter()
-        .filter_map(|t| t.join().unwrap().err())
-        .collect();
+            .collect();
+        workers
+            .into_iter()
+            .filter_map(|t| t.join().unwrap().err())
+            .collect()
+    });
     assert!(errors.is_empty(), "QA-7: {errors:#?}");
 
-    let mut check = McpProcess::spawn_with_key(dir.path());
+    let mut check = home.spawn_mcp(&[], &[]);
     check.initialize();
     let stats = check.call_tool("memory_stats", json!({})).json();
     assert_eq!(
@@ -424,7 +349,7 @@ fn rev1_push_dialogue_reports_learning_error_but_succeeds() {
     let msg = format!("Remember the vault code {MALFORMED_EXTRACTION}");
     let res = h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s-rev1", "new_message": msg}),
+        json!({"session_id": "s-rev1", "new_message": msg}),
     );
     assert!(
         !res.is_error,
@@ -453,7 +378,7 @@ fn rev1_push_dialogue_reports_learning_error_but_succeeds() {
     // and that successful push carries no learning_error.
     let next = h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s-rev1", "new_message": "next turn"}),
+        json!({"session_id": "s-rev1", "new_message": "next turn"}),
     );
     next.assert_ok();
     let next_ctx = next.json();
@@ -476,7 +401,7 @@ fn rev1_successful_push_dialogue_has_no_error_keys() {
     let mut h = Harness::start();
     let res = h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s1", "new_message": "All good here"}),
+        json!({"session_id": "s1", "new_message": "All good here"}),
     );
     res.assert_ok();
     let ctx = res.json();
@@ -496,7 +421,7 @@ fn rev1_extraction_is_capped_at_32_facts() {
     let mut h = Harness::start();
     h.call(
         "push_dialogue",
-        json!({"tenant_id": "t1", "session_id": "s1", "new_message": "dump [many-facts:40]"}),
+        json!({"session_id": "s1", "new_message": "dump [many-facts:40]"}),
     )
     .assert_ok();
     let bulk = h

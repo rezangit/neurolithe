@@ -257,7 +257,7 @@ mod tests {
         stm.store_node(
             &MemoryNode {
                 id: None,
-                tenant_id: TenantId("jarvis".into()),
+                tenant_id: TenantId("legacy".into()),
                 source_episode_id: None,
                 payload: json!({"fact": "metro doc", "dataId": "doc_1"}),
                 status: "active".into(),

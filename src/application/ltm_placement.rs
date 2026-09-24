@@ -4,7 +4,7 @@
 //! V2 is deliberately **simple**: best-match-or-inbox placement and a
 //! concatenate-and-truncate roll-up. The hard "grow the right way" logic
 //! (split fat nodes, merge similar branches, spawn new branches) is deferred —
-//! see `V2-DESIGN.md` §3.2 and `JARVIS-MEMORY-TREE.md`.
+//! see `V2-DESIGN.md` §3.2.
 
 use crate::domain::ltm::{Leaf, LtmRepository, Provenance, TreeEdge, TreeNode, TreeNodeKind};
 use crate::domain::ports::LlmClient;
@@ -71,7 +71,7 @@ pub struct DocumentToPlace {
     /// concept (placement) and — stored on the leaf — to make the document
     /// recallable by meaning.
     pub embedding: Vec<f32>,
-    /// Archive reference (Ledger/Pithos `dataId`).
+    /// Source-document reference (`dataId`).
     pub data_id: String,
     pub provenance: Provenance,
 }
@@ -201,20 +201,53 @@ impl LtmPlacement {
         Ok(moved)
     }
 
-    /// Tombstone: forget a `dataId` — remove its leaf and re-roll the affected
-    /// ancestor summaries. Returns false if the document was not in the tree.
+    /// Tombstone: forget a `dataId` — remove **every** leaf carrying it and
+    /// re-roll the affected ancestor summaries. Returns false if the document
+    /// was not in the tree.
     pub fn forget(&self, data_id: &str) -> Result<bool> {
-        let Some(leaf) = self.repo.get_node_by_data_id(data_id)? else {
-            return Ok(false);
-        };
-        let leaf_id = leaf.id.expect("stored node has id");
-        // Capture the parents before deletion so we know what to re-roll.
-        let parents = self.repo.get_parents(leaf_id)?;
-        self.repo.delete_node(leaf_id)?;
-        for parent in parents {
-            self.roll_up_from(parent.id.expect("stored node has id"))?;
+        let removed = self.remove_leaves(data_id, None)?;
+        Ok(removed > 0)
+    }
+
+    /// Upsert: file `doc`, then remove every *other* leaf with the same
+    /// `data_id` and re-roll the summaries of the parents they left (the new
+    /// parent included, so its title list no longer shows the old version).
+    ///
+    /// Ordering keeps it safe without a cross-call transaction: the new version
+    /// is committed before any old one is deleted, so a crash in between leaves
+    /// a duplicate (never a loss), and the next replace/forget of that `data_id`
+    /// removes all stale copies. Returns the placement and how many old leaves
+    /// were replaced.
+    pub fn replace(&self, doc: &DocumentToPlace) -> Result<(Placement, usize)> {
+        let placed = self.place(doc)?;
+        let replaced = self.remove_leaves(&doc.data_id, Some(placed.leaf_node_id))?;
+        Ok((placed, replaced))
+    }
+
+    /// Delete every leaf node carrying `data_id` except `keep`, then re-roll
+    /// each affected parent (once). Returns how many leaves were deleted.
+    fn remove_leaves(&self, data_id: &str, keep: Option<i64>) -> Result<usize> {
+        let mut parents: Vec<i64> = Vec::new();
+        let mut removed = 0;
+        for leaf in self.repo.get_nodes_by_data_id(data_id)? {
+            let leaf_id = leaf.id.expect("stored node has id");
+            if Some(leaf_id) == keep {
+                continue;
+            }
+            // Capture the parents before deletion so we know what to re-roll.
+            for parent in self.repo.get_parents(leaf_id)? {
+                let pid = parent.id.expect("stored node has id");
+                if !parents.contains(&pid) {
+                    parents.push(pid);
+                }
+            }
+            self.repo.delete_node(leaf_id)?;
+            removed += 1;
         }
-        Ok(true)
+        for pid in parents {
+            self.roll_up_from(pid)?;
+        }
+        Ok(removed)
     }
 
     /// Recompute `start`'s summary and every ancestor's, children-before-parents

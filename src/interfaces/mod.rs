@@ -1,6 +1,7 @@
 pub mod bus_query;
-// Kafka consumers/producers — only compiled with the `kafka` feature (the JARVIS
-// daemon). The standalone MCP build omits them entirely (no rdkafka).
+pub mod cli;
+// Kafka consumers/producers — only compiled with the `kafka` feature (the
+// long-running daemon). The standalone MCP build omits them entirely (no rdkafka).
 #[cfg(feature = "kafka")]
 pub mod command_consumer;
 #[cfg(feature = "kafka")]

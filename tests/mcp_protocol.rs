@@ -63,8 +63,13 @@ const EXPECTED_TOOLS: &[&str] = &[
     "store_memory",
     "query_memory",
     "recall_ltm",
-    "delete_tenant",
-    "export_tenant",
+    "remember_document",
+    "workspace_current",
+    "workspace_list",
+    "workspace_create",
+    "workspace_switch",
+    "workspace_export",
+    "workspace_delete",
     "memory_stats",
     "health",
     "placement_debug",
@@ -247,16 +252,127 @@ fn server_exits_cleanly_on_stdin_eof() {
 }
 
 #[test]
-fn server_answers_quickly_without_llm_for_introspection() {
+fn introspection_answers_quickly_without_calling_the_llm() {
     let mut h = Harness::start();
+    // Startup embeds the LTM spine (§5); wait for that to settle first.
+    let mut last = usize::MAX;
+    common::eventually(Duration::from_secs(10), || {
+        let now = h.llm.requests().len();
+        let settled = now == last;
+        last = now;
+        std::thread::sleep(Duration::from_millis(200));
+        settled
+    });
+    let before = h.llm.requests().len();
     let started = std::time::Instant::now();
-    for tool in ["health", "memory_stats", "stm_list", "ltm_map"] {
+    for tool in [
+        "health",
+        "memory_stats",
+        "stm_list",
+        "ltm_map",
+        "workspace_current",
+        "workspace_list",
+    ] {
         h.call(tool, json!({})).assert_ok();
     }
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(
         h.llm.requests().len(),
-        0,
+        before,
         "introspection must not call the LLM"
+    );
+}
+
+/// Phase 2 (§2): tenancy is gone from the MCP surface. No schema accepts
+/// `tenant_id`, and the tenant tools no longer exist (JSON-RPC -32602).
+#[test]
+fn tenant_surface_is_removed() {
+    let mut h = Harness::start();
+    let resp = h.server.request("tools/list", json!({}));
+    for tool in resp["result"]["tools"].as_array().unwrap() {
+        assert!(
+            tool["inputSchema"]["properties"].get("tenant_id").is_none(),
+            "{} still declares tenant_id",
+            tool["name"]
+        );
+    }
+    for gone in ["delete_tenant", "export_tenant"] {
+        let resp = h.server.request(
+            "tools/call",
+            json!({"name": gone, "arguments": {"tenant_id": "x", "confirm": "x"}}),
+        );
+        assert_eq!(resp["error"]["code"], -32602, "{gone}: {resp}");
+    }
+}
+
+/// Phase 2 (§2): `workspace_delete` is annotated destructive, and every
+/// workspace-name argument carries the name regex as a schema `pattern`.
+#[test]
+fn workspace_tool_schemas_are_annotated() {
+    let mut h = Harness::start();
+    let resp = h.server.request("tools/list", json!({}));
+    let tools = resp["result"]["tools"].as_array().unwrap().clone();
+    let tool = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .clone()
+    };
+    let hints = |name: &str| tool(name)["annotations"].clone();
+    assert_eq!(hints("workspace_delete")["destructiveHint"], json!(true));
+    assert_eq!(hints("workspace_delete")["idempotentHint"], json!(true));
+    for name in [
+        "query_memory",
+        "recall_ltm",
+        "workspace_current",
+        "workspace_list",
+        "workspace_export",
+        "memory_stats",
+        "health",
+        "placement_debug",
+        "stm_list",
+        "ltm_map",
+        "inspect_node",
+        "subtree",
+        "trace_dataId",
+    ] {
+        assert_eq!(
+            hints(name)["readOnlyHint"],
+            json!(true),
+            "{name}: {}",
+            hints(name)
+        );
+    }
+    for name in [
+        "store_memory",
+        "push_dialogue",
+        "remember_document",
+        "workspace_delete",
+    ] {
+        assert_ne!(
+            hints(name)["readOnlyHint"],
+            json!(true),
+            "{name} marked read-only"
+        );
+    }
+    assert_eq!(hints("remember_document")["destructiveHint"], json!(false));
+    for name in [
+        "workspace_create",
+        "workspace_switch",
+        "workspace_delete",
+        "workspace_export",
+    ] {
+        let pattern = &tool(name)["inputSchema"]["properties"]["name"]["pattern"];
+        assert_eq!(
+            pattern,
+            &json!("^[a-z0-9][a-z0-9_-]{0,63}$"),
+            "{name}: name pattern"
+        );
+    }
+    let required = tool("workspace_delete")["inputSchema"]["required"].clone();
+    assert!(
+        required.as_array().unwrap().iter().any(|r| r == "confirm"),
+        "workspace_delete must require confirm: {required}"
     );
 }

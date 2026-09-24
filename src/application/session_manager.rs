@@ -180,11 +180,19 @@ impl SessionManager {
             buffer.token_count > self.token_threshold
         };
 
-        // 3. Compress if buffer exceeds threshold (best-effort: on failure the
-        // buffer simply stays uncompressed).
-        if needs_compression && let Err(e) = self.compress_buffer(&key).await {
-            eprintln!("[neurolithe] context compression failed (episode {episode_id}): {e:#}");
-            warnings.push(format!("context compression failed: {e:#}"));
+        // 3. Over the threshold: summarize the oldest messages with the chat
+        // LLM. Without one (or if it fails) the buffer becomes a plain rolling
+        // window of the most recent messages — older ones stay archived as
+        // episodes, so nothing is lost, and memory stays bounded. Not
+        // configuring a chat LLM is a normal mode, so it is not a warning.
+        if needs_compression {
+            if !self.llm_client.chat_available() {
+                self.trim_to_recent(&key);
+            } else if let Err(e) = self.compress_buffer(&key).await {
+                tracing::warn!("context compression failed (episode {episode_id}): {e:#}");
+                warnings.push(format!("context compression failed: {e:#}"));
+                self.trim_to_recent(&key);
+            }
         }
 
         // 4. Get the current optimized state
@@ -200,7 +208,7 @@ impl SessionManager {
         let relevant_facts = match self.relevant_facts(tenant_id, new_message, ccl).await {
             Ok(facts) => facts,
             Err(e) => {
-                eprintln!("[neurolithe] fact recall failed (episode {episode_id}): {e:#}");
+                tracing::warn!("fact recall failed (episode {episode_id}): {e:#}");
                 warnings.push(format!("fact recall failed: {e:#}"));
                 Vec::new()
             }
@@ -233,6 +241,28 @@ impl SessionManager {
             &[ccl.to_string()],
             5,
         )
+    }
+
+    /// Drop all but the `keep_recent` newest messages (no summary is made; an
+    /// existing summary is kept). The dropped messages remain archived as
+    /// episodes.
+    fn trim_to_recent(&self, key: &str) {
+        let mut sessions = self.lock_sessions();
+        let Some(buffer) = sessions.get_mut(key) else {
+            return;
+        };
+        let excess = buffer.messages.len().saturating_sub(self.keep_recent);
+        buffer.messages.drain(0..excess);
+        buffer.token_count = buffer
+            .messages
+            .iter()
+            .map(|m| Self::estimate_tokens(m))
+            .sum::<usize>()
+            + buffer
+                .summary
+                .as_deref()
+                .map(Self::estimate_tokens)
+                .unwrap_or(0);
     }
 
     /// Compress the oldest messages in a session buffer into a dense summary.
@@ -408,8 +438,77 @@ mod tests {
             .push_dialogue(&t, &s, "second message", "reality")
             .await
             .expect("archived push must succeed");
-        assert_eq!(ctx.recent_messages.len(), 2, "buffer kept uncompressed");
+        assert_eq!(
+            ctx.recent_messages,
+            vec!["second message".to_string()],
+            "falls back to a rolling window"
+        );
+        assert!(ctx.summary.is_none());
         assert!(ctx.warnings.iter().any(|w| w.contains("compressor down")));
+    }
+
+    /// Compression is unavailable *by configuration* (no chat LLM).
+    struct NoChat {
+        compress_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for NoChat {
+        async fn extract_facts(
+            &self,
+            _d: &str,
+            _c: &[CclDefinition],
+        ) -> Result<Vec<ExtractedFact>> {
+            anyhow::bail!("LLM not configured")
+        }
+        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
+            anyhow::bail!("LLM not configured")
+        }
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.5, 0.1, 0.0, 0.0])
+        }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            self.compress_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!("LLM not configured")
+        }
+        fn chat_available(&self) -> bool {
+            false
+        }
+    }
+
+    /// Without a chat LLM the buffer is a rolling window of the newest
+    /// `keep_recent` messages: no compression call, no summary, no warning.
+    #[tokio::test]
+    async fn without_chat_llm_buffer_is_a_rolling_window() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&conn, 4).unwrap();
+        let llm = Arc::new(NoChat {
+            compress_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let sm = SessionManager::new(
+            Arc::new(SqliteMemoryRepository::new(conn)),
+            llm.clone(),
+            5, // tiny token threshold: every push overflows
+            2,
+        );
+        let (t, s) = (TenantId("t".into()), SessionId("s".into()));
+        let mut last = None;
+        for msg in [
+            "message one",
+            "message two",
+            "message three",
+            "message four",
+        ] {
+            last = Some(sm.push_dialogue(&t, &s, msg, "reality").await.unwrap().0);
+        }
+        let ctx = last.unwrap();
+        assert_eq!(ctx.recent_messages, vec!["message three", "message four"]);
+        assert!(ctx.summary.is_none());
+        assert!(ctx.warnings.is_empty(), "{:?}", ctx.warnings);
+        assert_eq!(
+            llm.compress_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
     }
 
     /// Two tenants using the same session id get separate buffers.

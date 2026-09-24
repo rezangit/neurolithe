@@ -218,14 +218,14 @@ mod tests {
         assert_eq!(m.stm_decay_histogram[1], 1, "0.3 in bin 1");
         assert!(m.stm_db_bytes > 0);
 
-        // LTM: 12 spine (root + 10 branches + inbox) + 1 leaf = 13 nodes; one
-        // inbox doc; tree height >= 2.
-        assert_eq!(m.ltm_tree_nodes, 13);
+        // LTM: 4 spine (root + notes + documents + inbox, the default spine)
+        // + 1 leaf = 5 nodes; one inbox doc; tree height >= 2.
+        assert_eq!(m.ltm_tree_nodes, 5);
         assert_eq!(m.ltm_leaves, 1);
         assert_eq!(m.ltm_inbox_docs, 1);
         assert_eq!(m.ltm_orphan_leaves, 0, "the leaf has a parent");
         assert!(m.ltm_max_depth >= 2);
-        assert!(m.ltm_edges >= 6); // 5 spine edges + 1 leaf edge
+        assert_eq!(m.ltm_edges, 4); // 3 spine edges + 1 leaf edge
         assert!(m.ltm_db_bytes > 0);
 
         // Runtime passed through.

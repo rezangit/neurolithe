@@ -1,12 +1,12 @@
-use crate::application::app::NeurolitheApp;
-use crate::application::introspection::{IntrospectionService, LeafPage};
-use crate::application::query_service::{QueryRequest, QueryScope, QueryService};
-use crate::domain::models::{DEFAULT_TENANT, TimeFilter};
+use crate::application::introspection::LeafPage;
+use crate::application::query_service::{QueryRequest, QueryScope};
+use crate::application::workspace::WorkspaceManager;
+use crate::domain::models::{TimeFilter, WORKSPACE_TENANT};
 use crate::interfaces::bus_query::flatten_recall;
 use crate::interfaces::mcp_types::{JsonRpcRequest, JsonRpcResponse, McpToolResult};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::rc::Rc;
 use tokio::io::{self, AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 // ---------------------------------------------------------------------------
@@ -30,9 +30,11 @@ const ID_PROBE_BYTES: usize = 1024;
 const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 /// Largest `fact_text` accepted by `store_memory` (bytes).
 const MAX_FACT_BYTES: usize = 16 * 1024;
+/// Largest document accepted by `remember_document` (bytes).
+const MAX_DOCUMENT_BYTES: usize = 512 * 1024;
 /// Largest search query (bytes).
 const MAX_QUERY_BYTES: usize = 4 * 1024;
-/// Largest identifier-like string (tenant, session, ccl, dataId, …).
+/// Largest identifier-like string (session, ccl, dataId, workspace, …).
 const MAX_ID_BYTES: usize = 256;
 
 /// Default recall breadth for the MCP query tools when the caller omits it.
@@ -52,6 +54,17 @@ fn introspect_result<T: Serialize>(result: anyhow::Result<T>) -> McpToolResult {
             McpToolResult::ok(serde_json::to_string(&value).unwrap_or_else(|_| "null".into()))
         }
         Err(e) => McpToolResult::err(format!("introspection failed: {e}")),
+    }
+}
+
+/// Render a workspace-operation result: JSON on success, the (already
+/// user-facing) error text as `isError` on failure.
+fn json_result<T: Serialize>(result: anyhow::Result<T>) -> McpToolResult {
+    match result {
+        Ok(value) => {
+            McpToolResult::ok(serde_json::to_string(&value).unwrap_or_else(|_| "null".into()))
+        }
+        Err(e) => McpToolResult::err(format!("{e}")),
     }
 }
 
@@ -144,13 +157,6 @@ impl<'a> Args<'a> {
             }
             Some(_) => Err(format!("'{name}' must be an array of strings")),
         }
-    }
-
-    /// The optional tenant (defaults to [`DEFAULT_TENANT`]).
-    fn tenant(&self) -> ArgResult<&'a str> {
-        Ok(self
-            .opt_str("tenant_id", MAX_ID_BYTES)?
-            .unwrap_or(DEFAULT_TENANT))
     }
 
     /// `time_filter: {after?, before?}` with `YYYY-MM-DD[...]` dates. Malformed
@@ -330,37 +336,62 @@ async fn read_bounded_line<R: AsyncBufRead + Unpin>(
 // ---------------------------------------------------------------------------
 
 pub struct McpServer {
-    app: Arc<NeurolitheApp>,
-    introspection: Arc<IntrospectionService>,
-    /// The shared recall use-case — the SAME service the `memory.query` bus door
-    /// runs on (design §7 "doors"). Both delivery adapters route through it so
-    /// the two doors can never drift on tenant/scope semantics again (the cause
-    /// of the field-report §1 empty-results bug).
-    query: QueryService,
+    /// The active workspace and its services, once startup has opened it.
+    /// Every tool call resolves the services through it, so `workspace_switch`
+    /// takes effect immediately. Recall runs on the same `QueryService` the
+    /// `memory.query` bus door uses, so the two doors can't drift.
+    ///
+    /// `None` while the workspace is still starting (embedder probe, store
+    /// migrations): `initialize` / `tools/list` / `ping` are answered anyway —
+    /// an MCP client must never time out waiting on a model load — and tool
+    /// calls wait for [`set_workspaces`](Self::set_workspaces).
+    workspaces: std::cell::RefCell<Option<Rc<WorkspaceManager>>>,
+    ready: tokio::sync::Notify,
 }
 
 impl McpServer {
-    pub fn new(
-        app: Arc<NeurolitheApp>,
-        introspection: Arc<IntrospectionService>,
-        query: QueryService,
-    ) -> Self {
+    /// A server over an already-open workspace.
+    pub fn new(workspaces: Rc<WorkspaceManager>) -> Self {
+        let server = Self::pending();
+        server.set_workspaces(workspaces);
+        server
+    }
+
+    /// A server whose workspace is still starting; see [`set_workspaces`](Self::set_workspaces).
+    pub fn pending() -> Self {
         Self {
-            app,
-            introspection,
-            query,
+            workspaces: std::cell::RefCell::new(None),
+            ready: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Hand over the opened workspace; releases any waiting tool calls.
+    pub fn set_workspaces(&self, workspaces: Rc<WorkspaceManager>) {
+        *self.workspaces.borrow_mut() = Some(workspaces);
+        self.ready.notify_waiters();
+    }
+
+    /// The workspace manager, waiting for startup if needed.
+    async fn workspaces(&self) -> Rc<WorkspaceManager> {
+        loop {
+            // Register before checking so a concurrent set can't be missed.
+            let notified = self.ready.notified();
+            if let Some(ws) = self.workspaces.borrow().clone() {
+                return ws;
+            }
+            notified.await;
         }
     }
 
     /// Build a [`QueryRequest`] from MCP tool arguments, applying the shared
-    /// defaults (tenant = [`DEFAULT_TENANT`], `reality` layer, breadth
-    /// [`DEFAULT_K`]). `scope` is fixed per tool. Keeps both query tools on one
+    /// defaults (`reality` layer, breadth [`DEFAULT_K`]). Isolation comes from
+    /// the workspace, so the tenant is always [`WORKSPACE_TENANT`]. `scope` is fixed per tool. Keeps both query tools on one
     /// parse path so their defaults never diverge. `query` is required: an
     /// empty query used to reach sqlite-vec and leak its SQL error (QA-9).
     fn query_request(&self, args: &Args, scope: QueryScope) -> ArgResult<QueryRequest> {
         Ok(QueryRequest {
             scope,
-            tenant: args.tenant()?.to_string(),
+            tenant: WORKSPACE_TENANT.to_string(),
             query: args.req_str("query", MAX_QUERY_BYTES)?.to_string(),
             k: args.count("k", DEFAULT_K, 1, MAX_K)?,
             time_filter: args.time_filter()?,
@@ -475,16 +506,20 @@ impl McpServer {
     /// rendered as an `isError` result; operational failures are rendered by
     /// each arm.
     async fn call_tool(&self, tool: &str, args: &Args<'_>) -> ArgResult<McpToolResult> {
+        // Resolve the active workspace once per call (a switch mid-call can't
+        // split one operation across two workspaces).
+        let manager = self.workspaces().await;
+        let ws = manager.current();
+        let svc = &ws.services;
         Ok(match tool {
             "store_memory" => {
                 // Explicit fact storage (bypasses the Sleep pipeline).
-                let tenant_id = args.tenant()?;
                 let fact_text = args.req_str("fact_text", MAX_FACT_BYTES)?;
                 let tags = args.str_list("tags", 64)?;
                 let ccl = args.opt_str("ccl", MAX_ID_BYTES)?.unwrap_or("reality");
-                match self
+                match svc
                     .app
-                    .store_explicit_fact(tenant_id, fact_text, &tags, ccl)
+                    .store_explicit_fact(WORKSPACE_TENANT, fact_text, &tags, ccl)
                     .await
                 {
                     Ok(_) => McpToolResult::ok("Memory fact explicitly stored."),
@@ -493,13 +528,12 @@ impl McpServer {
             }
             "push_dialogue" => {
                 // Flow 1: push dialogue to STM, compress, return optimized context.
-                let tenant_id = args.tenant()?;
                 let session_id = args.req_str("session_id", MAX_ID_BYTES)?;
                 let new_message = args.req_str("new_message", MAX_MESSAGE_BYTES)?;
                 let ccl = args.opt_str("ccl", MAX_ID_BYTES)?.unwrap_or("reality");
-                match self
+                match svc
                     .app
-                    .push_dialogue(tenant_id, session_id, new_message, ccl)
+                    .push_dialogue(WORKSPACE_TENANT, session_id, new_message, ccl)
                     .await
                 {
                     Ok(context_window) => McpToolResult::ok(
@@ -511,7 +545,7 @@ impl McpServer {
             "query_memory" => {
                 // STM recall over the shared QueryService (same path as the bus door).
                 let req = self.query_request(args, QueryScope::Stm)?;
-                match self.query.execute(&req).await {
+                match svc.query.execute(&req).await {
                     Ok(outcome) => McpToolResult::ok(
                         serde_json::to_string(&outcome.stm).unwrap_or_else(|_| "[]".into()),
                     ),
@@ -523,7 +557,7 @@ impl McpServer {
                 // the nearest concept/document and surface its `dataId` +
                 // provenance so the caller can fetch the original.
                 let req = self.query_request(args, QueryScope::Ltm)?;
-                match self.query.execute(&req).await {
+                match svc.query.execute(&req).await {
                     Ok(outcome) => {
                         let entries: Vec<_> = outcome.ltm.iter().flat_map(flatten_recall).collect();
                         McpToolResult::ok(
@@ -533,37 +567,53 @@ impl McpServer {
                     Err(e) => McpToolResult::err(format!("LTM recall failed: {e}")),
                 }
             }
-            "delete_tenant" => {
-                // Destructive: no default tenant, and the caller must repeat the
-                // tenant id in `confirm` (SEC-07).
-                let tenant_id = args.req_str("tenant_id", MAX_ID_BYTES)?;
-                let confirm = args.opt_str("confirm", MAX_ID_BYTES)?;
-                if confirm != Some(tenant_id) {
-                    return Err(format!(
-                        "delete_tenant is destructive: pass confirm = \"{tenant_id}\" \
-                         (the same value as tenant_id) to proceed"
-                    ));
-                }
-                match self.app.delete_tenant(tenant_id).await {
-                    Ok(_) => McpToolResult::ok(format!(
-                        "Successfully deleted all data for tenant {tenant_id}"
-                    )),
-                    Err(e) => McpToolResult::err(format!("Deletion failed: {e}")),
-                }
+            "remember_document" => {
+                // File a document/note into the permanent LTM tree (upsert by
+                // data_id). Summarized when a chat LLM is configured.
+                let doc = crate::application::documents::RememberDocument {
+                    title: args
+                        .opt_str("title", MAX_QUERY_BYTES)?
+                        .unwrap_or_default()
+                        .to_string(),
+                    text: args.req_str("text", MAX_DOCUMENT_BYTES)?.to_string(),
+                    data_id: args.opt_str("data_id", MAX_ID_BYTES)?.map(str::to_string),
+                    tags: args.str_list("tags", 64)?,
+                };
+                json_result(svc.documents.remember(doc).await)
             }
-            "export_tenant" => {
-                let tenant_id = args.tenant()?;
-                match self.app.export_tenant(tenant_id).await {
-                    Ok(json_export) => McpToolResult::ok(json_export),
-                    Err(e) => McpToolResult::err(format!("Export failed: {e}")),
+            // --- workspaces (physically separate memories) ---
+            "workspace_current" => json_result(manager.current_info()),
+            "workspace_list" => json_result(manager.list()),
+            "workspace_create" => {
+                let name = args.req_str("name", MAX_ID_BYTES)?;
+                json_result(manager.create(name))
+            }
+            "workspace_switch" => {
+                let name = args.req_str("name", MAX_ID_BYTES)?;
+                // Drop our handle on the old workspace before its stores close.
+                drop(ws);
+                json_result(manager.switch(name).await)
+            }
+            "workspace_export" => {
+                let name = args.opt_str("name", MAX_ID_BYTES)?;
+                json_result(manager.export(name))
+            }
+            "workspace_delete" => {
+                // Destructive: `confirm` must repeat the name; the active
+                // workspace can't be deleted.
+                let name = args.req_str("name", MAX_ID_BYTES)?;
+                let confirm = args.opt_str("confirm", MAX_ID_BYTES)?;
+                match manager.delete(name, confirm) {
+                    Ok(()) => McpToolResult::ok(format!("Deleted workspace {name:?}.")),
+                    Err(e) => McpToolResult::err(format!("{e}")),
                 }
             }
             // --- read-only introspection (CT scan) ---
-            "memory_stats" => introspect_result(self.introspection.memory_stats()),
-            "health" => introspect_result(self.introspection.health()),
+            "memory_stats" => introspect_result(svc.introspection.memory_stats()),
+            "health" => introspect_result(svc.introspection.health()),
             "placement_debug" => {
                 let sample = args.count("sample", 30, 1, MAX_SAMPLE)?;
-                introspect_result(self.introspection.placement_debug(sample))
+                introspect_result(svc.introspection.placement_debug(sample))
             }
             "stm_list" => {
                 let limit = args.count("limit", 20, 1, MAX_LIST_LIMIT)?;
@@ -576,11 +626,11 @@ impl McpServer {
                     return Err("'status' must be 'active' or 'archived'".into());
                 }
                 let contains = args.opt_str("contains", MAX_QUERY_BYTES)?;
-                introspect_result(self.introspection.stm_list(limit, offset, status, contains))
+                introspect_result(svc.introspection.stm_list(limit, offset, status, contains))
             }
             "ltm_map" => {
                 let depth = args.count("depth", 3, 1, MAX_DEPTH)?;
-                introspect_result(self.introspection.ltm_map(depth))
+                introspect_result(svc.introspection.ltm_map(depth))
             }
             "inspect_node" => {
                 let node_id = args.req_id("id")?;
@@ -589,16 +639,16 @@ impl McpServer {
                     child_offset: args.count("child_offset", 0, 0, MAX_OFFSET)?,
                     summary_max_chars: args.opt_count("summary_max_chars", 0, MAX_SUMMARY_CHARS)?,
                 };
-                introspect_result(self.introspection.inspect_node(node_id, page))
+                introspect_result(svc.introspection.inspect_node(node_id, page))
             }
             "subtree" => {
                 let node_id = args.req_id("node")?;
                 let depth = args.count("depth", 2, 1, MAX_DEPTH)?;
-                introspect_result(self.introspection.subtree(node_id, depth))
+                introspect_result(svc.introspection.subtree(node_id, depth))
             }
             "trace_dataId" => {
                 let data_id = args.req_str("dataId", MAX_ID_BYTES)?;
-                introspect_result(self.introspection.trace_data_id(data_id))
+                introspect_result(svc.introspection.trace_data_id(data_id))
             }
             other => return Err(format!("Unknown tool: {other}")),
         })
@@ -628,8 +678,13 @@ const TOOL_NAMES: &[&str] = &[
     "store_memory",
     "query_memory",
     "recall_ltm",
-    "delete_tenant",
-    "export_tenant",
+    "remember_document",
+    "workspace_current",
+    "workspace_list",
+    "workspace_create",
+    "workspace_switch",
+    "workspace_export",
+    "workspace_delete",
     "memory_stats",
     "health",
     "placement_debug",
@@ -640,12 +695,11 @@ const TOOL_NAMES: &[&str] = &[
     "trace_dataId",
 ];
 
-/// The optional-tenant schema fragment, with the real default spelled out
-/// (schemas used to claim `'default'` while the code used `DEFAULT_TENANT`).
-fn tenant_prop() -> Value {
+fn name_prop() -> Value {
     json!({
         "type": "string",
-        "description": format!("Optional tenant ID. Defaults to '{DEFAULT_TENANT}'.")
+        "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+        "description": "Workspace name: 1-64 chars of a-z, 0-9, '_' or '-', starting with a letter or digit."
     })
 }
 
@@ -688,8 +742,7 @@ fn tools_list() -> Value {
                     "properties": {
                         "session_id": { "type": "string", "description": "The session ID for the conversation" },
                         "new_message": { "type": "string", "maxLength": MAX_MESSAGE_BYTES, "description": "The new dialogue message to process" },
-                        "ccl": ccl_prop(),
-                        "tenant_id": tenant_prop()
+                        "ccl": ccl_prop()
                     },
                     "required": ["session_id", "new_message"]
                 }
@@ -702,8 +755,7 @@ fn tools_list() -> Value {
                     "properties": {
                         "fact_text": { "type": "string", "maxLength": MAX_FACT_BYTES, "description": "The factual statement to store" },
                         "tags": { "type": "array", "items": { "type": "string" }, "description": "Tags for categorizing the fact" },
-                        "ccl": ccl_prop(),
-                        "tenant_id": tenant_prop()
+                        "ccl": ccl_prop()
                     },
                     "required": ["fact_text"]
                 }
@@ -717,8 +769,7 @@ fn tools_list() -> Value {
                         "query": { "type": "string", "maxLength": MAX_QUERY_BYTES, "description": "The query to search for in memory" },
                         "k": k_prop(DEFAULT_K),
                         "time_filter": time_filter_prop(),
-                        "ccl_filter": { "type": "array", "items": { "type": "string" }, "description": "Cognitive layers to search. Defaults to ['reality']." },
-                        "tenant_id": tenant_prop()
+                        "ccl_filter": { "type": "array", "items": { "type": "string" }, "description": "Cognitive layers to search. Defaults to ['reality']." }
                     },
                     "required": ["query"]
                 },
@@ -731,37 +782,87 @@ fn tools_list() -> Value {
                     "type": "object",
                     "properties": {
                         "query": { "type": "string", "maxLength": MAX_QUERY_BYTES, "description": "What to look for in the archive (a phrase, topic, merchant, or document description)." },
-                        "k": k_prop(DEFAULT_K),
-                        "tenant_id": tenant_prop()
+                        "k": k_prop(DEFAULT_K)
                     },
                     "required": ["query"]
                 },
                 "annotations": read_only
             },
             {
-                "name": "delete_tenant",
-                "description": "DESTRUCTIVE: delete all memory nodes, edges, and episodes for one tenant. Requires tenant_id and confirm set to the same value.",
+                "name": "remember_document",
+                "description": "File a document or note into the PERMANENT long-term archive: it is summarized (if a chat LLM is configured), embedded, and placed under the best-matching concept. Returns {data_id, leaf_id, concept_path, updated, summarized}. Passing an existing data_id replaces that document (upsert).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "tenant_id": { "type": "string", "description": "The tenant whose data is deleted. Required (no default)." },
-                        "confirm": { "type": "string", "description": "Must equal tenant_id, to confirm the deletion." }
+                        "title": { "type": "string", "description": "Human-facing title. Defaults to the first line of text." },
+                        "text": { "type": "string", "maxLength": MAX_DOCUMENT_BYTES, "description": "The document text." },
+                        "data_id": { "type": "string", "description": "Stable id for upserts. Omitted: a new id is minted." },
+                        "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional tags." }
                     },
-                    "required": ["tenant_id", "confirm"]
+                    "required": ["text"]
                 },
-                "annotations": { "destructiveHint": true, "idempotentHint": true }
+                // Writes to memory; only idempotent when a data_id is given
+                // (without one each call files a new document).
+                "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false }
             },
             {
-                "name": "export_tenant",
-                "description": "Export all memory data for a tenant as a JSON string.",
+                "name": "workspace_current",
+                "description": "The active workspace: {name, path, stm_bytes, ltm_bytes}. Each workspace is a completely separate memory (its own STM + LTM stores).",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] },
+                "annotations": read_only
+            },
+            {
+                "name": "workspace_list",
+                "description": "All workspaces with their store sizes; the active one has active=true.",
+                "inputSchema": { "type": "object", "properties": {}, "required": [] },
+                "annotations": read_only
+            },
+            {
+                "name": "workspace_create",
+                "description": "Create a new, empty workspace (a separate memory). Does not switch to it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "tenant_id": tenant_prop()
+                        "name": name_prop()
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "workspace_switch",
+                "description": "Make another existing workspace active. Its stores are opened and the session buffers start empty; all memory tools then read and write that workspace. May be disabled by the server config.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": name_prop()
+                    },
+                    "required": ["name"]
+                }
+            },
+            {
+                "name": "workspace_export",
+                "description": "JSON dump of a workspace's STM facts and LTM document leaves (read-only). Defaults to the active workspace.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": name_prop()
                     },
                     "required": []
                 },
                 "annotations": read_only
+            },
+            {
+                "name": "workspace_delete",
+                "description": "DESTRUCTIVE: permanently delete a workspace and all of its memory. Requires confirm equal to name. The active workspace cannot be deleted.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "name": name_prop(),
+                        "confirm": { "type": "string", "description": "Must equal name, to confirm the deletion." }
+                    },
+                    "required": ["name", "confirm"]
+                },
+                "annotations": { "destructiveHint": true, "idempotentHint": true }
             },
             {
                 "name": "memory_stats",
@@ -861,15 +962,12 @@ fn tools_list() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::ltm_retrieval::LtmRetrieval;
-    use crate::application::retrieval::RetrievalService;
-    use crate::domain::ltm::LtmRepository;
+    use crate::daemon::SqliteWorkspaceHost;
     use crate::domain::models::CclDefinition;
-    use crate::domain::ports::{ExtractedFact, LlmClient, MemoryRepository};
-    use crate::infrastructure::database::init_db;
-    use crate::infrastructure::ltm_repository::SqliteLtmRepository;
-    use crate::infrastructure::repository::SqliteMemoryRepository;
-    use crate::infrastructure::schema::{init_ltm_schema, init_schema};
+    use crate::domain::ports::{ExtractedFact, LlmClient};
+    use crate::infrastructure::config::{AppConfig, LoadOptions};
+    use std::collections::HashMap;
+    use std::sync::Arc;
 
     const DIM: usize = 4;
 
@@ -899,29 +997,46 @@ mod tests {
 
     struct Harness {
         server: McpServer,
-        stm: Arc<dyn MemoryRepository>,
+        _home: tempfile::TempDir,
     }
 
-    fn harness() -> Harness {
-        let stm_conn = init_db(None as Option<&String>).unwrap();
-        init_schema(&stm_conn, DIM).unwrap();
-        let ltm_conn = init_db(None as Option<&String>).unwrap();
-        init_ltm_schema(&ltm_conn, DIM).unwrap();
-        let stm: Arc<dyn MemoryRepository> = Arc::new(SqliteMemoryRepository::new(stm_conn));
-        let ltm: Arc<dyn LtmRepository> = Arc::new(SqliteLtmRepository::new(ltm_conn));
-        ltm.seed_spine().unwrap();
-        let llm: Arc<dyn LlmClient> = Arc::new(StubLlm);
-        let app = Arc::new(NeurolitheApp::new(stm.clone(), llm.clone(), 7.0, 0.02));
-        let introspection = Arc::new(IntrospectionService::new(stm.clone(), ltm.clone()));
-        let query = QueryService::new(
-            RetrievalService::new(llm.clone(), stm.clone()),
-            LtmRetrieval::new(ltm),
-            llm,
-        );
+    /// A throwaway home with tiny embedding dimensions.
+    fn test_config(home: &std::path::Path, allow_switch: bool) -> AppConfig {
+        let env: HashMap<String, String> = [
+            ("NEUROLITHE__STM__VECTOR_DIMENSION", DIM.to_string()),
+            ("NEUROLITHE__LTM__VECTOR_DIMENSION", DIM.to_string()),
+            (
+                "NEUROLITHE__MCP__ALLOW_WORKSPACE_SWITCH",
+                allow_switch.to_string(),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let opts = LoadOptions {
+            home: Some(home.to_path_buf()),
+            ..Default::default()
+        };
+        AppConfig::load_with(&opts, &|_| None, Some(env)).unwrap()
+    }
+
+    /// The real server over the real SQLite workspace layout in a temp home,
+    /// with an offline stub LLM. Starts on workspace "default".
+    async fn harness_with(allow_switch: bool) -> Harness {
+        let home = tempfile::tempdir().unwrap();
+        let config = test_config(home.path(), allow_switch);
+        let host = SqliteWorkspaceHost::new(config.clone(), Arc::new(StubLlm));
+        let workspaces = WorkspaceManager::start(Box::new(host), &config.workspace, allow_switch)
+            .await
+            .unwrap();
         Harness {
-            server: McpServer::new(app, introspection, query),
-            stm,
+            server: McpServer::new(Rc::new(workspaces)),
+            _home: home,
         }
+    }
+
+    async fn harness() -> Harness {
+        harness_with(true).await
     }
 
     async fn rpc(h: &Harness, method: &str, params: Value) -> Value {
@@ -947,9 +1062,17 @@ mod tests {
             .to_string()
     }
 
+    /// Facts in the ACTIVE workspace's STM.
     fn stm_count(h: &Harness) -> usize {
-        h.stm
-            .list_node_summaries(1000, 0, None, None)
+        h.server
+            .workspaces
+            .borrow()
+            .clone()
+            .expect("workspace ready")
+            .current()
+            .services
+            .introspection
+            .stm_list(1000, 0, None, None)
             .unwrap()
             .len()
     }
@@ -958,7 +1081,7 @@ mod tests {
     /// newest) and no longer advertises list-change notifications it never sends.
     #[tokio::test]
     async fn test_initialize_negotiates_version_and_no_list_changed() {
-        let h = harness();
+        let h = harness().await;
         let r = rpc(&h, "initialize", json!({ "protocolVersion": "2025-03-26" })).await;
         assert_eq!(r["result"]["protocolVersion"], "2025-03-26");
         assert_eq!(r["result"]["capabilities"]["tools"]["listChanged"], false);
@@ -973,7 +1096,7 @@ mod tests {
     /// QA-11: `ping` answers with an empty result (it used to be -32601).
     #[tokio::test]
     async fn test_ping() {
-        let h = harness();
+        let h = harness().await;
         let r = rpc(&h, "ping", json!({})).await;
         assert_eq!(r["result"], json!({}));
         assert!(r.get("error").is_none());
@@ -983,7 +1106,7 @@ mod tests {
     /// nothing (it used to store an empty fact and report success).
     #[tokio::test]
     async fn test_store_memory_requires_fact_text() {
-        let h = harness();
+        let h = harness().await;
         for args in [
             json!({}),
             json!({ "fact_text": "   " }),
@@ -1008,7 +1131,7 @@ mod tests {
     /// QA-9: an empty query is a clear argument error, not a leaked vec0/SQL error.
     #[tokio::test]
     async fn test_query_memory_requires_query() {
-        let h = harness();
+        let h = harness().await;
         for tool in ["query_memory", "recall_ltm"] {
             let r = call(&h, tool, json!({ "query": "" })).await;
             assert!(is_error(&r), "{tool}: {r}");
@@ -1022,7 +1145,7 @@ mod tests {
     /// are clamped instead of being cast to "no limit"; bad dates are errors.
     #[tokio::test]
     async fn test_counts_rejected_or_clamped_and_dates_validated() {
-        let h = harness();
+        let h = harness().await;
         let r = call(&h, "query_memory", json!({ "query": "x", "k": -5 })).await;
         assert!(is_error(&r) && text(&r).contains("'k'"), "{r}");
         let r = call(&h, "stm_list", json!({ "limit": 2.5 })).await;
@@ -1053,49 +1176,203 @@ mod tests {
     /// SEC-12: oversized text arguments are refused before touching the LLM/DB.
     #[tokio::test]
     async fn test_oversized_fact_rejected() {
-        let h = harness();
+        let h = harness().await;
         let big = "a".repeat(MAX_FACT_BYTES + 1);
         let r = call(&h, "store_memory", json!({ "fact_text": big })).await;
         assert!(is_error(&r) && text(&r).contains("too large"), "{r}");
         assert_eq!(stm_count(&h), 0);
     }
 
-    /// SEC-07: `delete_tenant {}` no longer wipes the default tenant; it needs
-    /// an explicit tenant and a matching confirmation.
+    /// 2.2: workspaces are completely separate memories. A fact stored in
+    /// "default" is invisible after switching to "work", and visible again
+    /// after switching back.
     #[tokio::test]
-    async fn test_delete_tenant_requires_explicit_confirmed_tenant() {
-        let h = harness();
-        call(&h, "store_memory", json!({ "fact_text": "keep me" })).await;
+    async fn test_workspace_switch_isolates_memory() {
+        let h = harness().await;
+        let r = call(&h, "workspace_current", json!({})).await;
+        let cur: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert_eq!(cur["name"], "default", "{r}");
+
+        call(
+            &h,
+            "store_memory",
+            json!({ "fact_text": "lives in default" }),
+        )
+        .await;
         assert_eq!(stm_count(&h), 1);
 
-        let r = call(&h, "delete_tenant", json!({})).await;
-        assert!(is_error(&r) && text(&r).contains("tenant_id"), "{r}");
-        let r = call(&h, "delete_tenant", json!({ "tenant_id": DEFAULT_TENANT })).await;
+        let r = call(&h, "workspace_create", json!({ "name": "work" })).await;
+        assert!(!is_error(&r), "{r}");
+        let r = call(&h, "workspace_switch", json!({ "name": "work" })).await;
+        assert!(!is_error(&r), "{r}");
+        assert_eq!(stm_count(&h), 0, "a new workspace shares nothing");
+        let r = call(&h, "query_memory", json!({ "query": "lives in default" })).await;
+        assert_eq!(text(&r), "[]", "no cross-workspace recall: {r}");
+
+        call(&h, "workspace_switch", json!({ "name": "default" })).await;
+        assert_eq!(stm_count(&h), 1);
+
+        let r = call(&h, "workspace_list", json!({})).await;
+        let list: Value = serde_json::from_str(&text(&r)).unwrap();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|w| w["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["default", "work"]);
+        assert_eq!(list[0]["active"], true);
+        assert_eq!(list[1]["active"], false);
+    }
+
+    /// 2.2: switching to a missing or badly named workspace is refused, as is
+    /// creating one twice.
+    #[tokio::test]
+    async fn test_workspace_switch_and_create_validation() {
+        let h = harness().await;
+        let r = call(&h, "workspace_switch", json!({ "name": "nope" })).await;
+        assert!(is_error(&r) && text(&r).contains("does not exist"), "{r}");
+        let r = call(&h, "workspace_create", json!({ "name": "../escape" })).await;
+        assert!(
+            is_error(&r) && text(&r).contains("invalid workspace name"),
+            "{r}"
+        );
+        let r = call(&h, "workspace_create", json!({ "name": "default" })).await;
+        assert!(is_error(&r) && text(&r).contains("already exists"), "{r}");
+        let r = call(&h, "workspace_switch", json!({})).await;
+        assert!(is_error(&r) && text(&r).contains("'name'"), "{r}");
+    }
+
+    /// 2.2: `[mcp] allow_workspace_switch = false` pins the server.
+    #[tokio::test]
+    async fn test_workspace_switch_can_be_disabled() {
+        let h = harness_with(false).await;
+        let r = call(&h, "workspace_switch", json!({ "name": "default" })).await;
+        assert!(is_error(&r) && text(&r).contains("disabled"), "{r}");
+    }
+
+    /// P2R-4: a pinned session (switching disabled) can't reach any other
+    /// workspace — no create, delete, or export of another — but can still
+    /// export its own.
+    #[tokio::test]
+    async fn test_pinned_session_cannot_touch_other_workspaces() {
+        let h = harness_with(false).await;
+        // Another workspace exists on disk (made by some other session/CLI).
+        let home = h._home.path().to_path_buf();
+        std::fs::create_dir_all(home.join("workspaces/other")).unwrap();
+
+        let r = call(&h, "workspace_create", json!({ "name": "new" })).await;
+        assert!(is_error(&r) && text(&r).contains("pinned"), "{r}");
+        let r = call(
+            &h,
+            "workspace_delete",
+            json!({ "name": "other", "confirm": "other" }),
+        )
+        .await;
+        assert!(is_error(&r) && text(&r).contains("pinned"), "{r}");
+        assert!(home.join("workspaces/other").exists());
+        let r = call(&h, "workspace_export", json!({ "name": "other" })).await;
+        assert!(is_error(&r) && text(&r).contains("pinned"), "{r}");
+
+        let r = call(&h, "workspace_export", json!({})).await;
+        assert!(!is_error(&r), "own workspace exports: {r}");
+        let r = call(&h, "workspace_export", json!({ "name": "default" })).await;
+        assert!(!is_error(&r), "{r}");
+    }
+
+    /// 2.2 / SEC-07: delete needs confirm == name, and the active workspace
+    /// can't be deleted.
+    #[tokio::test]
+    async fn test_workspace_delete_rules() {
+        let h = harness().await;
+        call(&h, "workspace_create", json!({ "name": "scratch" })).await;
+
+        let r = call(&h, "workspace_delete", json!({ "name": "scratch" })).await;
         assert!(is_error(&r) && text(&r).contains("confirm"), "{r}");
         let r = call(
             &h,
-            "delete_tenant",
-            json!({ "tenant_id": DEFAULT_TENANT, "confirm": "other" }),
+            "workspace_delete",
+            json!({ "name": "scratch", "confirm": "other" }),
         )
         .await;
         assert!(is_error(&r), "{r}");
-        assert_eq!(stm_count(&h), 1, "nothing deleted without confirmation");
+        let r = call(
+            &h,
+            "workspace_delete",
+            json!({ "name": "default", "confirm": "default" }),
+        )
+        .await;
+        assert!(is_error(&r) && text(&r).contains("active"), "{r}");
 
         let r = call(
             &h,
-            "delete_tenant",
-            json!({ "tenant_id": DEFAULT_TENANT, "confirm": DEFAULT_TENANT }),
+            "workspace_delete",
+            json!({ "name": "scratch", "confirm": "scratch" }),
         )
         .await;
         assert!(!is_error(&r), "{r}");
-        assert_eq!(stm_count(&h), 0);
+        let r = call(&h, "workspace_list", json!({})).await;
+        assert!(!text(&r).contains("scratch"), "{r}");
+    }
+
+    /// 2.2: export dumps the active (or named) workspace's facts.
+    #[tokio::test]
+    async fn test_workspace_export() {
+        let h = harness().await;
+        call(
+            &h,
+            "store_memory",
+            json!({ "fact_text": "exportable fact" }),
+        )
+        .await;
+        let r = call(&h, "workspace_export", json!({})).await;
+        assert!(!is_error(&r), "{r}");
+        let dump: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert_eq!(dump["workspace"], "default");
+        assert_eq!(dump["stm_facts"][0]["payload"]["fact"], "exportable fact");
+        let r = call(&h, "workspace_export", json!({ "name": "missing" })).await;
+        assert!(is_error(&r), "{r}");
+    }
+
+    /// 2.5: remember_document files into LTM (upsert by data_id) and needs text.
+    #[tokio::test]
+    async fn test_remember_document_upserts() {
+        let h = harness().await;
+        let r = call(&h, "remember_document", json!({ "title": "t" })).await;
+        assert!(is_error(&r) && text(&r).contains("'text'"), "{r}");
+
+        let args =
+            json!({ "title": "Lease", "text": "Apartment lease for 2026", "data_id": "doc_lease" });
+        let r = call(&h, "remember_document", args.clone()).await;
+        assert!(!is_error(&r), "{r}");
+        let first: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert_eq!(first["data_id"], "doc_lease");
+        assert_eq!(first["updated"], false);
+
+        let r = call(&h, "remember_document", args).await;
+        let second: Value = serde_json::from_str(&text(&r)).unwrap();
+        assert_eq!(second["updated"], true, "same data_id replaces: {r}");
+    }
+
+    /// 2.2: `tenant_id` is gone from every tool schema, and the old tenant
+    /// tools no longer exist.
+    #[tokio::test]
+    async fn test_no_tenant_surface() {
+        let h = harness().await;
+        let list = rpc(&h, "tools/list", json!({})).await;
+        let rendered = list.to_string();
+        assert!(!rendered.contains("tenant"), "tenant leaked into schemas");
+        for gone in ["delete_tenant", "export_tenant"] {
+            let r = rpc(&h, "tools/call", json!({ "name": gone, "arguments": {} })).await;
+            assert_eq!(r["error"]["code"], -32602, "{gone}: {r}");
+        }
     }
 
     /// REV-6: an unknown tool is a JSON-RPC invalid-params error (-32602)
     /// naming the tool, not an `isError` tool result.
     #[tokio::test]
     async fn test_unknown_tool_is_protocol_error() {
-        let h = harness();
+        let h = harness().await;
         let r = rpc(&h, "tools/call", json!({ "name": "nope", "arguments": {} })).await;
         assert_eq!(r["error"]["code"], -32602, "{r}");
         assert!(r["error"]["message"].as_str().unwrap().contains("nope"));
@@ -1106,7 +1383,7 @@ mod tests {
     /// the dispatcher accepts, and list exactly the dispatchable tools.
     #[tokio::test]
     async fn test_tool_schemas_match_dispatcher() {
-        let h = harness();
+        let h = harness().await;
         let list = rpc(&h, "tools/list", json!({})).await["result"]["tools"].clone();
         let tools = list.as_array().unwrap();
 
@@ -1121,7 +1398,6 @@ mod tests {
             !rendered.contains("Defaults to 'default'"),
             "a schema still claims the tenant default is 'default'"
         );
-        assert!(!rendered.contains("JARVIS tenant"));
 
         let props = |name: &str| {
             tools.iter().find(|t| t["name"] == name).unwrap()["inputSchema"]["properties"].clone()
@@ -1131,7 +1407,7 @@ mod tests {
             ("store_memory", "ccl"),
             ("query_memory", "ccl_filter"),
             ("recall_ltm", "k"),
-            ("delete_tenant", "confirm"),
+            ("workspace_delete", "confirm"),
         ] {
             assert!(
                 props(tool).get(param).is_some(),
@@ -1150,7 +1426,7 @@ mod tests {
     /// loop; the next request is still served.
     #[tokio::test]
     async fn test_oversized_line_rejected_and_loop_continues() {
-        let h = harness();
+        let h = harness().await;
         let mut input = Vec::new();
         input.extend_from_slice(
             br#"{"id":41,"jsonrpc":"2.0","method":"tools/call","params":{"x":""#,
@@ -1207,7 +1483,7 @@ mod tests {
     /// Notifications (no id) get no reply; a final line without `\n` is served.
     #[tokio::test]
     async fn test_notifications_silent_and_unterminated_last_line() {
-        let h = harness();
+        let h = harness().await;
         let input = b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}";
         let mut out: Vec<u8> = Vec::new();
         h.server

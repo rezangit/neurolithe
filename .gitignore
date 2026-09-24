@@ -9,8 +9,10 @@ docs/book
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+# ...except committed test fixtures
+!/tests/fixtures/**/*.sqlite
 
-# Secrets / local env (Pithos token, LLM API key, reset token)
+# Secrets / local env (LLM API keys, Kafka SASL credentials, reset token)
 .env
 
 # Internal design/audit docs — kept local only, not for the public repo

@@ -1,0 +1,22 @@
+{
+  "edges": 2,
+  "embedding_dim": 64,
+  "embedding_model": "fake-embed",
+  "embedding_provider": "openai-compatible fake (tests/common)",
+  "episodes": 2,
+  "generated_by": "neurolithe v0.2.0 (pre-Phase-2 master)",
+  "tenants": {
+    "jarvis": [
+      "Alice works at Acme",
+      "Bob likes green tea",
+      "Extracted: I moved to Oslo last spring [rel:Oslo]",
+      "Oslo",
+      "The vault code is 4711"
+    ],
+    "work": [
+      "Carol",
+      "Extracted: I have a meeting with Carol [rel:Carol]",
+      "Quarterly report is due Friday"
+    ]
+  }
+}

@@ -65,11 +65,21 @@ fn is_indexable(embedding: &[f32]) -> bool {
 
 pub struct SqliteMemoryRepository {
     conn: Connection,
+    /// Keeps the workspace marked "open" (its shared advisory lock) for
+    /// exactly as long as this connection lives — i.e. as long as anything
+    /// still holds the repository.
+    _lease: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl SqliteMemoryRepository {
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self { conn, _lease: None }
+    }
+
+    /// Tie a workspace lease to this repository's connection lifetime.
+    pub fn with_lease(mut self, lease: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self._lease = Some(lease);
+        self
     }
 
     /// The `about` subjects of a turn (STM-GRAPH), as connections: one per
@@ -954,7 +964,7 @@ mod tests {
     #[test]
     fn test_query_with_graph_is_punctuation_safe_and_finds_verbatim() {
         let repo = setup_mem_repo();
-        let t = TenantId("jarvis".into());
+        let t = TenantId("legacy".into());
         let node = MemoryNode {
             id: None,
             tenant_id: t.clone(),
@@ -998,7 +1008,7 @@ mod tests {
     #[test]
     fn test_ranking_prefers_match_quality_and_surfaces_data_id() {
         let repo = setup_mem_repo();
-        let t = TenantId("jarvis".into());
+        let t = TenantId("legacy".into());
 
         // Strong match: contains both query terms; modest relevance.
         let strong = MemoryNode {

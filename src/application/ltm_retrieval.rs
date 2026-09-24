@@ -3,7 +3,7 @@
 //!
 //! Results are **reference-returning**: leaves surface their `dataId` +
 //! provenance (the opposite of STM's id-hiding `MemoryResult`), so the agent
-//! can fetch originals from Ledger -> Pithos. See `V2-DESIGN.md` §3.3.
+//! can fetch originals from their source.
 
 use crate::domain::ltm::{LtmRepository, Provenance, TreeNode, TreeNodeKind};
 use anyhow::Result;
@@ -464,7 +464,7 @@ mod tests {
         repo.add_edge(&TreeEdge::new(root, concept)).unwrap();
         let leaf = repo
             .create_node(
-                &TreeNode::new("note", "a durable metis note", TreeNodeKind::Leaf),
+                &TreeNode::new("note", "a durable agent note", TreeNodeKind::Leaf),
                 Some(&[0.0, 1.0, 0.0, 0.0]),
             )
             .unwrap();
@@ -472,7 +472,7 @@ mod tests {
             tree_node_id: leaf,
             data_id: "note_1".into(),
             provenance: Provenance {
-                source: "metis".into(),
+                source: "agent".into(),
                 ingested_at: None,
                 confidence: 1.0,
             },
@@ -493,7 +493,7 @@ mod tests {
         assert_eq!(recalled.entry.kind, TreeNodeKind::Leaf);
         assert_eq!(recalled.leaves.len(), 1);
         assert_eq!(recalled.leaves[0].data_id, "note_1");
-        assert_eq!(recalled.leaves[0].provenance.source, "metis");
+        assert_eq!(recalled.leaves[0].provenance.source, "agent");
         // Framed by its ancestor for context.
         assert!(recalled.ancestors.iter().any(|n| n.id == root));
     }

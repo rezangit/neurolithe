@@ -23,6 +23,64 @@ fn add_column_if_missing(
     Ok(())
 }
 
+/// The STM sqlite-vec index table.
+pub const STM_VEC_TABLES: &[&str] = &["vec_nodes"];
+/// The LTM sqlite-vec index tables (concepts, document leaves).
+pub const LTM_VEC_TABLES: &[&str] = &["vec_ltm", "vec_leaves"];
+
+/// `CREATE VIRTUAL TABLE IF NOT EXISTS <table>` as a vec0 index at `dim`.
+fn create_vec_table(conn: &Connection, table: &str, dim: usize) -> rusqlite::Result<()> {
+    conn.execute(
+        &format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {table} USING vec0(
+                node_id INTEGER PRIMARY KEY,
+                embedding float[{dim}]
+            )"
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+/// Create the STM vector index (`vec_nodes`) at `dim`, if absent.
+pub fn create_stm_vec_table(conn: &Connection, dim: usize) -> rusqlite::Result<()> {
+    create_vec_table(conn, "vec_nodes", dim)
+}
+
+/// Create the LTM vector indexes (`vec_ltm`, `vec_leaves`) at `dim`, if absent.
+pub fn create_ltm_vec_tables(conn: &Connection, dim: usize) -> rusqlite::Result<()> {
+    for table in LTM_VEC_TABLES {
+        create_vec_table(conn, table, dim)?;
+    }
+    Ok(())
+}
+
+/// Drop the given vec0 tables (used to rebuild them at a new dimension).
+pub fn drop_vec_tables(conn: &Connection, tables: &[&str]) -> rusqlite::Result<()> {
+    for table in tables {
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+    }
+    Ok(())
+}
+
+/// The dimension a vec0 table was created with (parsed from its DDL), or
+/// `None` if the table does not exist.
+pub fn vec_table_dim(conn: &Connection, table: &str) -> rusqlite::Result<Option<usize>> {
+    use rusqlite::OptionalExtension;
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(sql.and_then(|sql| {
+        let start = sql.find("float[")? + "float[".len();
+        let len = sql[start..].find(']')?;
+        sql[start..start + len].trim().parse().ok()
+    }))
+}
+
 /// Initialize the database schema for NeuroLithe memory service.
 /// This creates the required `episodes`, `nodes`, and `edges` tables if they don't exist.
 pub fn init_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::Result<()> {
@@ -106,14 +164,7 @@ pub fn init_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::Resu
     )?;
     // 4. The Vector Index (Semantic Search via sqlite-vec)
     // We use vec0 to store our configurable dimensional embeddings
-    let vec_query = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_nodes USING vec0(
-            node_id INTEGER PRIMARY KEY,
-            embedding float[{}]
-        )",
-        vector_dimension
-    );
-    conn.execute(&vec_query, [])?;
+    create_stm_vec_table(conn, vector_dimension)?;
 
     // Only active, meaningfully-embedded nodes belong in the KNN index (ARC-17).
     // Stores written before that rule may still hold vectors for archived nodes
@@ -208,7 +259,7 @@ pub fn init_ltm_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::
         [],
     )?;
 
-    // 2. Document leaves — a tree node points at a dataId (Ledger/Pithos).
+    // 2. Document leaves — a tree node points at a dataId (the source document).
     conn.execute(
         "CREATE TABLE IF NOT EXISTS leaves (
             tree_node_id INTEGER NOT NULL,
@@ -229,23 +280,9 @@ pub fn init_ltm_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::
     // only, so a document's embedding can never crowd out a concept match (the
     // vec0 `k` cut is applied before any kind filter — a shared index would let
     // a near leaf displace the real concept and misroute the doc to the inbox).
-    let vec_query = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_ltm USING vec0(
-            node_id INTEGER PRIMARY KEY,
-            embedding float[{vector_dimension}]
-        )"
-    );
-    conn.execute(&vec_query, [])?;
-
-    // 3b. Vector index over DOCUMENT LEAF embeddings — so recall can land on a
-    // document directly by meaning (while it still sits under the inbox).
-    let vec_leaves_query = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS vec_leaves USING vec0(
-            node_id INTEGER PRIMARY KEY,
-            embedding float[{vector_dimension}]
-        )"
-    );
-    conn.execute(&vec_leaves_query, [])?;
+    // 3b. `vec_leaves`: vector index over DOCUMENT LEAF embeddings — so recall
+    // can land on a document directly by meaning (while it sits in the inbox).
+    create_ltm_vec_tables(conn, vector_dimension)?;
 
     // 4. FTS5 over node summaries (content table = tree_nodes).
     conn.execute(

@@ -3,10 +3,94 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [Unreleased] — 0.2.1
+## [0.3.0] — 2026-09-24
 
-Correctness and hardening release from the 2026-09 multi-discipline review
-(`project-review/`). Phase 0 (safety net) + Phase 1 (make it correct).
+A clean standalone product: one user, isolated **workspaces**, **local
+embeddings with no API key**, a proper home directory, versioned stores, and no
+JARVIS-specific coupling. **Breaking**: config location, store layout, and the
+MCP tool surface all change. See *Upgrading* below.
+
+### Upgrading from 0.2.x
+
+1. `cargo install --path .` (the prebuilt-binary installers are retired), then
+   `neurolithe init`. This writes `~/.neurolithe/neurolithe.toml`, downloads the
+   local embedding model (~130 MB, once), and prints an MCP client snippet.
+2. Bring an old store over with
+   `neurolithe workspace import <name> --stm <old-stm.sqlite> --ltm <old-ltm.sqlite>`.
+   The source files are left untouched and a backup is taken before migrating.
+   All old tenants are merged into the workspace.
+3. If the old store was embedded with a different model, run
+   `neurolithe reembed --workspace <name>`.
+4. Update MCP client configs to the snippet `init` prints (`args: ["mcp", …]`).
+   `tenant_id` arguments, `delete_tenant` and `export_tenant` are gone.
+
+### Added
+
+- **Workspaces**: fully separate STM+LTM store pairs under
+  `<home>/workspaces/<name>/`.
+  - Select one with `--workspace`, `NEUROLITHE_WORKSPACE` or config.
+  - MCP tools: `workspace_current/list/create/switch/export/delete`. Delete
+    requires `confirm` and refuses the active workspace; switching can be
+    disabled with `[mcp] allow_workspace_switch`.
+  - CLI: `neurolithe workspace list|create|delete|export|backup|import`.
+    Backups use timestamped `VACUUM INTO`.
+- **Local embeddings by default** (`local-embeddings` feature, on by default):
+  fastembed `bge-small-en-v1.5` (384-d). The model is cached in
+  `<home>/models` and works offline after the first download.
+- **The chat LLM is optional** (`provider = "none"`). Memory still stores and
+  searches without it; `push_dialogue` reports `learning_error: "LLM not
+  configured"`.
+- **`remember_document`** MCP tool, so long-term memory works in standalone
+  mode: summarize (or excerpt), embed, place in the concept tree, upsert by
+  `data_id`.
+- **`neurolithe init`** and **`neurolithe reembed`**.
+- **Store metadata and migrations**: each store records its schema version
+  and embedding model/dimension.
+  - An automatic backup is taken before any migration.
+  - A store built with a different embedder, a newer schema, or of the wrong
+    kind (STM vs LTM) is refused.
+- **Configurable concept spine** via `[[ltm.spine]]`. The default is
+  `notes` / `documents` / `inbox`.
+- **Kafka mode is a generic optional tool**:
+  - `[kafka.topics]` sets topic names.
+  - `[kafka.client]` passes settings through to librdkafka (SASL/TLS).
+  - Documents carry their text in the event.
+- **Structured logging** via `tracing`, to stderr only. The level comes from
+  `RUST_LOG`, then `[log] level`.
+- **Graceful shutdown** on SIGINT/SIGTERM in both modes, with a WAL
+  checkpoint. The daemon also drains its Kafka loops, commits and flushes.
+
+### Changed
+
+- **Home directory**: config comes from `--home` / `NEUROLITHE_HOME` /
+  `~/.neurolithe`, and `--config` / `NEUROLITHE_CONFIG`. `.env` is read only
+  from the home dir. The current working directory is never read, so a cloned
+  repo can no longer redirect your API key. Created dirs are 0700 and files
+  0600.
+- **Store paths and dimensions are no longer configured**: they come from the
+  workspace and the embedder. Stale `path` / `vector_dimension` keys are
+  ignored with a warning.
+- **MCP startup never blocks on the embedder**: `initialize`, `tools/list`
+  and `ping` answer immediately while the workspace opens.
+- **Hard reset over Kafka** is disabled unless `NEUROLITHE_RESET_TOKEN` is set
+  to at least 16 characters, and it is compared in constant time.
+- **Build image** moved to Debian trixie. The ONNX Runtime prebuilt needs
+  glibc ≥ 2.38 and GCC 14.
+- **sqlite-vec** upgraded to 0.1.9.
+
+### Removed
+
+- Tenancy on the MCP and Kafka surfaces (`tenant_id`, `delete_tenant`,
+  `export_tenant`).
+- The Pithos archive client and `[pithos]` config.
+- The hard-coded personal-life spine, private LAN/GCP defaults and
+  host-specific compose paths.
+- The `install.sh` / `install.ps1` binary installers.
+
+## [0.2.1] — 2026-09-23 (not tagged; ships as part of 0.3.0)
+
+Correctness and hardening from the 2026-09 multi-discipline review.
+Phase 0 (safety net) + Phase 1 (make it correct).
 
 ### Fixed
 
