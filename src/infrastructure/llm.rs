@@ -1,9 +1,205 @@
 use crate::domain::ports::{ExtractedFact, LlmClient};
 use crate::infrastructure::config::{LlmConfig, LlmProvider};
 use anyhow::{Result, anyhow};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
+
+// ==========================================
+// HTTP plumbing shared by every provider
+// ==========================================
+
+/// TCP/TLS connect timeout for provider calls. Short: an unreachable host should
+/// fail fast rather than hold the serial MCP loop (DEV-5 / SEC-11).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Upstream error bodies are truncated to this many characters before they are
+/// wrapped into an error that may reach an MCP client or a log (SEC-09).
+const MAX_ERROR_BODY_CHARS: usize = 300;
+
+/// Build the one HTTP client every provider shares (connection pool + TLS
+/// session reuse), with a connect timeout and a total per-request timeout so a
+/// hung provider can never freeze the process (DEV-5 / SEC-11).
+pub fn build_http_client(request_timeout: Duration) -> Client {
+    Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(request_timeout)
+        .build()
+        // Builder only fails on TLS backend init; fall back to defaults rather
+        // than abort (the timeouts are then enforced by the caller's budget).
+        .unwrap_or_else(|_| Client::new())
+}
+
+/// Truncate an upstream body to [`MAX_ERROR_BODY_CHARS`], collapsing whitespace
+/// so a multi-line HTML error page stays a one-liner.
+fn truncate_for_error(body: &str) -> String {
+    let flat: String = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_ERROR_BODY_CHARS {
+        flat
+    } else {
+        let head: String = flat.chars().take(MAX_ERROR_BODY_CHARS).collect();
+        format!("{head}… [truncated]")
+    }
+}
+
+/// A transport error with the request URL stripped — reqwest's `Display`
+/// includes the URL, which for some providers carried credentials and in all
+/// cases leaks endpoint details to the MCP client (SEC-08 / SEC-09).
+fn transport_error(provider: &str, e: reqwest::Error) -> anyhow::Error {
+    let kind = if e.is_timeout() {
+        " (timed out)"
+    } else if e.is_connect() {
+        " (connection failed)"
+    } else {
+        ""
+    };
+    anyhow!("{provider} request failed{kind}: {}", e.without_url())
+}
+
+/// Send a request and return the JSON body, mapping every failure to a
+/// sanitized error: URL stripped, status included, body truncated.
+async fn send_json(provider: &str, request: RequestBuilder) -> Result<serde_json::Value> {
+    let resp = request
+        .send()
+        .await
+        .map_err(|e| transport_error(provider, e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "{provider} API error ({status}): {}",
+            truncate_for_error(&body)
+        ));
+    }
+    resp.json().await.map_err(|e| transport_error(provider, e))
+}
+
+// ==========================================
+// API keys
+// ==========================================
+
+/// Environment variables consulted (in order) for a provider's API key.
+///
+/// `custom` deliberately reads **only** `NEUROLITHE_API_KEY`: its `base_url`
+/// can point anywhere (OpenRouter, a LAN box, plain HTTP), so it must never
+/// pick up — and forward — a real `OPENAI_API_KEY` (SEC-09). Vertex uses
+/// service-account auth, not a key.
+pub fn api_key_env_vars(provider: &LlmProvider) -> &'static [&'static str] {
+    match provider {
+        LlmProvider::Openai => &["OPENAI_API_KEY", "NEUROLITHE_API_KEY"],
+        LlmProvider::Gemini => &["GEMINI_API_KEY", "NEUROLITHE_API_KEY"],
+        LlmProvider::Anthropic => &["ANTHROPIC_API_KEY", "NEUROLITHE_API_KEY"],
+        LlmProvider::Custom => &["NEUROLITHE_API_KEY"],
+        LlmProvider::Vertex | LlmProvider::Local | LlmProvider::None => &[],
+    }
+}
+
+/// Whether a provider cannot work without an API key. `custom` endpoints are
+/// often local (Ollama, LM Studio) and keyless; Vertex authenticates via
+/// `GOOGLE_APPLICATION_CREDENTIALS`.
+fn key_required(provider: &LlmProvider) -> bool {
+    matches!(
+        provider,
+        LlmProvider::Openai | LlmProvider::Gemini | LlmProvider::Anthropic
+    )
+}
+
+/// Resolve a provider's API key via `lookup` (the process env in production,
+/// a map in tests). Empty values count as missing.
+pub fn resolve_api_key(
+    provider: &LlmProvider,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    api_key_env_vars(provider)
+        .iter()
+        .filter_map(|name| lookup(name))
+        .map(|v| v.trim().to_string())
+        .find(|v| !v.is_empty())
+}
+
+/// Stand-in for a provider half whose API key is missing. Every call fails with
+/// a short, actionable message instead of sending a fake key upstream (the old
+/// `dummy_key` fallback, QA-10 / DEV-13). Introspection never calls the LLM, so
+/// it keeps working.
+///
+/// Also stands in for the chat half when no chat provider is configured
+/// (`llm.provider = "none"`, the default) — then [`LlmClient::chat_available`]
+/// is `false` and services take their no-LLM fallbacks.
+struct UnconfiguredLlm {
+    message: String,
+}
+
+/// Prefix of every "no chat model" error, so callers/tests can recognise it.
+pub const LLM_NOT_CONFIGURED: &str = "LLM not configured";
+
+impl UnconfiguredLlm {
+    fn for_provider(role: &str, provider: &LlmProvider) -> Self {
+        let vars = api_key_env_vars(provider).join(" or ");
+        Self {
+            message: format!("{LLM_NOT_CONFIGURED}: set {vars} ({role} provider)"),
+        }
+    }
+
+    fn no_chat_provider() -> Self {
+        Self {
+            message: format!(
+                "{LLM_NOT_CONFIGURED}: no chat provider (llm.provider = \"none\"); \
+                 set llm.provider/llm.model to enable fact extraction and summaries"
+            ),
+        }
+    }
+
+    fn with_message(message: String) -> Self {
+        Self { message }
+    }
+
+    fn fail<T>(&self) -> Result<T> {
+        Err(anyhow!("{}", self.message))
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for UnconfiguredLlm {
+    async fn extract_facts(
+        &self,
+        _dialogue: &str,
+        _valid_ccls: &[crate::domain::models::CclDefinition],
+    ) -> Result<Vec<ExtractedFact>> {
+        self.fail()
+    }
+
+    async fn generate_ccl_description(&self, _ccl_name: &str, _context: &str) -> Result<String> {
+        self.fail()
+    }
+
+    async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+        self.fail()
+    }
+
+    async fn compress_context(&self, _messages: &str) -> Result<String> {
+        self.fail()
+    }
+
+    async fn embedding_dim(&self) -> Result<usize> {
+        self.fail()
+    }
+
+    fn chat_available(&self) -> bool {
+        false
+    }
+}
+
+// ==========================================
+// Factory
+// ==========================================
+
+/// The assembled client plus any startup warnings (missing keys, keys sent in
+/// clear text) for the caller to log.
+pub struct LlmSetup {
+    pub client: Arc<dyn LlmClient>,
+    pub warnings: Vec<String>,
+}
 
 /// Build the LLM client, delegating chat and embeddings to (possibly) different
 /// providers. Chat uses `config.provider`/`config.model`/`config.base_url`;
@@ -11,64 +207,242 @@ use std::sync::Arc;
 /// `config.embedding_model` / `config.embedding_base_url` (falling back to
 /// `base_url`). This lets chat run on Claude (which has no embeddings endpoint)
 /// while embeddings run on Vertex/Google/OpenAI/local — see `SplitLlmClient`.
-pub fn create_llm_client(
-    config: &LlmConfig,
-    chat_api_key: String,
-    embed_api_key: String,
-) -> Arc<dyn LlmClient> {
-    let chat = build_chat_client(config, chat_api_key);
-    let embed = build_embed_client(config, embed_api_key);
-    Arc::new(SplitLlmClient { chat, embed })
+///
+/// Keys are resolved through `lookup` (pass `|k| std::env::var(k).ok()`). A
+/// missing required key does **not** abort startup: that half becomes an
+/// [`UnconfiguredLlm`] and a warning is returned. Both halves share one HTTP
+/// client with timeouts.
+pub fn create_llm_client(config: &LlmConfig, lookup: &dyn Fn(&str) -> Option<String>) -> LlmSetup {
+    let http = build_http_client(Duration::from_secs(config.request_timeout_secs));
+    let mut warnings = Vec::new();
+
+    let chat_provider = &config.provider;
+    let chat_key = resolve_api_key(chat_provider, lookup);
+    let chat: Arc<dyn LlmClient> = if !chat_provider.is_chat() {
+        // `none` (the default) or a misplaced `local`: store-and-search mode.
+        let stub = UnconfiguredLlm::no_chat_provider();
+        warnings.push(format!(
+            "{LLM_NOT_CONFIGURED} (llm.provider = \"none\") — memory is stored and searched, \
+             but fact extraction, compression and summaries are skipped"
+        ));
+        Arc::new(stub)
+    } else if key_required(chat_provider) && chat_key.is_none() {
+        let stub = UnconfiguredLlm::for_provider("chat", chat_provider);
+        warnings.push(format!(
+            "{} — fact extraction and compression will fail",
+            stub.message
+        ));
+        Arc::new(stub)
+    } else {
+        build_chat_client(config, http.clone(), chat_key.clone())
+    };
+
+    let embed_provider = config.effective_embedding_provider();
+    let embed_key = resolve_api_key(embed_provider, lookup);
+    let embed_base_url = config
+        .embedding_base_url
+        .clone()
+        .or_else(|| config.base_url.clone());
+    let embed: Arc<dyn LlmClient> = if key_required(embed_provider) && embed_key.is_none() {
+        let stub = UnconfiguredLlm::for_provider("embedding", embed_provider);
+        warnings.push(format!(
+            "{} — storing and searching memory will fail",
+            stub.message
+        ));
+        Arc::new(stub)
+    } else {
+        match build_embed_client(config, http, embed_key.clone(), embed_base_url.clone()) {
+            Ok(client) => client,
+            Err(e) => {
+                let message = format!("embedder unavailable: {e:#}");
+                warnings.push(format!(
+                    "{message} — storing and searching memory will fail"
+                ));
+                Arc::new(UnconfiguredLlm::with_message(message))
+            }
+        }
+    };
+    let embed_id = embedding_model_id(config);
+
+    // SEC-09: a key sent to a non-TLS, non-loopback endpoint travels in clear.
+    // Only openai/custom honour a base URL; anthropic/gemini/vertex ignore it,
+    // so checking their key against `base_url` would warn about a request that
+    // never happens (REV-7).
+    let pairs = [
+        (chat_provider, &chat_key, &config.base_url),
+        (embed_provider, &embed_key, &embed_base_url),
+    ];
+    for (provider, key, url) in pairs {
+        if uses_base_url(provider)
+            && let (Some(_), Some(url)) = (key, url)
+            && is_plaintext_remote(url)
+        {
+            warnings.push(format!(
+                "an API key will be sent over plain HTTP to {url}; use https"
+            ));
+        }
+    }
+
+    LlmSetup {
+        client: Arc::new(SplitLlmClient {
+            chat,
+            embed,
+            embed_id,
+        }),
+        warnings,
+    }
+}
+
+/// Stable identity of the configured embedder, `"<provider>:<model>"` (e.g.
+/// `local:bge-small-en-v1.5`, `openai:text-embedding-3-small`). Local model
+/// names are canonicalised so two spellings of one model compare equal.
+pub fn embedding_model_id(config: &LlmConfig) -> String {
+    let provider = config.effective_embedding_provider();
+    let model = config.embedding_model.trim();
+    #[cfg(feature = "local-embeddings")]
+    if *provider == LlmProvider::Local
+        && let Ok(spec) = crate::infrastructure::local_embed::resolve_model(model)
+    {
+        return format!("local:{}", spec.name);
+    }
+    format!("{}:{model}", provider_name(provider))
+}
+
+/// The config spelling of a provider (matches `serde(rename_all = "lowercase")`).
+pub fn provider_name(provider: &LlmProvider) -> &'static str {
+    match provider {
+        LlmProvider::Openai => "openai",
+        LlmProvider::Gemini => "gemini",
+        LlmProvider::Anthropic => "anthropic",
+        LlmProvider::Custom => "custom",
+        LlmProvider::Vertex => "vertex",
+        LlmProvider::Local => "local",
+        LlmProvider::None => "none",
+    }
+}
+
+/// Providers whose requests go to the configured `base_url`.
+fn uses_base_url(provider: &LlmProvider) -> bool {
+    matches!(provider, LlmProvider::Openai | LlmProvider::Custom)
+}
+
+/// Plain `http` to a host that is not loopback. Parsed with `reqwest::Url`, so
+/// scheme case (`HTTP://`), IPv6 literals (`[::1]`), the whole 127/8 block and
+/// `localhost` in any case are all handled (REV-7). An unparseable URL is not
+/// judged here (the request itself will fail loudly).
+fn is_plaintext_remote(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    // IPv6 literals come back bracketed (`[::1]`).
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let local = host.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    !local
 }
 
 /// Default Vertex AI region when `embedding_location` is unset. `us-central1`
 /// serves `text-embedding-004`; the `global` endpoint does not host it.
 const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
 
-fn build_chat_client(config: &LlmConfig, api_key: String) -> Arc<dyn LlmClient> {
+fn build_chat_client(
+    config: &LlmConfig,
+    http: Client,
+    api_key: Option<String>,
+) -> Arc<dyn LlmClient> {
     match config.provider {
         LlmProvider::Openai | LlmProvider::Custom => Arc::new(OpenAiClient::new(
+            http,
             api_key,
             config.model.clone(),
             config.embedding_model.clone(),
             config.base_url.clone(),
         )),
         LlmProvider::Gemini => Arc::new(GeminiClient::new(
-            api_key,
+            http,
+            api_key.unwrap_or_default(),
             config.model.clone(),
             config.embedding_model.clone(),
         )),
-        LlmProvider::Anthropic => Arc::new(AnthropicClient::new(api_key, config.model.clone())),
-        LlmProvider::Vertex => Arc::new(vertex_client(config, config.model.clone())),
+        LlmProvider::Anthropic => Arc::new(AnthropicClient::new(
+            http,
+            api_key.unwrap_or_default(),
+            config.model.clone(),
+        )),
+        LlmProvider::Vertex => Arc::new(vertex_client(config, http, config.model.clone())),
+        // Not chat providers — `create_llm_client` never gets here with them.
+        LlmProvider::Local | LlmProvider::None => Arc::new(UnconfiguredLlm::no_chat_provider()),
     }
 }
 
-fn build_embed_client(config: &LlmConfig, api_key: String) -> Arc<dyn LlmClient> {
-    let base_url = config
-        .embedding_base_url
-        .clone()
-        .or_else(|| config.base_url.clone());
-    match config.effective_embedding_provider() {
+fn build_embed_client(
+    config: &LlmConfig,
+    http: Client,
+    api_key: Option<String>,
+    base_url: Option<String>,
+) -> Result<Arc<dyn LlmClient>> {
+    Ok(match config.effective_embedding_provider() {
         LlmProvider::Openai | LlmProvider::Custom => Arc::new(OpenAiClient::new(
+            http,
             api_key,
             config.model.clone(),
             config.embedding_model.clone(),
             base_url,
         )),
         LlmProvider::Gemini => Arc::new(GeminiClient::new(
-            api_key,
+            http,
+            api_key.unwrap_or_default(),
             config.model.clone(),
             config.embedding_model.clone(),
         )),
-        LlmProvider::Anthropic => Arc::new(AnthropicClient::new(api_key, config.model.clone())),
-        LlmProvider::Vertex => Arc::new(vertex_client(config, config.embedding_model.clone())),
-    }
+        LlmProvider::Anthropic => Arc::new(AnthropicClient::new(
+            http,
+            api_key.unwrap_or_default(),
+            config.model.clone(),
+        )),
+        LlmProvider::Vertex => {
+            Arc::new(vertex_client(config, http, config.embedding_model.clone()))
+        }
+        LlmProvider::Local => build_local_embedder(config)?,
+        LlmProvider::None => {
+            return Err(anyhow!(
+                "llm.embedding_provider = \"none\": memory needs an embedder (use \"local\")"
+            ));
+        }
+    })
+}
+
+#[cfg(feature = "local-embeddings")]
+fn build_local_embedder(config: &LlmConfig) -> Result<Arc<dyn LlmClient>> {
+    let dir = config
+        .models_dir
+        .clone()
+        .ok_or_else(|| anyhow!("model cache dir not set (llm.models_dir must be <home>/models)"))?;
+    Ok(Arc::new(
+        crate::infrastructure::local_embed::LocalEmbedder::new(&config.embedding_model, dir)?,
+    ))
+}
+
+#[cfg(not(feature = "local-embeddings"))]
+fn build_local_embedder(_config: &LlmConfig) -> Result<Arc<dyn LlmClient>> {
+    Err(anyhow!(
+        "llm.embedding_provider = \"local\" needs a build with the `local-embeddings` feature"
+    ))
 }
 
 /// Construct a `VertexClient` from the config's project/location, defaulting the
 /// region to `us-central1`.
-fn vertex_client(config: &LlmConfig, model: String) -> VertexClient {
+fn vertex_client(config: &LlmConfig, http: Client, model: String) -> VertexClient {
     VertexClient::new(
+        http,
         model,
         config.embedding_project.clone().unwrap_or_default(),
         config
@@ -87,6 +461,8 @@ fn vertex_client(config: &LlmConfig, model: String) -> VertexClient {
 struct SplitLlmClient {
     chat: Arc<dyn LlmClient>,
     embed: Arc<dyn LlmClient>,
+    /// `"<provider>:<model>"` of the embed half, for store meta.
+    embed_id: String,
 }
 
 #[async_trait::async_trait]
@@ -110,6 +486,60 @@ impl LlmClient for SplitLlmClient {
     async fn compress_context(&self, messages: &str) -> Result<String> {
         self.chat.compress_context(messages).await
     }
+
+    async fn embedding_dim(&self) -> Result<usize> {
+        self.embed.embedding_dim().await
+    }
+
+    fn embedding_model_id(&self) -> String {
+        self.embed_id.clone()
+    }
+
+    fn chat_available(&self) -> bool {
+        self.chat.chat_available()
+    }
+}
+
+// ==========================================
+// Prompts (shared by every chat provider)
+// ==========================================
+
+fn extraction_prompt(valid_ccls: &[crate::domain::models::CclDefinition]) -> String {
+    let ccl_descriptions = valid_ccls
+        .iter()
+        .map(|c| format!("- '{}' ({})", c.name, c.description))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!("
+            Extract independent factual statements from the user's dialogue.
+            Only extract facts that represent long-term knowledge, preferences, or identifiers.
+            For each fact, also extract any relationships to other entities with temporal bounds.
+            The available Cognitive Context Layers (CCL) are:
+{}
+            You MUST assign a valid 'ccl' to each fact and relationship based on these definitions.
+            Return format: {{\"facts\": [{{\"fact\": \"...\", \"ccl\": \"reality\", \"tags\": [...], \"relationships\": [{{\"target_entity\": \"...\", \"relation\": \"WORKS_AT\", \"ccl\": \"reality\", \"valid_from\": \"YYYY-MM-DD or null\", \"valid_until\": \"YYYY-MM-DD or null\"}}]}}]}}
+            If no facts are present, return {{\"facts\": []}}.
+            Output ONLY valid JSON.
+        ", ccl_descriptions)
+}
+
+const CCL_DESCRIPTION_SYSTEM: &str = "You are a helpful assistant. Generate a generic one-line description for the conceptual memory layer requested.";
+
+fn ccl_description_prompt(ccl_name: &str, context: &str) -> String {
+    format!(
+        "Generate a generic one-line description for the conceptual memory layer '{}' based on the following context:\n{}",
+        ccl_name, context
+    )
+}
+
+const COMPRESS_SYSTEM: &str = "Compress the following conversation into a dense, factual summary. Preserve all key facts, decisions, and context. Remove filler and redundancy. Output only the summary text.";
+
+/// Parse `{"facts": [...]}` out of a model reply.
+fn parse_facts(json_text: &str) -> Result<Vec<ExtractedFact>> {
+    let parsed: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| anyhow!("model returned invalid JSON for fact extraction: {e}"))?;
+    Ok(serde_json::from_value(parsed["facts"].clone())?)
 }
 
 // ==========================================
@@ -117,7 +547,8 @@ impl LlmClient for SplitLlmClient {
 // ==========================================
 pub struct OpenAiClient {
     client: Client,
-    api_key: String,
+    /// `None` for keyless local endpoints (Ollama): no Authorization header.
+    api_key: Option<String>,
     model: String,
     embedding_model: String,
     base_url: String,
@@ -125,18 +556,40 @@ pub struct OpenAiClient {
 
 impl OpenAiClient {
     pub fn new(
-        api_key: String,
+        client: Client,
+        api_key: Option<String>,
         model: String,
         embedding_model: String,
         base_url: Option<String>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client,
             api_key,
             model,
             embedding_model,
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
         }
+    }
+
+    fn post(&self, path: &str) -> RequestBuilder {
+        let url = format!("{}/{}", self.base_url.trim_end_matches('/'), path);
+        let mut rb = self
+            .client
+            .post(url)
+            .header("HTTP-Referer", "https://neurolithe.com")
+            .header("X-Title", "NeuroLithe");
+        if let Some(key) = &self.api_key {
+            rb = rb.bearer_auth(key);
+        }
+        rb
+    }
+
+    async fn chat(&self, payload: serde_json::Value) -> Result<String> {
+        let resp_json = send_json("OpenAI", self.post("chat/completions").json(&payload)).await?;
+        Ok(resp_json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
     }
 }
 
@@ -147,98 +600,35 @@ impl LlmClient for OpenAiClient {
         dialogue: &str,
         valid_ccls: &[crate::domain::models::CclDefinition],
     ) -> Result<Vec<ExtractedFact>> {
-        let ccl_descriptions = valid_ccls
-            .iter()
-            .map(|c| format!("- '{}' ({})", c.name, c.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system_prompt = format!("
-            Extract independent factual statements from the user's dialogue.
-            Only extract facts that represent long-term knowledge, preferences, or identifiers.
-            For each fact, also extract any relationships to other entities with temporal bounds.
-            The available Cognitive Context Layers (CCL) are:
-{}
-            You MUST assign a valid 'ccl' to each fact and relationship based on these definitions.
-            Return format: {{\"facts\": [{{\"fact\": \"...\", \"ccl\": \"reality\", \"tags\": [...], \"relationships\": [{{\"target_entity\": \"...\", \"relation\": \"WORKS_AT\", \"ccl\": \"reality\", \"valid_from\": \"YYYY-MM-DD or null\", \"valid_until\": \"YYYY-MM-DD or null\"}}]}}]}}
-            If no facts are present, return {{\"facts\": []}}.
-            Output ONLY valid JSON.
-        ", ccl_descriptions);
-
-        let payload = json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": dialogue}
-            ],
-            "response_format": {"type": "json_object"}
-        });
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://neurolithe.com")
-            .header("X-Title", "NeuroLithe")
-            .json(&payload)
-            .send()
+        let content = self
+            .chat(json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": extraction_prompt(valid_ccls)},
+                    {"role": "user", "content": dialogue}
+                ],
+                "response_format": {"type": "json_object"}
+            }))
             .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenAI API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let content = resp_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("{\"facts\": []}");
-
-        let parsed: serde_json::Value = serde_json::from_str(content)?;
-        let facts = serde_json::from_value(parsed["facts"].clone())?;
-
-        Ok(facts)
+        let content = if content.trim().is_empty() {
+            "{\"facts\": []}"
+        } else {
+            content.as_str()
+        };
+        parse_facts(content)
     }
 
     async fn generate_ccl_description(&self, ccl_name: &str, context: &str) -> Result<String> {
-        let system_prompt = "You are a helpful assistant. Generate a generic one-line description for the conceptual memory layer requested.";
-        let user_prompt = format!(
-            "Generate a generic one-line description for the conceptual memory layer '{}' based on the following context:\n{}",
-            ccl_name, context
-        );
-
-        let payload = json!({
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ]
-        });
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://neurolithe.com")
-            .header("X-Title", "NeuroLithe")
-            .json(&payload)
-            .send()
+        let content = self
+            .chat(json!({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": CCL_DESCRIPTION_SYSTEM},
+                    {"role": "user", "content": ccl_description_prompt(ccl_name, context)}
+                ]
+            }))
             .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenAI API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let description = resp_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        Ok(description)
+        Ok(content.trim().to_string())
     }
 
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
@@ -246,84 +636,67 @@ impl LlmClient for OpenAiClient {
             "model": self.embedding_model,
             "input": text
         });
-
-        let url = format!("{}/embeddings", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://neurolithe.com")
-            .header("X-Title", "NeuroLithe")
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenAI API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let embedding: Vec<f32> =
-            serde_json::from_value(resp_json["data"][0]["embedding"].clone())?;
-
+        let resp_json = send_json("OpenAI", self.post("embeddings").json(&payload)).await?;
+        let embedding: Vec<f32> = serde_json::from_value(resp_json["data"][0]["embedding"].clone())
+            .map_err(|e| anyhow!("OpenAI embeddings: unexpected response shape: {e}"))?;
         Ok(embedding)
     }
 
     async fn compress_context(&self, messages: &str) -> Result<String> {
-        let system_prompt = "Compress the following conversation into a dense, factual summary. Preserve all key facts, decisions, and context. Remove filler and redundancy. Output only the summary text.";
-
-        let payload = json!({
+        self.chat(json!({
             "model": self.model,
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": COMPRESS_SYSTEM},
                 {"role": "user", "content": messages}
             ]
-        });
-
-        let url = format!("{}/chat/completions", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("HTTP-Referer", "https://neurolithe.com")
-            .header("X-Title", "NeuroLithe")
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("OpenAI API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let summary = resp_json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        Ok(summary)
+        }))
+        .await
     }
 }
 
 // ==========================================
 // Google Gemini Client
 // ==========================================
+const GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
 pub struct GeminiClient {
     client: Client,
     api_key: String,
     model: String,
     embedding_model: String,
+    base_url: String,
 }
 
 impl GeminiClient {
-    pub fn new(api_key: String, model: String, embedding_model: String) -> Self {
+    pub fn new(client: Client, api_key: String, model: String, embedding_model: String) -> Self {
         Self {
-            client: Client::new(),
+            client,
             api_key,
             model,
             embedding_model,
+            base_url: GEMINI_BASE_URL.to_string(),
         }
+    }
+
+    /// POST `models/{model}:{method}`. The key travels in the
+    /// `x-goog-api-key` header — never in the `?key=` query string, where it
+    /// leaked into reqwest error text, logs, and MCP replies (DEV-14 / SEC-08).
+    fn post(&self, model: &str, method: &str) -> RequestBuilder {
+        self.client
+            .post(format!("{}/models/{model}:{method}", self.base_url))
+            .header("x-goog-api-key", &self.api_key)
+    }
+
+    async fn generate(&self, payload: serde_json::Value) -> Result<String> {
+        let resp_json = send_json(
+            "Gemini",
+            self.post(&self.model, "generateContent").json(&payload),
+        )
+        .await?;
+        Ok(resp_json["candidates"][0]["content"]["parts"][0]["text"]
+            .as_str()
+            .unwrap_or("")
+            .to_string())
     }
 }
 
@@ -334,92 +707,39 @@ impl LlmClient for GeminiClient {
         dialogue: &str,
         valid_ccls: &[crate::domain::models::CclDefinition],
     ) -> Result<Vec<ExtractedFact>> {
-        let ccl_descriptions = valid_ccls
-            .iter()
-            .map(|c| format!("- '{}' ({})", c.name, c.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system_prompt = format!("
-            Extract independent factual statements from the user's dialogue.
-            Only extract facts that represent long-term knowledge, preferences, or identifiers.
-            For each fact, also extract any relationships to other entities with temporal bounds.
-            The available Cognitive Context Layers (CCL) are:
-{}
-            You MUST assign a valid 'ccl' to each fact and relationship based on these definitions.
-            Return format: {{\"facts\": [{{\"fact\": \"...\", \"ccl\": \"reality\", \"tags\": [...], \"relationships\": [{{\"target_entity\": \"...\", \"relation\": \"WORKS_AT\", \"ccl\": \"reality\", \"valid_from\": \"YYYY-MM-DD or null\", \"valid_until\": \"YYYY-MM-DD or null\"}}]}}]}}
-            If no facts are present, return {{\"facts\": []}}.
-            Output ONLY valid JSON.
-        ", ccl_descriptions);
-
-        let payload = json!({
-            "system_instruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [{
-                "parts": [{"text": dialogue}]
-            }],
-            "generationConfig": {
-                "responseMimeType": "application/json"
-            }
-        });
-
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
-        );
-        let resp = self.client.post(&url).json(&payload).send().await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gemini API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let content = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("{\"facts\": []}");
-
-        let parsed: serde_json::Value = serde_json::from_str(content)?;
-        let facts = serde_json::from_value(parsed["facts"].clone())?;
-
-        Ok(facts)
+        let content = self
+            .generate(json!({
+                "system_instruction": {
+                    "parts": [{"text": extraction_prompt(valid_ccls)}]
+                },
+                "contents": [{
+                    "parts": [{"text": dialogue}]
+                }],
+                "generationConfig": {
+                    "responseMimeType": "application/json"
+                }
+            }))
+            .await?;
+        let content = if content.trim().is_empty() {
+            "{\"facts\": []}"
+        } else {
+            content.as_str()
+        };
+        parse_facts(content)
     }
 
     async fn generate_ccl_description(&self, ccl_name: &str, context: &str) -> Result<String> {
-        let system_prompt = "You are a helpful assistant. Generate a generic one-line description for the conceptual memory layer requested.";
-        let user_prompt = format!(
-            "Generate a generic one-line description for the conceptual memory layer '{}' based on the following context:\n{}",
-            ccl_name, context
-        );
-
-        let payload = json!({
-            "system_instruction": {
-                "parts": [{"text": system_prompt}]
-            },
-            "contents": [{
-                "parts": [{"text": user_prompt}]
-            }]
-        });
-
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
-        );
-        let resp = self.client.post(&url).json(&payload).send().await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gemini API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let description = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        Ok(description)
+        let content = self
+            .generate(json!({
+                "system_instruction": {
+                    "parts": [{"text": CCL_DESCRIPTION_SYSTEM}]
+                },
+                "contents": [{
+                    "parts": [{"text": ccl_description_prompt(ccl_name, context)}]
+                }]
+            }))
+            .await?;
+        Ok(content.trim().to_string())
     }
 
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
@@ -429,59 +749,35 @@ impl LlmClient for GeminiClient {
                 "parts": [{"text": text}]
             }
         });
-
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:embedContent?key={}",
-            self.embedding_model, self.api_key
-        );
-        let resp = self.client.post(&url).json(&payload).send().await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gemini API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let embedding: Vec<f32> = serde_json::from_value(resp_json["embedding"]["values"].clone())?;
-
+        let resp_json = send_json(
+            "Gemini",
+            self.post(&self.embedding_model, "embedContent")
+                .json(&payload),
+        )
+        .await?;
+        let embedding: Vec<f32> = serde_json::from_value(resp_json["embedding"]["values"].clone())
+            .map_err(|e| anyhow!("Gemini embeddings: unexpected response shape: {e}"))?;
         Ok(embedding)
     }
 
     async fn compress_context(&self, messages: &str) -> Result<String> {
-        let system_prompt = "Compress the following conversation into a dense, factual summary. Preserve all key facts, decisions, and context. Remove filler and redundancy. Output only the summary text.";
-
-        let payload = json!({
+        self.generate(json!({
             "system_instruction": {
-                "parts": [{"text": system_prompt}]
+                "parts": [{"text": COMPRESS_SYSTEM}]
             },
             "contents": [{
                 "parts": [{"text": messages}]
             }]
-        });
-
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-            self.model, self.api_key
-        );
-        let resp = self.client.post(&url).json(&payload).send().await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Gemini API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let summary = resp_json["candidates"][0]["content"]["parts"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        Ok(summary)
+        }))
+        .await
     }
 }
 
 // ==========================================
 // Anthropic Client
 // ==========================================
+
+const ANTHROPIC_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 
 /// Return the text of the first `text` content block in an Anthropic Messages
 /// response. Claude 4.6+ models (incl. Sonnet 5) can emit a `thinking` block at
@@ -495,6 +791,15 @@ fn anthropic_first_text(resp_json: &serde_json::Value) -> String {
         .and_then(|b| b["text"].as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// The outermost `{…}` span of a chatty model reply, if there is a well-ordered
+/// one. Replaces an unchecked slice that panicked when a `}` preceded the first
+/// `{` (e.g. `"} sorry {"`) — DEV-6.
+fn extract_json_object(content: &str) -> Option<&str> {
+    let start = content.find('{')?;
+    let end = content.rfind('}')?;
+    (end > start).then(|| &content[start..=end])
 }
 
 /// Output-token ceiling for **document summarization** (`compress_context`).
@@ -517,12 +822,36 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(client: Client, api_key: String, model: String) -> Self {
         Self {
-            client: Client::new(),
+            client,
             api_key,
             model,
         }
+    }
+
+    /// One Messages call; thinking disabled so the reply is a single `text`
+    /// block (Sonnet 5 otherwise runs adaptive thinking first).
+    async fn message(&self, system: &str, user: &str, max_tokens: u32) -> Result<String> {
+        let payload = json!({
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "thinking": {"type": "disabled"},
+            "system": system,
+            "messages": [
+                {"role": "user", "content": user}
+            ]
+        });
+        let resp_json = send_json(
+            "Anthropic",
+            self.client
+                .post(ANTHROPIC_MESSAGES_URL)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&payload),
+        )
+        .await?;
+        Ok(anthropic_first_text(&resp_json))
     }
 }
 
@@ -533,69 +862,16 @@ impl LlmClient for AnthropicClient {
         dialogue: &str,
         valid_ccls: &[crate::domain::models::CclDefinition],
     ) -> Result<Vec<ExtractedFact>> {
-        let ccl_descriptions = valid_ccls
-            .iter()
-            .map(|c| format!("- '{}' ({})", c.name, c.description))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let system_prompt = format!("
-            Extract independent factual statements from the user's dialogue.
-            Only extract facts that represent long-term knowledge, preferences, or identifiers.
-            For each fact, also extract any relationships to other entities with temporal bounds.
-            The available Cognitive Context Layers (CCL) are:
-{}
-            You MUST assign a valid 'ccl' to each fact and relationship based on these definitions.
-            Return format: {{\"facts\": [{{\"fact\": \"...\", \"ccl\": \"reality\", \"tags\": [...], \"relationships\": [{{\"target_entity\": \"...\", \"relation\": \"WORKS_AT\", \"ccl\": \"reality\", \"valid_from\": \"YYYY-MM-DD or null\", \"valid_until\": \"YYYY-MM-DD or null\"}}]}}]}}
-            If no facts are present, return {{\"facts\": []}}.
-            Output ONLY valid JSON.
-        ", ccl_descriptions);
-
-        // Anthropic structure. Thinking is disabled so the response is a single
-        // `text` block of JSON (Sonnet 5 otherwise runs adaptive thinking and
-        // returns a thinking block first).
-        let payload = json!({
-            "model": self.model,
-            "max_tokens": SHORT_MAX_TOKENS,
-            "thinking": {"type": "disabled"},
-            "system": system_prompt,
-            "messages": [
-                {"role": "user", "content": dialogue}
-            ]
-        });
-
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&payload)
-            .send()
+        let text = self
+            .message(&extraction_prompt(valid_ccls), dialogue, SHORT_MAX_TOKENS)
             .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Anthropic API error: {}", error_text));
+        if text.trim().is_empty() {
+            return Ok(Vec::new());
         }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let text = anthropic_first_text(&resp_json);
-        let content = if text.is_empty() {
-            "{\"facts\": []}"
-        } else {
-            text.as_str()
-        };
-
-        // For Claude we might need to find JSON substring if it chatters
-        let json_start = content.find('{').unwrap_or(0);
-        let json_end = content.rfind('}').unwrap_or(content.len() - 1) + 1;
-        let clean_json = &content[json_start..json_end];
-
-        let parsed: serde_json::Value = serde_json::from_str(clean_json)?;
-        let facts = serde_json::from_value(parsed["facts"].clone())?;
-
-        Ok(facts)
+        // Claude may wrap the JSON in prose; take the outermost object.
+        let json_text = extract_json_object(&text)
+            .ok_or_else(|| anyhow!("Anthropic reply contained no JSON object"))?;
+        parse_facts(json_text)
     }
 
     async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
@@ -605,73 +881,19 @@ impl LlmClient for AnthropicClient {
     }
 
     async fn generate_ccl_description(&self, ccl_name: &str, context: &str) -> Result<String> {
-        let system_prompt = "You are a helpful assistant. Generate a generic one-line description for the conceptual memory layer requested.";
-        let user_prompt = format!(
-            "Generate a generic one-line description for the conceptual memory layer '{}' based on the following context:\n{}",
-            ccl_name, context
-        );
-
-        let payload = json!({
-            "model": self.model,
-            "max_tokens": SHORT_MAX_TOKENS,
-            "thinking": {"type": "disabled"},
-            "system": system_prompt,
-            "messages": [
-                {"role": "user", "content": user_prompt}
-            ]
-        });
-
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&payload)
-            .send()
+        let text = self
+            .message(
+                CCL_DESCRIPTION_SYSTEM,
+                &ccl_description_prompt(ccl_name, context),
+                SHORT_MAX_TOKENS,
+            )
             .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Anthropic API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let content = anthropic_first_text(&resp_json).trim().to_string();
-        Ok(content)
+        Ok(text.trim().to_string())
     }
 
     async fn compress_context(&self, messages: &str) -> Result<String> {
-        let system_prompt = "Compress the following conversation into a dense, factual summary. Preserve all key facts, decisions, and context. Remove filler and redundancy. Output only the summary text.";
-
-        let payload = json!({
-            "model": self.model,
-            "max_tokens": COMPRESS_MAX_TOKENS,
-            "thinking": {"type": "disabled"},
-            "system": system_prompt,
-            "messages": [
-                {"role": "user", "content": messages}
-            ]
-        });
-
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Anthropic API error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
-        let summary = anthropic_first_text(&resp_json);
-        Ok(summary)
+        self.message(COMPRESS_SYSTEM, messages, COMPRESS_MAX_TOKENS)
+            .await
     }
 }
 
@@ -679,13 +901,12 @@ impl LlmClient for AnthropicClient {
 // Google Vertex AI Client (embeddings)
 // ==========================================
 
-/// Vertex AI access-token scope (same broad scope Cadmus uses).
+/// Vertex AI access-token scope.
 const VERTEX_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
-/// Google Vertex AI client, used for embeddings so NeuroLithe can share
-/// Cadmus's Gemini/Vertex access. Authenticates with a service-account key via
-/// `gcp_auth` (reads `GOOGLE_APPLICATION_CREDENTIALS`), minting short-lived
-/// bearer tokens — no API key. Chat methods are unimplemented (use
+/// Google Vertex AI client, used for embeddings. Authenticates with a
+/// service-account key via `gcp_auth` (reads `GOOGLE_APPLICATION_CREDENTIALS`),
+/// minting short-lived bearer tokens — no API key. Chat methods are unimplemented (use
 /// anthropic/gemini/custom for reasoning).
 pub struct VertexClient {
     client: Client,
@@ -699,9 +920,9 @@ pub struct VertexClient {
 }
 
 impl VertexClient {
-    pub fn new(model: String, project: String, location: String) -> Self {
+    pub fn new(client: Client, model: String, project: String, location: String) -> Self {
         Self {
-            client: Client::new(),
+            client,
             model,
             project,
             location,
@@ -711,7 +932,6 @@ impl VertexClient {
 
     /// The Vertex `:predict` embeddings endpoint. `global` uses the unprefixed
     /// host; any other location pins data residency to `{loc}-aiplatform...`
-    /// (mirrors Cadmus's `generate_content_url`).
     fn predict_url(&self) -> String {
         let host = if self.location == "global" {
             "aiplatform.googleapis.com".to_string()
@@ -771,25 +991,19 @@ impl LlmClient for VertexClient {
         let token = self.access_token().await?;
         let payload = json!({ "instances": [{ "content": text }] });
 
-        let resp = self
-            .client
-            .post(self.predict_url())
-            .bearer_auth(token)
-            .json(&payload)
-            .send()
-            .await?;
-
-        if !resp.status().is_success() {
-            let error_text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Vertex embeddings error: {}", error_text));
-        }
-
-        let resp_json: serde_json::Value = resp.json().await?;
+        let resp_json = send_json(
+            "Vertex",
+            self.client
+                .post(self.predict_url())
+                .bearer_auth(token)
+                .json(&payload),
+        )
+        .await?;
         let values = resp_json["predictions"][0]["embeddings"]["values"].clone();
         if values.is_null() {
             return Err(anyhow!(
                 "Vertex embeddings: no values in response (unexpected shape): {}",
-                resp_json
+                truncate_for_error(&resp_json.to_string())
             ));
         }
         let embedding: Vec<f32> = serde_json::from_value(values)?;
@@ -800,5 +1014,383 @@ impl LlmClient for VertexClient {
         Err(anyhow!(
             "Vertex client is embeddings-only in NeuroLithe; use anthropic/gemini/custom for chat."
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn test_config(provider: LlmProvider, embed: Option<LlmProvider>) -> LlmConfig {
+        LlmConfig {
+            provider,
+            model: "m".into(),
+            embedding_model: "e".into(),
+            base_url: None,
+            embedding_provider: embed,
+            embedding_base_url: None,
+            embedding_project: None,
+            embedding_location: None,
+            request_timeout_secs: 5,
+            models_dir: None,
+        }
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    /// One-shot HTTP server: captures the raw request, replies with `status`
+    /// and `body`. Returns the base URL and a handle yielding the request text.
+    async fn one_shot_server(
+        status: u16,
+        body: String,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Read headers, then the declared body.
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap();
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(idx) = text.find("\r\n\r\n") {
+                    let len = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= idx + 4 + len {
+                        break;
+                    }
+                }
+                if n == 0 {
+                    break;
+                }
+            }
+            let resp = format!(
+                "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    /// DEV-6: a reply where `}` precedes the first `{` used to panic on an
+    /// out-of-order slice; now it's simply "no JSON object".
+    #[test]
+    fn test_extract_json_object_never_panics() {
+        assert_eq!(extract_json_object("} sorry {"), None);
+        assert_eq!(extract_json_object("no braces"), None);
+        assert_eq!(extract_json_object("}"), None);
+        assert_eq!(
+            extract_json_object("Sure! {\"facts\": []} hope that helps"),
+            Some("{\"facts\": []}")
+        );
+    }
+
+    /// QA-10 / DEV-13: a missing key never becomes `dummy_key`; the half is
+    /// replaced by a stub that fails with an actionable message, and a startup
+    /// warning is produced.
+    #[tokio::test]
+    async fn test_missing_key_yields_not_configured_error() {
+        let setup = create_llm_client(&test_config(LlmProvider::Openai, None), &env(&[]));
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|w| w.contains("LLM not configured") && w.contains("OPENAI_API_KEY"))
+        );
+        let err = setup.client.embed_text("hi").await.unwrap_err().to_string();
+        assert!(
+            err.starts_with("LLM not configured: set OPENAI_API_KEY"),
+            "{err}"
+        );
+        assert!(!err.contains("dummy"));
+    }
+
+    /// The chat LLM is optional: `provider = none` gives a client whose chat
+    /// half reports "LLM not configured" (and `chat_available() == false`)
+    /// while embeddings still come from the configured embedder.
+    #[tokio::test]
+    async fn test_no_chat_provider_is_store_and_search_mode() {
+        let cfg = test_config(LlmProvider::None, Some(LlmProvider::Custom));
+        let setup = create_llm_client(&cfg, &env(&[]));
+        assert!(!setup.client.chat_available());
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|w| w.contains(LLM_NOT_CONFIGURED)),
+            "{:?}",
+            setup.warnings
+        );
+        for err in [
+            setup.client.compress_context("x").await.unwrap_err(),
+            setup.client.extract_facts("x", &[]).await.unwrap_err(),
+            setup
+                .client
+                .generate_ccl_description("a", "b")
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(err.to_string().starts_with(LLM_NOT_CONFIGURED), "{err}");
+        }
+        assert_eq!(setup.client.embedding_model_id(), "custom:e");
+    }
+
+    #[test]
+    fn test_chat_provider_reports_chat_available() {
+        let cfg = test_config(LlmProvider::Custom, None);
+        let setup = create_llm_client(&cfg, &env(&[]));
+        assert!(setup.client.chat_available());
+    }
+
+    #[test]
+    fn test_embedding_none_is_an_unusable_embedder() {
+        let cfg = test_config(LlmProvider::None, Some(LlmProvider::None));
+        let setup = create_llm_client(&cfg, &env(&[]));
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|w| w.contains("embedder unavailable")),
+            "{:?}",
+            setup.warnings
+        );
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    fn local_config(models_dir: Option<std::path::PathBuf>) -> LlmConfig {
+        let mut cfg = test_config(LlmProvider::None, Some(LlmProvider::Local));
+        cfg.embedding_model = "BGE-small-en-v1.5".into();
+        cfg.models_dir = models_dir;
+        cfg
+    }
+
+    /// The local embedder reports its dimension and canonical id without any
+    /// I/O (no model download in the default test run).
+    #[cfg(feature = "local-embeddings")]
+    #[tokio::test]
+    async fn test_local_embedder_dim_and_id_without_io() {
+        let dir = std::env::temp_dir().join("neurolithe-llm-test-never-created");
+        let setup = create_llm_client(&local_config(Some(dir.clone())), &env(&[]));
+        assert_eq!(setup.client.embedding_dim().await.unwrap(), 384);
+        assert_eq!(setup.client.embedding_model_id(), "local:bge-small-en-v1.5");
+        assert_eq!(
+            embedding_model_id(&local_config(None)),
+            "local:bge-small-en-v1.5"
+        );
+        assert!(!dir.exists(), "dim/id must not create the model cache");
+    }
+
+    /// Without a models dir the local embedder refuses (never the CWD).
+    #[cfg(feature = "local-embeddings")]
+    #[tokio::test]
+    async fn test_local_embedder_requires_models_dir() {
+        let setup = create_llm_client(&local_config(None), &env(&[]));
+        let err = setup.client.embed_text("x").await.unwrap_err().to_string();
+        assert!(err.contains("model cache dir not set"), "{err}");
+    }
+
+    #[cfg(feature = "local-embeddings")]
+    #[test]
+    fn test_unknown_local_model_is_reported_at_startup() {
+        let mut cfg = local_config(Some(std::env::temp_dir()));
+        cfg.embedding_model = "text-embedding-3-small".into();
+        let setup = create_llm_client(&cfg, &env(&[]));
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|w| w.contains("unknown local embedding model")),
+            "{:?}",
+            setup.warnings
+        );
+    }
+
+    /// SEC-09: `custom` must never read `OPENAI_API_KEY` (it may point at any
+    /// host); only `NEUROLITHE_API_KEY`, and it is optional (keyless Ollama).
+    #[test]
+    fn test_custom_provider_never_reads_openai_key() {
+        let lookup = env(&[("OPENAI_API_KEY", "sk-real-openai")]);
+        assert_eq!(resolve_api_key(&LlmProvider::Custom, &lookup), None);
+        let lookup = env(&[
+            ("OPENAI_API_KEY", "sk-real-openai"),
+            ("NEUROLITHE_API_KEY", "nl-key"),
+        ]);
+        assert_eq!(
+            resolve_api_key(&LlmProvider::Custom, &lookup).as_deref(),
+            Some("nl-key")
+        );
+        // Keyless custom is a valid setup: no warning, no stub.
+        let setup = create_llm_client(
+            &test_config(LlmProvider::Custom, None),
+            &env(&[("OPENAI_API_KEY", "sk-real-openai")]),
+        );
+        assert!(setup.warnings.is_empty(), "{:?}", setup.warnings);
+    }
+
+    /// SEC-09: the keyless custom client sends no Authorization header at all,
+    /// even when OPENAI_API_KEY is present in the environment.
+    #[tokio::test]
+    async fn test_custom_request_carries_no_openai_key() {
+        let (url, server) =
+            one_shot_server(200, r#"{"data":[{"embedding":[0.5,0.25]}]}"#.into()).await;
+        let mut cfg = test_config(LlmProvider::Custom, None);
+        cfg.base_url = Some(url);
+        let setup = create_llm_client(&cfg, &env(&[("OPENAI_API_KEY", "sk-real-openai")]));
+        let v = setup.client.embed_text("hello").await.unwrap();
+        assert_eq!(v, vec![0.5, 0.25]);
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("sk-real-openai"));
+        assert!(!request.contains("authorization:"), "{request}");
+    }
+
+    /// DEV-14 / SEC-08: the Gemini key goes in the `x-goog-api-key` header,
+    /// never the URL; and an upstream error body is truncated (SEC-09).
+    #[tokio::test]
+    async fn test_gemini_key_in_header_and_error_body_truncated() {
+        let huge = format!("{{\"error\":\"{}\"}}", "x".repeat(5000));
+        let (url, server) = one_shot_server(500, huge).await;
+        let mut client = GeminiClient::new(
+            build_http_client(Duration::from_secs(5)),
+            "SECRET-GEMINI-KEY".into(),
+            "chat".into(),
+            "emb".into(),
+        );
+        client.base_url = url;
+
+        let err = client.embed_text("hi").await.unwrap_err().to_string();
+        let request = server.await.unwrap();
+        let request_line = request.lines().next().unwrap_or("");
+        assert!(
+            !request_line.contains("SECRET-GEMINI-KEY"),
+            "key leaked into URL: {request_line}"
+        );
+        assert!(!request_line.contains("key="));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("x-goog-api-key: secret-gemini-key")
+        );
+        assert!(err.contains("500"), "{err}");
+        assert!(
+            err.len() < 500,
+            "error body not truncated ({} chars)",
+            err.len()
+        );
+        assert!(!err.contains("SECRET-GEMINI-KEY"));
+    }
+
+    /// SEC-08: transport errors don't echo the request URL (which can carry
+    /// credentials or internal hosts) back to the caller.
+    #[tokio::test]
+    async fn test_transport_error_strips_url() {
+        // Bind then drop, so the port refuses connections.
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let client = OpenAiClient::new(
+            build_http_client(Duration::from_secs(5)),
+            None,
+            "m".into(),
+            "e".into(),
+            Some(format!("http://127.0.0.1:{port}/v1?token=SECRET-IN-URL")),
+        );
+        let err = client.embed_text("hi").await.unwrap_err().to_string();
+        assert!(!err.contains("SECRET-IN-URL"), "{err}");
+        assert!(!err.contains("127.0.0.1"), "{err}");
+    }
+
+    /// DEV-5: a provider that accepts the connection but never answers must
+    /// time out instead of hanging the caller forever.
+    #[tokio::test]
+    async fn test_hung_provider_times_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _hold = tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let client = OpenAiClient::new(
+            build_http_client(Duration::from_millis(300)),
+            None,
+            "m".into(),
+            "e".into(),
+            Some(format!("http://{addr}")),
+        );
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(5), client.embed_text("hi"))
+            .await
+            .expect("request must time out on its own")
+            .unwrap_err()
+            .to_string();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(err.contains("timed out"), "{err}");
+    }
+
+    #[test]
+    fn test_plaintext_remote_detection() {
+        assert!(is_plaintext_remote("http://openrouter.example/api"));
+        assert!(!is_plaintext_remote("http://localhost:11434/v1"));
+        assert!(!is_plaintext_remote("http://127.0.0.1:11434/v1"));
+        assert!(!is_plaintext_remote("https://api.openai.com/v1"));
+    }
+
+    /// REV-7: IPv6 loopback, the whole 127/8 block and `localhost` in any case
+    /// are local; an uppercase scheme is still plain HTTP.
+    #[test]
+    fn test_plaintext_remote_parses_urls() {
+        assert!(!is_plaintext_remote("http://[::1]:11434/v1"));
+        assert!(!is_plaintext_remote("http://127.0.0.2:11434/v1"));
+        assert!(!is_plaintext_remote("http://LOCALHOST:11434"));
+        assert!(is_plaintext_remote("HTTP://openrouter.example/api"));
+        assert!(is_plaintext_remote("http://[2001:db8::1]/v1"));
+        assert!(is_plaintext_remote("http://10.0.0.5:8080/v1"));
+    }
+
+    /// REV-7: anthropic/gemini ignore `base_url`, so an http base URL must not
+    /// trigger a warning for their key; openai with the same URL must.
+    #[test]
+    fn test_plaintext_warning_only_for_providers_using_base_url() {
+        let keys = env(&[
+            ("ANTHROPIC_API_KEY", "a"),
+            ("OPENAI_API_KEY", "o"),
+            ("GEMINI_API_KEY", "g"),
+        ]);
+        let mut cfg = test_config(LlmProvider::Anthropic, Some(LlmProvider::Gemini));
+        cfg.base_url = Some("http://10.0.0.5:8080/v1".into());
+        let setup = create_llm_client(&cfg, &keys);
+        assert!(
+            !setup.warnings.iter().any(|w| w.contains("plain HTTP")),
+            "{:?}",
+            setup.warnings
+        );
+
+        let mut cfg = test_config(LlmProvider::Openai, None);
+        cfg.base_url = Some("http://10.0.0.5:8080/v1".into());
+        let setup = create_llm_client(&cfg, &keys);
+        assert!(
+            setup.warnings.iter().any(|w| w.contains("plain HTTP")),
+            "{:?}",
+            setup.warnings
+        );
     }
 }

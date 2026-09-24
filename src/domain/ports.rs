@@ -69,20 +69,35 @@ pub trait MemoryRepository {
         data_id: &str,
     ) -> Result<Option<i64>>;
 
-    /// Find nodes semantically similar to the given embedding (for conflict resolution)
+    /// Find active nodes of one tenant within `threshold` vector distance of
+    /// `embedding`, nearest first, each paired with its distance (for conflict
+    /// resolution). Returns at most `limit` nodes.
     fn find_similar_nodes(
         &self,
         embedding: &[f32],
         tenant_id: &TenantId,
         threshold: f64,
         limit: usize,
-    ) -> Result<Vec<MemoryNode>>;
+    ) -> Result<Vec<(MemoryNode, f64)>>;
 
-    /// Update existing node by incrementing support_count and resetting relevance (for assimilation)
+    /// Reinforce a node (support_count + 1, relevance back to 1.0), optionally
+    /// replacing its payload. The payload must keep the same fact text — the
+    /// stored embedding is left untouched. Use [`Self::update_node_content`]
+    /// when the text changes.
     fn update_node_support(
         &self,
         node_id: i64,
         new_payload: Option<&serde_json::Value>,
+    ) -> Result<()>;
+
+    /// Replace a node's payload **and** its embedding atomically (reinforcing
+    /// it like [`Self::update_node_support`]). Used when a merge changes the
+    /// fact text, so the vector keeps describing what the node now says.
+    fn update_node_content(
+        &self,
+        node_id: i64,
+        payload: &serde_json::Value,
+        embedding: &[f32],
     ) -> Result<()>;
 
     /// Delete all data for a given tenant
@@ -136,6 +151,17 @@ pub trait MemoryRepository {
     /// Delete idempotency rows older than `older_than_days`; returns how many
     /// were removed. Called from the periodic sweep.
     fn sweep_processed_commands(&self, older_than_days: i64) -> Result<usize>;
+}
+
+/// Which embedder produced a store's vectors. Recorded in each store's `meta`
+/// table; a store embedded by a different model or at a different dimension
+/// cannot be searched with the current embedder and must be re-embedded
+/// (`neurolithe reembed`). `dim` is what the embedder actually outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmbeddingIdentity {
+    pub provider: String,
+    pub model: String,
+    pub dim: usize,
 }
 
 /// A single STM fact, flattened for the introspection CT scan.
@@ -211,26 +237,39 @@ pub trait LlmClient: Send + Sync {
 
     /// Compress/summarize old dialogue messages into a dense summary
     async fn compress_context(&self, messages: &str) -> Result<String>;
+
+    /// The embedder's output dimension. The default probes by embedding a short
+    /// text; providers that know it statically (e.g. local models) override.
+    async fn embedding_dim(&self) -> Result<usize> {
+        Ok(self.embed_text("dimension probe").await?.len())
+    }
+
+    /// Stable identifier of the embedding model, `"<provider>:<model>"` (e.g.
+    /// `"local:bge-small-en-v1.5"`). Recorded in store metadata; a change means
+    /// the stores must be re-embedded. Default: `"unknown"`.
+    fn embedding_model_id(&self) -> String {
+        "unknown".to_string()
+    }
+
+    /// Whether a chat model is configured (fact extraction, compression,
+    /// summaries). Embeddings are independent of this. Default: `true`.
+    fn chat_available(&self) -> bool {
+        true
+    }
 }
 
-/// Outcome of fetching an artifact's text from the archive.
-///
-/// Missing is a normal, expected case — the claim-check bytes may be gone
-/// before a tombstone compacts — so the feeder skips gracefully rather than
-/// treating it as an error (ADR-0004 "empty", not "error").
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FetchOutcome {
-    Found(String),
-    Missing,
-}
-
-/// Read-only access to the artifact archive (Pithos). The feeder dereferences
-/// a `pt://` pointer from a `document.completed` event to pull the page text it
-/// needs to distill. NeuroLithe never writes — Pithos stays the source of truth.
-#[async_trait::async_trait]
-pub trait ArtifactStore: Send + Sync {
-    /// Fetch the UTF-8 text artifact at a `pt://` URI. Returns
-    /// [`FetchOutcome::Missing`] for a 404/gone artifact; errors only on
-    /// transient failures (network, 5xx) the caller may retry.
-    async fn fetch_text(&self, uri: &str) -> Result<FetchOutcome>;
+/// The [`EmbeddingIdentity`] of `llm`'s embedder: provider and model from
+/// [`LlmClient::embedding_model_id`] (`"provider:model"`; without a `:` the
+/// provider is `"unknown"`), dimension from [`LlmClient::embedding_dim`].
+pub async fn embedding_identity(llm: &dyn LlmClient) -> Result<EmbeddingIdentity> {
+    let id = llm.embedding_model_id();
+    let provider = match id.split_once(':') {
+        Some((provider, _)) if !provider.is_empty() => provider.to_string(),
+        _ => "unknown".to_string(),
+    };
+    Ok(EmbeddingIdentity {
+        provider,
+        model: id,
+        dim: llm.embedding_dim().await?,
+    })
 }

@@ -8,6 +8,7 @@
 
 - [Quickstart Guide](./quickstart.md)
 - [Configuration](./configuration.md)
+- [Kafka Mode (optional)](./kafka.md)
 
 # Architecture
 
@@ -22,10 +23,10 @@
 - [Tool: push_dialogue](./mcp/push-dialogue.md)
 - [Tool: store_memory](./mcp/store-memory.md)
 - [Tool: query_memory](./mcp/query-memory.md)
-- [Tool: register_ccl](./mcp/register-ccl.md)
-- [Tool: get_ccl_layers](./mcp/get-ccl-layers.md)
-- [Tool: delete_tenant](./mcp/delete-tenant.md)
-- [Tool: export_tenant](./mcp/export-tenant.md)
+- [Tool: remember_document](./mcp/remember-document.md)
+- [Tool: recall_ltm](./mcp/recall-ltm.md)
+- [Workspace tools](./mcp/workspaces.md)
+- [Introspection tools](./mcp/introspection.md)
 
 # Theory
 

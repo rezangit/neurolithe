@@ -8,3 +8,6 @@ target/
 .git/
 docs/
 *.md
+project-review/
+# Local config may hold secrets; the image reads /data/neurolithe.toml instead.
+/neurolithe.toml

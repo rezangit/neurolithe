@@ -3,6 +3,155 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.3.0] — 2026-09-24
+
+A clean standalone product: one user, isolated **workspaces**, **local
+embeddings with no API key**, a proper home directory, versioned stores, and no
+JARVIS-specific coupling. **Breaking**: config location, store layout, and the
+MCP tool surface all change. See *Upgrading* below.
+
+### Upgrading from 0.2.x
+
+1. `cargo install --path .` (the prebuilt-binary installers are retired), then
+   `neurolithe init`. This writes `~/.neurolithe/neurolithe.toml`, downloads the
+   local embedding model (~130 MB, once), and prints an MCP client snippet.
+2. Bring an old store over with
+   `neurolithe workspace import <name> --stm <old-stm.sqlite> --ltm <old-ltm.sqlite>`.
+   The source files are left untouched and a backup is taken before migrating.
+   All old tenants are merged into the workspace.
+3. If the old store was embedded with a different model, run
+   `neurolithe reembed --workspace <name>`.
+4. Update MCP client configs to the snippet `init` prints (`args: ["mcp", …]`).
+   `tenant_id` arguments, `delete_tenant` and `export_tenant` are gone.
+
+### Added
+
+- **Workspaces**: fully separate STM+LTM store pairs under
+  `<home>/workspaces/<name>/`.
+  - Select one with `--workspace`, `NEUROLITHE_WORKSPACE` or config.
+  - MCP tools: `workspace_current/list/create/switch/export/delete`. Delete
+    requires `confirm` and refuses the active workspace; switching can be
+    disabled with `[mcp] allow_workspace_switch`.
+  - CLI: `neurolithe workspace list|create|delete|export|backup|import`.
+    Backups use timestamped `VACUUM INTO`.
+- **Local embeddings by default** (`local-embeddings` feature, on by default):
+  fastembed `bge-small-en-v1.5` (384-d). The model is cached in
+  `<home>/models` and works offline after the first download.
+- **The chat LLM is optional** (`provider = "none"`). Memory still stores and
+  searches without it; `push_dialogue` reports `learning_error: "LLM not
+  configured"`.
+- **`remember_document`** MCP tool, so long-term memory works in standalone
+  mode: summarize (or excerpt), embed, place in the concept tree, upsert by
+  `data_id`.
+- **`neurolithe init`** and **`neurolithe reembed`**.
+- **Store metadata and migrations**: each store records its schema version
+  and embedding model/dimension.
+  - An automatic backup is taken before any migration.
+  - A store built with a different embedder, a newer schema, or of the wrong
+    kind (STM vs LTM) is refused.
+- **Configurable concept spine** via `[[ltm.spine]]`. The default is
+  `notes` / `documents` / `inbox`.
+- **Kafka mode is a generic optional tool**:
+  - `[kafka.topics]` sets topic names.
+  - `[kafka.client]` passes settings through to librdkafka (SASL/TLS).
+  - Documents carry their text in the event.
+- **Structured logging** via `tracing`, to stderr only. The level comes from
+  `RUST_LOG`, then `[log] level`.
+- **Graceful shutdown** on SIGINT/SIGTERM in both modes, with a WAL
+  checkpoint. The daemon also drains its Kafka loops, commits and flushes.
+- **Configurable distance thresholds**: `[ltm] placement_max_distance`, `[stm] assimilation_threshold` and `[stm] accommodation_threshold`, with per-embedding-model defaults (`bge-small-en-v1.5`, `text-embedding-004`) and a warned fallback for other models. `placement_debug` now returns `{thresholds, probes}` and shows where each value came from.
+
+### Changed
+
+- **Home directory**: config comes from `--home` / `NEUROLITHE_HOME` /
+  `~/.neurolithe`, and `--config` / `NEUROLITHE_CONFIG`. `.env` is read only
+  from the home dir. The current working directory is never read, so a cloned
+  repo can no longer redirect your API key. Created dirs are 0700 and files
+  0600.
+- **Store paths and dimensions are no longer configured**: they come from the
+  workspace and the embedder. Stale `path` / `vector_dimension` keys are
+  ignored with a warning.
+- **MCP startup never blocks on the embedder**: `initialize`, `tools/list`
+  and `ping` answer immediately while the workspace opens.
+- **Hard reset over Kafka** is disabled unless `NEUROLITHE_RESET_TOKEN` is set
+  to at least 16 characters, and it is compared in constant time.
+- **Build image** moved to Debian trixie. The ONNX Runtime prebuilt needs
+  glibc ≥ 2.38 and GCC 14.
+- **sqlite-vec** upgraded to 0.1.9.
+
+### Removed
+
+- Tenancy on the MCP and Kafka surfaces (`tenant_id`, `delete_tenant`,
+  `export_tenant`).
+- The Pithos archive client and `[pithos]` config.
+- The hard-coded personal-life spine, private LAN/GCP defaults and
+  host-specific compose paths.
+- The `install.sh` / `install.ps1` binary installers.
+
+## [0.2.1] — 2026-09-23 (not tagged; ships as part of 0.3.0)
+
+Correctness and hardening from the 2026-09 multi-discipline review.
+Phase 0 (safety net) + Phase 1 (make it correct).
+
+### Fixed
+
+- **`push_dialogue` never learned anything.** Extracted facts were stored under a
+  placeholder episode id `0`, failed the foreign key, and the error was discarded.
+  Facts now persist. An extraction failure no longer fails the call; it is reported
+  as `learning_error` on a successful context window, so a retry does not duplicate
+  the turn.
+- **Conflict resolver corrupted memories.** A "modify" replaced a node's text but
+  kept its old embedding and dropped payload keys such as `dataId`. It now
+  re-embeds, preserves payload, unions tags, and never merges nodes with different
+  `dataId`s. `assimilation_threshold` is now used.
+- **`delete_tenant` failed for any tenant with graph edges** (FK error). It now
+  deletes edges, vectors, nodes, episodes and CCL registry rows in one
+  transaction. It also **requires** `tenant_id` plus a matching `confirm`
+  instead of defaulting to the `jarvis` tenant.
+- **MCP clients saw every tool failure as success.** Tool results now carry
+  `isError` (camelCase) as the spec requires. An unknown tool is a JSON-RPC
+  `-32602` error.
+- **Search ignored `k` and could return nothing.** The hard-coded `LIMIT 5` is
+  gone, filters run before the limit, zero-vector anchors and archived nodes are
+  kept out of the vector index (existing stores are cleaned on startup), and LTM
+  recall returns the top-k hits instead of one.
+- **"database is locked" with several processes.** `busy_timeout` is set before
+  WAL, write transactions begin `IMMEDIATE`, and store open retries briefly.
+- The Anthropic JSON extraction could panic, and a zero half-life produced NaN.
+
+### Changed
+
+- **Every LLM call has timeouts** via one shared HTTP client
+  (`llm.request_timeout_secs`, default 120).
+- **No more `dummy_key`.** A missing key logs a startup warning, and LLM tools
+  return "LLM not configured: …".
+- **Config is validated at load** and every problem is reported at once.
+- **MCP:**
+  - Supports `ping`, advertises `listChanged: false` and negotiates the protocol version.
+  - Validates and clamps tool arguments.
+  - Caps sizes: message 64 KiB, fact 16 KiB, query 4 KiB, line 4 MiB.
+  - Tool schemas declare all accepted params and include read-only/destructive hints.
+- **Sessions are keyed by (tenant, session)**, with LRU (256) and idle-TTL (6 h)
+  eviction. Each extraction is capped at 32 facts and 32 relationships.
+- **Secrets:**
+  - The Gemini key is sent in the `x-goog-api-key` header, not the URL.
+  - `provider = "custom"` only reads `NEUROLITHE_API_KEY`.
+  - Errors are stripped of URLs and upstream bodies are truncated.
+
+### Added
+
+- `scripts/check.sh`: local quality gate (fmt, clippy `-D warnings`, tests on
+  default and `kafka` features), with an optional `scripts/pre-commit` hook.
+  `scripts/cargo.sh` runs cargo in Docker when no local toolchain exists.
+- End-to-end MCP STDIO tests (`tests/`) driving the real binary against an
+  in-process fake LLM, including regression tests tagged by issue ID.
+- `rust-toolchain.toml` (1.94.1) and a generic `neurolithe.example.toml`. The
+  private `neurolithe.toml` is no longer tracked.
+
+### Removed
+
+- The dead CI badge.
+
 ## [0.2.0] — 2026-07-10
 
 A reliability release driven by real-world MCP testing: search actually works

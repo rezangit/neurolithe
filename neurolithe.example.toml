@@ -1,0 +1,140 @@
+# NeuroLithe configuration.
+#
+# `neurolithe init` writes this file to <home>/neurolithe.toml, where <home> is
+# `--home`, else $NEUROLITHE_HOME, else ~/.neurolithe. Use `--config <file>` or
+# $NEUROLITHE_CONFIG to point elsewhere. The current directory is never read.
+#
+# Every value can also be set by an environment variable using the
+# `NEUROLITHE__<SECTION>__<KEY>` form, e.g. NEUROLITHE__LLM__PROVIDER=gemini.
+# API keys come from the environment (or <home>/.env), never from this file:
+#   OPENAI_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY, or NEUROLITHE_API_KEY.
+
+# --- Workspaces ---
+# Each workspace is a completely separate memory: its own STM + LTM stores in
+# <home>/workspaces/<name>/. Selected by `--workspace`, else
+# $NEUROLITHE_WORKSPACE, else this value. Created on first use.
+# workspace = "default"
+
+[llm]
+# Embeddings power all memory search. The default runs fully offline: a local
+# ONNX model (bge-small-en-v1.5, 384-dim), downloaded once into <home>/models.
+# No API key needed.
+embedding_provider = "local"
+embedding_model = "bge-small-en-v1.5"
+
+# Chat LLM: optional. It is used for fact extraction (push_dialogue), context
+# compression and document summaries. With "none", NeuroLithe still stores and
+# recalls memory; push_dialogue just reports that learning is unavailable.
+provider = "none"
+
+# --- OpenAI chat (key: OPENAI_API_KEY) ---
+# provider = "openai"
+# model = "gpt-4o-mini"
+
+# --- Anthropic chat (key: ANTHROPIC_API_KEY) ---
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+
+# --- Google Gemini chat (key: GEMINI_API_KEY) ---
+# provider = "gemini"
+# model = "gemini-2.5-flash"
+
+# --- Fully local chat via Ollama (no API key) ---
+# provider = "custom"
+# model = "llama3.1"
+# base_url = "http://localhost:11434/v1"
+
+# --- Remote embeddings instead of the local model ---
+# Changing the embedding model later requires `neurolithe reembed`.
+# embedding_provider = "openai"                  # or "gemini", "custom"
+# embedding_model = "text-embedding-3-small"
+# embedding_base_url = "https://api.openai.com/v1"
+
+# --- Legacy embedding: Google Vertex AI text-embedding-004 (768-dim) ---
+# The embedder used by NeuroLithe <= 0.2. Keep it to open a pre-0.3 store
+# without `neurolithe reembed`. Auth: service-account key at
+# GOOGLE_APPLICATION_CREDENTIALS (env or <home>/.env).
+# embedding_provider = "vertex"
+# embedding_model = "text-embedding-004"
+# embedding_project = "your-gcp-project-id"
+# embedding_location = "us-central1"
+
+# [mcp]
+# Whether the MCP `workspace_switch` tool may change workspace mid-session.
+# allow_workspace_switch = true
+
+# [log]
+# Diagnostics go to stderr only (stdout is the MCP transport). RUST_LOG, when
+# set, overrides this. Examples: "info" (default), "debug", "neurolithe=debug,warn".
+# level = "info"
+
+# --- Memory stores ---
+# STM = decaying short-term working memory. LTM = permanent long-term knowledge
+# tree. Both live in <home>/workspaces/<name>/; their vector size follows the
+# embedder and is recorded in each store.
+
+# Distance thresholds (optional). Defaults are picked per embedding model; see
+# docs/src/configuration.md ("Distance thresholds"). Calibrate placement with
+# the `placement_debug` MCP tool, which reports the values in effect.
+# [ltm]
+# placement_max_distance = 0.96   # file under the nearest concept within this L2 distance
+# [stm]
+# assimilation_threshold = 0.40   # a new fact this close IS the existing fact
+# accommodation_threshold = 0.58  # this close: the new fact refines the existing one
+#
+# Legacy calibration for text-embedding-004 (768-dim, NeuroLithe <= 0.2),
+# measured on a real corpus. Applied automatically whenever that embedding
+# model is configured. To pin them explicitly, uncomment this block INSTEAD of
+# the one above (a TOML table may appear only once):
+# [ltm]
+# placement_max_distance = 1.10
+# [stm]
+# assimilation_threshold = 0.15
+# accommodation_threshold = 0.35
+
+# LTM spine: the curated top branches documents are filed under (plus an
+# implicit "inbox"). Default: "notes" and "documents". `path` is "/"-separated.
+# Define your own branches, each with a descriptive `description`: with the
+# generic default spine nearly every document lands in "inbox".
+# [[ltm.spine]]
+# path = "work/projects"
+# description = "Active projects: plans, decisions, status."
+
+# --- Forgetting curve (STM only) ---
+[decay]
+default_half_life_days = 7.0
+working_half_life_minutes = 30.0
+
+# --- Optional: Kafka daemon (only in builds with `--features kafka`) ---
+# See docs/src/kafka.md. Hard reset stays disabled unless NEUROLITHE_RESET_TOKEN
+# (env) is at least 16 characters.
+# [kafka]
+# brokers = "localhost:9092"
+# group_id = "neurolithe"
+#
+# [kafka.topics]            # defaults shown; set any subset
+# documents = "document.completed"
+# commands = "memory.command"
+# queries = "memory.query"
+# results = "memory.result"
+# metrics = "memory.metrics"
+# dlq = "dlq.memory"
+# parking = "parking.lot"
+#
+# [kafka.client]            # librdkafka properties for every Kafka client (SASL/TLS)
+# "security.protocol" = "SASL_SSL"
+# "sasl.mechanism" = "SCRAM-SHA-512"
+# "sasl.username" = "neurolithe"
+# # sasl.password: prefer NEUROLITHE__KAFKA__CLIENT__SASL_PASSWORD in the env/.env
+#
+# [sweep]
+# interval_secs = 300
+#
+# [metrics]
+# interval_secs = 60
+#
+# [feeder]
+# enabled = false
+#
+# [bus_query]
+# enabled = false

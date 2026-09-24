@@ -6,6 +6,9 @@ use crate::domain::ports::{LlmClient, MemoryRepository};
 use anyhow::Result;
 use std::sync::Arc;
 
+/// `learning_error` reported by `push_dialogue` when no chat LLM is configured.
+pub const LLM_NOT_CONFIGURED: &str = "LLM not configured";
+
 pub struct NeurolitheApp {
     memory_repo: Arc<dyn MemoryRepository>,
     llm_client: Arc<dyn LlmClient>,
@@ -24,6 +27,7 @@ impl NeurolitheApp {
         llm_client: Arc<dyn LlmClient>,
         default_half_life_days: f64,
         working_half_life_days: f64,
+        thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
             memory_repo: memory_repo.clone(),
@@ -34,6 +38,9 @@ impl NeurolitheApp {
                 llm_client.clone(),
                 default_half_life_days,
                 working_half_life_days,
+                crate::domain::cognition::conflict_resolver::ConflictResolver::from_thresholds(
+                    thresholds,
+                ),
             ),
             session_manager: SessionManager::new(
                 memory_repo.clone(),
@@ -72,7 +79,7 @@ impl NeurolitheApp {
         new_message: &str,
         ccl: &str,
     ) -> Result<ContextWindow> {
-        let ctx = self
+        let (mut ctx, episode_id) = self
             .session_manager
             .push_dialogue(
                 &TenantId(tenant_id.to_string()),
@@ -82,17 +89,29 @@ impl NeurolitheApp {
             )
             .await?;
 
-        // Queue for background learning (extract facts from the new message)
+        // Learn from the new message, attributing facts to the episode it was
+        // archived as (the old placeholder id 0 FK-failed every fact — ARC-1).
+        // The message is already archived and buffered, so a learning failure
+        // must not fail the call (a retry would store it twice — REV-1): it is
+        // logged and reported in `learning_error` instead, never swallowed.
         let episode = Episode {
-            id: Some(0), // placeholder, already stored by session_manager
+            id: Some(episode_id),
             tenant_id: TenantId(tenant_id.to_string()),
             session_id: SessionId(session_id.to_string()),
             raw_dialogue: new_message.to_string(),
             ccl: ccl.to_string(),
             created_at: None,
         };
-        // Fire-and-forget: in production this would be async/background
-        let _ = self.sleep_worker.process_episode(&episode).await;
+        if !self.llm_client.chat_available() {
+            // No chat LLM configured: nothing can be extracted. Not an error —
+            // the dialogue is archived — but reported so the caller knows.
+            ctx.learning_error = Some(LLM_NOT_CONFIGURED.to_string());
+        } else if let Err(e) = self.sleep_worker.process_episode(&episode).await {
+            tracing::warn!(
+                "dialogue archived as episode {episode_id}, but fact extraction failed: {e:#}"
+            );
+            ctx.learning_error = Some(format!("fact extraction failed: {e:#}"));
+        }
 
         Ok(ctx)
     }
@@ -200,5 +219,242 @@ impl NeurolitheApp {
     pub async fn export_tenant(&self, tenant_id: &str) -> Result<String> {
         self.memory_repo
             .export_tenant(&TenantId(tenant_id.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::models::CclDefinition;
+    use crate::domain::ports::ExtractedFact;
+    use crate::infrastructure::database::init_db;
+    use crate::infrastructure::repository::SqliteMemoryRepository;
+    use crate::infrastructure::schema::init_schema;
+    use async_trait::async_trait;
+
+    /// Extracts one fact per dialogue (or fails, when `fail` is set).
+    struct StubLlm {
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LlmClient for StubLlm {
+        async fn extract_facts(
+            &self,
+            dialogue: &str,
+            _c: &[CclDefinition],
+        ) -> Result<Vec<ExtractedFact>> {
+            if self.fail {
+                anyhow::bail!("extractor down");
+            }
+            Ok(vec![ExtractedFact {
+                fact: format!("learned: {dialogue}"),
+                ccl: "reality".into(),
+                tags: vec!["t".into()],
+                relationships: vec![],
+            }])
+        }
+        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
+            Ok("d".into())
+        }
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.5, 0.1, 0.0, 0.0])
+        }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            Ok("summary".into())
+        }
+    }
+
+    fn app(fail: bool) -> NeurolitheApp {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&conn, 4).unwrap();
+        NeurolitheApp::new(
+            Arc::new(SqliteMemoryRepository::new(conn)),
+            Arc::new(StubLlm { fail }),
+            7.0,
+            30.0 / 1440.0,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
+        )
+    }
+
+    /// ARC-1/DEV-3/QA-1: facts extracted from pushed dialogue are persisted
+    /// (the placeholder episode id 0 used to FK-fail every insert, silently).
+    #[tokio::test]
+    async fn push_dialogue_persists_extracted_facts() {
+        let app = app(false);
+        app.push_dialogue("t1", "s1", "I moved to Lyon", "reality")
+            .await
+            .expect("push_dialogue succeeds");
+
+        let export: serde_json::Value =
+            serde_json::from_str(&app.export_tenant("t1").await.unwrap()).unwrap();
+        let facts = export["extracted_facts"].as_array().unwrap();
+        assert_eq!(
+            facts.len(),
+            1,
+            "the extracted fact must be stored: {export}"
+        );
+        assert_eq!(facts[0]["fact"], "learned: I moved to Lyon");
+    }
+
+    /// REV-1: an extraction failure after the message is archived still returns
+    /// the context window (success) and reports it in `learning_error` — so a
+    /// client never retries and archives the message twice.
+    #[tokio::test]
+    async fn push_dialogue_reports_learning_error_without_failing() {
+        let app = app(true);
+        let ctx = app
+            .push_dialogue("t1", "s1", "hello", "reality")
+            .await
+            .expect("archiving succeeded, so the call succeeds");
+        assert_eq!(ctx.recent_messages, vec!["hello".to_string()]);
+        let err = ctx
+            .learning_error
+            .clone()
+            .expect("learning failure is reported");
+        assert!(err.contains("extractor down"), "{err}");
+
+        let json = serde_json::to_value(&ctx).unwrap();
+        assert!(
+            json["learning_error"]
+                .as_str()
+                .unwrap()
+                .contains("extractor down")
+        );
+    }
+
+    /// Success responses carry no `learning_error` key at all.
+    #[tokio::test]
+    async fn push_dialogue_success_has_no_learning_error() {
+        let app = app(false);
+        let ctx = app
+            .push_dialogue("t1", "s1", "hi", "reality")
+            .await
+            .unwrap();
+        assert!(ctx.learning_error.is_none());
+        let json = serde_json::to_value(&ctx).unwrap();
+        assert!(json.get("learning_error").is_none());
+    }
+
+    /// REV-1: with no LLM at all (chat and embeddings fail), the message is
+    /// still archived and the context window is still returned.
+    #[tokio::test]
+    async fn push_dialogue_without_llm_still_returns_context() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&conn, 4).unwrap();
+        let app = NeurolitheApp::new(
+            Arc::new(SqliteMemoryRepository::new(conn)),
+            Arc::new(NoLlm),
+            7.0,
+            30.0 / 1440.0,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
+        );
+        let ctx = app
+            .push_dialogue("t1", "s1", "remember this", "reality")
+            .await
+            .expect("no LLM must not fail an archived push");
+        assert_eq!(ctx.recent_messages, vec!["remember this".to_string()]);
+        assert!(ctx.relevant_facts.is_empty());
+        assert_eq!(ctx.learning_error.as_deref(), Some(LLM_NOT_CONFIGURED));
+        assert!(!ctx.warnings.is_empty(), "the failed recall is reported");
+    }
+
+    /// Every call fails, like an unconfigured provider.
+    struct NoLlm;
+
+    #[async_trait]
+    impl LlmClient for NoLlm {
+        async fn extract_facts(
+            &self,
+            _d: &str,
+            _c: &[CclDefinition],
+        ) -> Result<Vec<ExtractedFact>> {
+            anyhow::bail!("LLM not configured")
+        }
+        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
+            anyhow::bail!("LLM not configured")
+        }
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            anyhow::bail!("LLM not configured")
+        }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            anyhow::bail!("LLM not configured")
+        }
+        fn chat_available(&self) -> bool {
+            false
+        }
+    }
+
+    /// Extracts the dialogue itself as one fact; "alpha …" embeds at E and
+    /// "beta …" at L2 0.25 from it.
+    struct TwoFacts;
+
+    #[async_trait]
+    impl LlmClient for TwoFacts {
+        async fn extract_facts(
+            &self,
+            dialogue: &str,
+            _c: &[CclDefinition],
+        ) -> Result<Vec<ExtractedFact>> {
+            Ok(vec![ExtractedFact {
+                fact: dialogue.to_string(),
+                ccl: "reality".into(),
+                tags: vec![],
+                relationships: vec![],
+            }])
+        }
+        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
+            Ok("d".into())
+        }
+        async fn embed_text(&self, t: &str) -> Result<Vec<f32>> {
+            Ok(if t.starts_with("beta") {
+                vec![1.0, 0.25, 0.0, 0.0]
+            } else {
+                vec![1.0, 0.0, 0.0, 0.0]
+            })
+        }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            Ok("summary".into())
+        }
+    }
+
+    async fn facts_after_two_pushes(accommodation: f64) -> usize {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&conn, 4).unwrap();
+        let thresholds = crate::domain::thresholds::Thresholds::resolve(
+            "unknown:model",
+            crate::domain::thresholds::ThresholdOverrides {
+                placement_max_distance: None,
+                assimilation: Some(0.1),
+                accommodation: Some(accommodation),
+            },
+        )
+        .unwrap()
+        .0;
+        let app = NeurolitheApp::new(
+            Arc::new(SqliteMemoryRepository::new(conn)),
+            Arc::new(TwoFacts),
+            7.0,
+            1.0,
+            &thresholds,
+        );
+        app.push_dialogue("t", "s", "alpha fact", "reality")
+            .await
+            .unwrap();
+        app.push_dialogue("t", "s", "beta fact", "reality")
+            .await
+            .unwrap();
+        let export: serde_json::Value =
+            serde_json::from_str(&app.export_tenant("t").await.unwrap()).unwrap();
+        export["extracted_facts"].as_array().unwrap().len()
+    }
+
+    /// The thresholds passed to the app reach the sleep worker's conflict
+    /// resolver: two facts 0.25 apart merge under accommodation 0.35 but stay
+    /// separate under 0.20.
+    #[tokio::test]
+    async fn thresholds_reach_the_sleep_workers_resolver() {
+        assert_eq!(facts_after_two_pushes(0.35).await, 1, "merged");
+        assert_eq!(facts_after_two_pushes(0.20).await, 2, "kept apart");
     }
 }

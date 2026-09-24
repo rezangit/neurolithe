@@ -3,16 +3,28 @@
 //!
 //! Results are **reference-returning**: leaves surface their `dataId` +
 //! provenance (the opposite of STM's id-hiding `MemoryResult`), so the agent
-//! can fetch originals from Ledger -> Pithos. See `V2-DESIGN.md` §3.3.
+//! can fetch originals from their source.
 
 use crate::domain::ltm::{LtmRepository, Provenance, TreeNode, TreeNodeKind};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-/// Recall locates the nearest concept regardless of distance (k = 1, no
-/// threshold) — unlike placement, which only attaches within a tight bound.
-const RECALL_MAX_DISTANCE: f64 = f64::MAX;
+/// Recall applies **no** distance cutoff: the nearest `k` nodes are always
+/// returned, ordered by distance (which each hit reports). A fixed L2 cutoff
+/// assumes unit-norm embeddings, which nothing enforces — with an un-normalised
+/// embedder it silently empties every recall (REV-4). Output stays bounded by
+/// [`RECALL_MAX_K`] and the per-hit child/leaf caps.
+const RECALL_NO_DISTANCE_CAP: f64 = f64::MAX;
+
+/// Upper bound on hits per recall, whatever `k` the caller asks for.
+pub const RECALL_MAX_K: usize = 50;
+
+/// Per hit, at most this many child concepts and this many document leaves are
+/// returned, so a broad concept with thousands of documents cannot flood the
+/// caller's context (ARC-15). Use `drill`/`inspect_node` to page further.
+pub const RECALL_MAX_CHILDREN: usize = 20;
+pub const RECALL_MAX_LEAVES: usize = 20;
 
 /// A concept/leaf node, flattened for output (no internal timestamps).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,21 +191,23 @@ impl LtmRetrieval {
         }))
     }
 
-    /// Vector-locate the nearest node to `embedding` — a concept **or** a
-    /// document leaf — then assemble context. A concept entry returns its
-    /// ancestors + children + child document leaves (the knowledge-tree view). A
-    /// leaf entry returns the document itself (its `dataId`/provenance) framed by
-    /// its ancestors, so a document is recallable by meaning even while it sits
-    /// under the inbox. `None` if nothing is vector-indexed yet.
-    pub fn recall(&self, embedding: &[f32]) -> Result<Option<RecallResult>> {
-        let Some((entry, distance)) = self
-            .repo
-            .find_similar_any(embedding, RECALL_MAX_DISTANCE, 1)?
+    /// Vector-locate the `k` nearest nodes to `embedding` — concepts **and**
+    /// document leaves, with no distance cutoff — nearest
+    /// first, and assemble context for each. A concept hit returns its
+    /// ancestors + (bounded) children + (bounded) child document leaves. A leaf
+    /// hit returns the document itself (its `dataId`/provenance) framed by its
+    /// ancestors, so a document is recallable by meaning even while it sits
+    /// under the inbox. Empty only when nothing is vector-indexed.
+    pub fn recall(&self, embedding: &[f32], k: usize) -> Result<Vec<RecallResult>> {
+        let k = k.clamp(1, RECALL_MAX_K);
+        self.repo
+            .find_similar_any(embedding, RECALL_NO_DISTANCE_CAP, k)?
             .into_iter()
-            .next()
-        else {
-            return Ok(None);
-        };
+            .map(|(entry, distance)| self.assemble_hit(entry, distance))
+            .collect()
+    }
+
+    fn assemble_hit(&self, entry: TreeNode, distance: f64) -> Result<RecallResult> {
         let entry_id = entry.id.expect("stored node has id");
 
         let ancestors = self
@@ -202,16 +216,18 @@ impl LtmRetrieval {
             .map(NodeView::from)
             .collect();
 
+        let to_ref = |l: crate::domain::ltm::Leaf| LeafRef {
+            data_id: l.data_id,
+            provenance: l.provenance,
+        };
+
         // A leaf hit surfaces the document directly; a concept hit surfaces its
-        // children + attached document leaves.
+        // children + attached document leaves, each bounded.
         let (children, leaves) = if entry.kind == TreeNodeKind::Leaf {
             let leaf = self
                 .repo
                 .get_leaf(entry_id)?
-                .map(|l| LeafRef {
-                    data_id: l.data_id,
-                    provenance: l.provenance,
-                })
+                .map(to_ref)
                 .into_iter()
                 .collect();
             (Vec::new(), leaf)
@@ -220,27 +236,26 @@ impl LtmRetrieval {
                 .repo
                 .get_children(entry_id)?
                 .iter()
+                .take(RECALL_MAX_CHILDREN)
                 .map(NodeView::from)
                 .collect();
             let leaves = self
                 .repo
                 .get_child_leaves(entry_id)?
                 .into_iter()
-                .map(|l| LeafRef {
-                    data_id: l.data_id,
-                    provenance: l.provenance,
-                })
+                .take(RECALL_MAX_LEAVES)
+                .map(to_ref)
                 .collect();
             (children, leaves)
         };
 
-        Ok(Some(RecallResult {
+        Ok(RecallResult {
             entry: NodeView::from(&entry),
             ancestors,
             children,
             leaves,
             distance,
-        }))
+        })
     }
 
     /// All distinct ancestors of a node (BFS upward), nearest first.
@@ -410,8 +425,10 @@ mod tests {
 
         let recalled = f
             .ret
-            .recall(&[1.0, 0.0, 0.0, 0.0])
+            .recall(&[1.0, 0.0, 0.0, 0.0], 1)
             .unwrap()
+            .into_iter()
+            .next()
             .expect("a concept exists");
         assert_eq!(recalled.entry.id, f.jobs, "vector entry is the job concept");
         assert!(recalled.distance < 1e-6, "exact match has ~0 distance");
@@ -447,7 +464,7 @@ mod tests {
         repo.add_edge(&TreeEdge::new(root, concept)).unwrap();
         let leaf = repo
             .create_node(
-                &TreeNode::new("note", "a durable metis note", TreeNodeKind::Leaf),
+                &TreeNode::new("note", "a durable agent note", TreeNodeKind::Leaf),
                 Some(&[0.0, 1.0, 0.0, 0.0]),
             )
             .unwrap();
@@ -455,7 +472,7 @@ mod tests {
             tree_node_id: leaf,
             data_id: "note_1".into(),
             provenance: Provenance {
-                source: "metis".into(),
+                source: "agent".into(),
                 ingested_at: None,
                 confidence: 1.0,
             },
@@ -465,8 +482,10 @@ mod tests {
 
         let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
         let recalled = ret
-            .recall(&[0.0, 1.0, 0.0, 0.0])
+            .recall(&[0.0, 1.0, 0.0, 0.0], 1)
             .unwrap()
+            .into_iter()
+            .next()
             .expect("the leaf is vector-indexed");
 
         // Nearest node is the document leaf → entry is the leaf, carrying its dataId.
@@ -474,8 +493,110 @@ mod tests {
         assert_eq!(recalled.entry.kind, TreeNodeKind::Leaf);
         assert_eq!(recalled.leaves.len(), 1);
         assert_eq!(recalled.leaves[0].data_id, "note_1");
-        assert_eq!(recalled.leaves[0].provenance.source, "metis");
+        assert_eq!(recalled.leaves[0].provenance.source, "agent");
         // Framed by its ancestor for context.
         assert!(recalled.ancestors.iter().any(|n| n.id == root));
+    }
+
+    fn leaf_under(
+        repo: &Arc<SqliteLtmRepository>,
+        parent: i64,
+        data_id: &str,
+        emb: Option<&[f32]>,
+    ) {
+        let leaf = repo
+            .create_node(&TreeNode::new(data_id, "doc", TreeNodeKind::Leaf), emb)
+            .unwrap();
+        repo.create_leaf(&Leaf {
+            tree_node_id: leaf,
+            data_id: data_id.into(),
+            provenance: Provenance {
+                source: "test".into(),
+                ingested_at: None,
+                confidence: 1.0,
+            },
+        })
+        .unwrap();
+        repo.add_edge(&TreeEdge::new(parent, leaf)).unwrap();
+    }
+
+    /// ARC-15: recall returns the top-k hits, nearest first (not just one).
+    #[test]
+    fn test_recall_returns_top_k_nearest_first() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&conn, DIM).unwrap();
+        let repo = Arc::new(SqliteLtmRepository::new(conn));
+        let root = repo
+            .create_node(&TreeNode::new("root", "root", TreeNodeKind::Spine), None)
+            .unwrap();
+        let mut ids = Vec::new();
+        for (name, emb) in [
+            ("near", [1.0, 0.0, 0.0, 0.0]),
+            ("mid", [1.0, 0.5, 0.0, 0.0]),
+            ("far", [1.0, 0.9, 0.0, 0.0]),
+        ] {
+            let id = repo
+                .create_node(&TreeNode::new(name, name, TreeNodeKind::Spine), Some(&emb))
+                .unwrap();
+            repo.add_edge(&TreeEdge::new(root, id)).unwrap();
+            ids.push(id);
+        }
+        let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
+
+        let two: Vec<i64> = ret
+            .recall(&[1.0, 0.0, 0.0, 0.0], 2)
+            .unwrap()
+            .iter()
+            .map(|r| r.entry.id)
+            .collect();
+        assert_eq!(two, vec![ids[0], ids[1]], "top-2, nearest first");
+
+        let all = ret.recall(&[1.0, 0.0, 0.0, 0.0], 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.windows(2).all(|w| w[0].distance <= w[1].distance));
+    }
+
+    /// REV-4: with un-normalised embeddings, distances are large; recall must
+    /// still return the nearest nodes rather than an empty result.
+    #[test]
+    fn test_recall_has_no_distance_cutoff() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&conn, DIM).unwrap();
+        let repo = Arc::new(SqliteLtmRepository::new(conn));
+        let far = repo
+            .create_node(
+                &TreeNode::new("far", "far", TreeNodeKind::Spine),
+                Some(&[40.0, 30.0, 0.0, 0.0]),
+            )
+            .unwrap();
+        let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
+
+        let hits = ret.recall(&[0.0, 0.0, 3.0, 4.0], 5).unwrap();
+        assert_eq!(hits.len(), 1, "nearest node returned despite distance ~50");
+        assert_eq!(hits[0].entry.id, far);
+        assert!(hits[0].distance > 10.0);
+    }
+
+    /// ARC-15: a concept hit carries a bounded number of document leaves.
+    #[test]
+    fn test_recall_bounds_child_leaves() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&conn, DIM).unwrap();
+        let repo = Arc::new(SqliteLtmRepository::new(conn));
+        let concept = repo
+            .create_node(
+                &TreeNode::new("bills", "bills", TreeNodeKind::Spine),
+                Some(&[1.0, 0.0, 0.0, 0.0]),
+            )
+            .unwrap();
+        for i in 0..(RECALL_MAX_LEAVES + 15) {
+            leaf_under(&repo, concept, &format!("doc_{i}"), None);
+        }
+        let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
+
+        let hit = ret.recall(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].leaves.len(), RECALL_MAX_LEAVES);
+        assert!(hit[0].children.len() <= RECALL_MAX_CHILDREN);
     }
 }

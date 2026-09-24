@@ -1,9 +1,9 @@
 //! Write service — applies `remember` / `forget` commands from `memory.command`.
 //!
-//! The bus door for Metis to *write* the brain (design §7). `remember stm`
+//! The bus door for an agent to *write* memory. `remember stm`
 //! stores a distilled fact into working memory; `remember ltm` mints a synthetic
 //! `note_<uuidv7>` `dataId` and places a durable note as a leaf on the knowledge
-//! tree (provenance `metis`); `forget` tombstones a `dataId` across both stores.
+//! tree (provenance `agent`); `forget` tombstones a `dataId` across both stores.
 //!
 //! Every write is idempotent on its `commandId` (Kafka is at-least-once): a
 //! duplicate delivery is recorded once and skipped thereafter. The id is marked
@@ -22,12 +22,13 @@ use anyhow::{Result, bail};
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Default tenant for agent writes (matches the feeder + query door).
-const DEFAULT_TENANT: &str = "jarvis";
+/// Tenant for agent writes: the process's single workspace (a legacy `tenant`
+/// field on the command is ignored).
+const AGENT_TENANT: &str = crate::domain::models::WORKSPACE_TENANT;
 /// Default cognitive-context layer for agent-remembered facts (design §7).
 const DEFAULT_CCL: &str = "reality";
-/// Provenance source stamped on Metis-authored LTM notes.
-const NOTE_SOURCE: &str = "metis";
+/// Provenance source stamped on agent-authored LTM notes.
+const NOTE_SOURCE: &str = "agent";
 /// Max characters of note text used as the LTM leaf's display name.
 const NAME_MAX: usize = 60;
 
@@ -54,6 +55,8 @@ pub struct WriteService {
     llm: Arc<dyn LlmClient>,
     /// STM embedding dimension, for zero-vector graph-anchor (subject) nodes.
     stm_vector_dim: usize,
+    /// Resolved placement threshold for LTM notes (see `domain::thresholds`).
+    placement_max_distance: f64,
 }
 
 impl WriteService {
@@ -63,6 +66,7 @@ impl WriteService {
         ingestion: Arc<IngestionService>,
         llm: Arc<dyn LlmClient>,
         stm_vector_dim: usize,
+        thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
             stm,
@@ -70,6 +74,7 @@ impl WriteService {
             ingestion,
             llm,
             stm_vector_dim,
+            placement_max_distance: thresholds.placement_max_distance.value,
         }
     }
 
@@ -108,7 +113,7 @@ impl WriteService {
         let Some(fact) = cmd.fact.as_deref() else {
             bail!("remember stm requires a 'fact'");
         };
-        let tenant = cmd.tenant.as_deref().unwrap_or(DEFAULT_TENANT);
+        let tenant = AGENT_TENANT;
         let ccl = cmd.ccl.as_deref().unwrap_or(DEFAULT_CCL);
         let tenant_id = TenantId(tenant.to_string());
 
@@ -206,7 +211,7 @@ impl WriteService {
         let data_id = format!("note_{}", Uuid::now_v7());
         let embedding = self.llm.embed_text(text).await?;
 
-        let placement = LtmPlacement::new(self.ltm.clone());
+        let placement = LtmPlacement::new(self.ltm.clone(), self.placement_max_distance);
         let doc = DocumentToPlace {
             name: leaf_name(text),
             summary: text.to_string(),
@@ -246,9 +251,9 @@ fn leaf_name(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::ingestion::{DocumentCompleted, PageRef};
+    use crate::application::ingestion::tests::text_event;
     use crate::domain::models::CclDefinition;
-    use crate::domain::ports::{ArtifactStore, ExtractedFact, FetchOutcome};
+    use crate::domain::ports::ExtractedFact;
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::repository::SqliteMemoryRepository;
@@ -278,14 +283,6 @@ mod tests {
         }
     }
 
-    struct StubArtifacts;
-    #[async_trait]
-    impl ArtifactStore for StubArtifacts {
-        async fn fetch_text(&self, uri: &str) -> Result<FetchOutcome> {
-            Ok(FetchOutcome::Found(format!("text of {uri}")))
-        }
-    }
-
     struct Harness {
         write: WriteService,
         ingest: Arc<IngestionService>,
@@ -308,9 +305,9 @@ mod tests {
             stm.clone() as Arc<dyn MemoryRepository>,
             ltm.clone() as Arc<dyn LtmRepository>,
             Arc::new(StubLlm),
-            Arc::new(StubArtifacts),
             DIM,
-            "jarvis",
+            AGENT_TENANT,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         ));
         let write = WriteService::new(
             stm.clone() as Arc<dyn MemoryRepository>,
@@ -318,13 +315,14 @@ mod tests {
             ingest.clone(),
             Arc::new(StubLlm),
             DIM,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         Harness {
             write,
             ingest,
             stm,
             ltm,
-            tenant: TenantId("jarvis".into()),
+            tenant: TenantId(AGENT_TENANT.into()),
         }
     }
 
@@ -337,7 +335,6 @@ mod tests {
             ccl: None,
             context_key: None,
             tags: vec![],
-            tenant: None,
             subjects: vec![],
         })
     }
@@ -356,7 +353,6 @@ mod tests {
             ccl: Some("working".into()),
             context_key: Some(context_key.into()),
             tags: vec![],
-            tenant: None,
             subjects: subjects
                 .iter()
                 .map(
@@ -496,11 +492,10 @@ mod tests {
             command_id: "cmd_1".into(),
             scope: WriteScope::Ltm,
             fact: None,
-            text: Some("Project JARVIS uses claim-check on Kafka".into()),
+            text: Some("Project Atlas uses claim-check on Kafka".into()),
             ccl: None,
             context_key: None,
-            tags: vec!["jarvis".into()],
-            tenant: None,
+            tags: vec!["atlas".into()],
             subjects: vec![],
         });
         let outcome = h.write.handle(&cmd).await.unwrap();
@@ -508,7 +503,7 @@ mod tests {
             panic!("expected RememberedLtm, got {outcome:?}");
         };
         assert!(data_id.starts_with("note_"), "synthetic dataId: {data_id}");
-        // The leaf is discoverable by its dataId with metis provenance.
+        // The leaf is discoverable by its dataId with agent provenance.
         let leaf = h.ltm.get_node_by_data_id(&data_id).unwrap();
         assert!(leaf.is_some(), "note placed as an LTM leaf");
     }
@@ -524,7 +519,6 @@ mod tests {
             ccl: Some("working".into()),
             context_key: Some("chat.jid:1".into()),
             tags: vec![],
-            tenant: None,
             subjects: vec![],
         });
         let outcome = h.write.handle(&cmd).await.unwrap();
@@ -552,7 +546,6 @@ mod tests {
             ccl: None,
             context_key: None,
             tags: vec![],
-            tenant: None,
             subjects: vec![],
         });
         assert!(h.write.handle(&bad).await.is_err());
@@ -562,19 +555,7 @@ mod tests {
     async fn forget_tombstones_across_both_stores() {
         let h = harness();
         // Ingest a document, then forget it by dataId.
-        h.ingest
-            .ingest(&DocumentCompleted {
-                group_id: Some("grp_1".into()),
-                data_id: None,
-                pages: vec![PageRef {
-                    page_index: Some(0),
-                    status: Some("ok".into()),
-                    text_uri: Some("pt://archive/p0/text".into()),
-                    tags: vec![],
-                }],
-            })
-            .await
-            .unwrap();
+        h.ingest.ingest(&text_event("grp_1")).await.unwrap();
         assert!(h.ltm.get_node_by_data_id("grp_1").unwrap().is_some());
 
         let outcome = h

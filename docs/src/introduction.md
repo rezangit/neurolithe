@@ -13,7 +13,7 @@ NeuroLithe is an embedded memory service designed specifically for AI agents. It
 - **Adaptive Forgetting** — Memories decay over time via an exponential function, mimicking human memory
 - **Context Compression** — Keeps agent context windows lean by summarizing old dialogue
 - **Conflict Resolution** — Tri-modal cognitive adaptation: assimilate, accommodate-modify, or accommodate-create
-- **Multi-Tenant** — Strict data isolation via `tenant_id` on every query
+- **Workspaces** — Separate, independent memories per workspace, selected per process
 - **Zero Infrastructure** — Everything runs in a single embedded SQLite database
 - **Model Context Protocol** — Exposes tools via MCP JSON-RPC 2.0 over STDIO
 

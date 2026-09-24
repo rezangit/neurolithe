@@ -1,12 +1,15 @@
-//! Reset — the disposable-brain operations.
+//! Reset — the disposable-brain operations (Kafka mode).
 //!
 //! Soft reset wipes STM only (junky working memory → clean slate). Hard reset
-//! wipes BOTH stores and re-seeds the curated spine; the caller then rewinds
-//! the feeder so `document.completed` replays and LTM (+ STM) is re-derived.
-//! Nothing is lost — every leaf is a `dataId` pointer back to Ledger/Pithos.
-//! Both are destructive; hard reset is guarded by a confirmation token.
+//! wipes BOTH stores and re-seeds the spine; the caller then rewinds the
+//! feeder so the documents topic replays and LTM (+ STM) is re-derived from the
+//! events. Both are destructive.
+//!
+//! Hard reset is **disabled** unless `NEUROLITHE_RESET_TOKEN` holds a token of
+//! at least [`MIN_RESET_TOKEN_LEN`] characters; the command's `confirm` value
+//! is compared against it in constant time (SEC-01).
 
-use crate::domain::ltm::LtmRepository;
+use crate::domain::ltm::{LtmRepository, SpineSeed, default_spine};
 use crate::domain::ports::MemoryRepository;
 use anyhow::{Result, bail};
 use serde::Deserialize;
@@ -16,8 +19,8 @@ use std::sync::Arc;
 /// `{"command":"reset_soft"}`, `{"command":"reset_hard","confirm":"<token>"}`,
 /// `{"command":"remember","scope":"stm",…}`, `{"command":"forget","dataId":…}`.
 ///
-/// The two reset variants are the historical shape — Pharos already publishes
-/// them — and MUST keep parsing unchanged as `remember`/`forget` are added.
+/// The two reset variants are the original wire shape and MUST keep parsing
+/// unchanged as `remember`/`forget` are added.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum MemoryCommand {
@@ -35,8 +38,9 @@ pub enum WriteScope {
     Ltm,
 }
 
-/// A `remember` write. `scope=stm` uses `fact` (+ optional `ccl`/`tenant`);
-/// `scope=ltm` uses `text` (+ optional `tags`). Fields are optional at the parse
+/// A `remember` write. `scope=stm` uses `fact` (+ optional `ccl`);
+/// `scope=ltm` uses `text` (+ optional `tags`). A legacy `tenant` field is
+/// accepted and ignored: one workspace per process. Fields are optional at the parse
 /// layer and validated per-scope when applied, so one envelope covers both.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,8 +53,8 @@ pub struct RememberCommand {
     /// LTM note text (`scope=ltm`).
     #[serde(default)]
     pub text: Option<String>,
-    /// Cognitive-context layer for an STM fact (defaults to `reality`; Metis
-    /// passes `working` for situational notes).
+    /// Cognitive-context layer for an STM fact (defaults to `reality`; agents
+    /// pass `working` for situational notes).
     #[serde(default)]
     pub ccl: Option<String>,
     /// Working-memory thread key stamped on an STM note (STM-WORKING-MEMORY
@@ -60,9 +64,6 @@ pub struct RememberCommand {
     /// Tags for an LTM note (advisory; not vocabulary-enforced in v1).
     #[serde(default)]
     pub tags: Vec<String>,
-    /// Tenant override (defaults to `jarvis`).
-    #[serde(default)]
-    pub tenant: Option<String>,
     /// Documents/entities this working turn is *about* (STM-GRAPH). Each becomes
     /// a reused subject node with an `about` edge from the turn — the relation
     /// that connects a session's turns and marks the focus. Empty for ordinary
@@ -94,25 +95,77 @@ impl MemoryCommand {
     }
 }
 
+/// Environment variable holding the hard-reset confirmation token.
+pub const RESET_TOKEN_ENV: &str = "NEUROLITHE_RESET_TOKEN";
+
+/// Shortest accepted hard-reset token. Anything shorter (or unset/blank)
+/// leaves hard reset disabled — there is no built-in default token.
+pub const MIN_RESET_TOKEN_LEN: usize = 16;
+
+/// Compare two byte strings in time that depends only on their lengths, never
+/// on where they first differ (no early exit), so a remote caller can't recover
+/// the token byte by byte from response timing.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
+/// The usable hard-reset token from a raw value: trimmed, and only if it is at
+/// least [`MIN_RESET_TOKEN_LEN`] characters. `None` = hard reset disabled.
+pub fn usable_reset_token(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|t| t.chars().count() >= MIN_RESET_TOKEN_LEN)
+        .map(str::to_string)
+}
+
 /// Performs soft/hard resets across the two stores. Store wipes only — the
-/// feeder offset rewind for hard reset is the consumer's job (slice 11).
+/// feeder offset rewind for hard reset is the consumer's job.
 pub struct ResetService {
     stm: Arc<dyn MemoryRepository>,
     ltm: Arc<dyn LtmRepository>,
-    confirm_token: String,
+    /// `None` = hard reset disabled (no/short token configured).
+    confirm_token: Option<String>,
+    /// The spine re-seeded after a hard reset (`[ltm.spine]` or the default).
+    spine: Vec<SpineSeed>,
 }
 
 impl ResetService {
+    /// `confirm_token` is validated with [`usable_reset_token`]: unset, blank or
+    /// shorter than [`MIN_RESET_TOKEN_LEN`] disables hard reset.
     pub fn new(
         stm: Arc<dyn MemoryRepository>,
         ltm: Arc<dyn LtmRepository>,
-        confirm_token: impl Into<String>,
+        confirm_token: Option<&str>,
     ) -> Self {
         Self {
             stm,
             ltm,
-            confirm_token: confirm_token.into(),
+            confirm_token: usable_reset_token(confirm_token),
+            spine: default_spine(),
         }
+    }
+
+    /// Re-seed this spine after a hard reset instead of the default
+    /// (`config.ltm.spine_or_default()`).
+    pub fn with_spine(mut self, spine: Vec<SpineSeed>) -> Self {
+        self.spine = spine;
+        self
+    }
+
+    /// Build from the process environment ([`RESET_TOKEN_ENV`]).
+    pub fn from_env(stm: Arc<dyn MemoryRepository>, ltm: Arc<dyn LtmRepository>) -> Self {
+        let raw = std::env::var(RESET_TOKEN_ENV).ok();
+        Self::new(stm, ltm, raw.as_deref())
+    }
+
+    /// Whether a hard reset can ever succeed (a usable token is configured).
+    pub fn hard_reset_enabled(&self) -> bool {
+        self.confirm_token.is_some()
     }
 
     /// Wipe STM only; LTM untouched.
@@ -120,16 +173,23 @@ impl ResetService {
         self.stm.reset_store()
     }
 
-    /// Wipe BOTH stores and re-seed the curated spine. Requires the confirmation
-    /// token. The caller rewinds the feeder afterward to relearn from the bus.
+    /// Wipe BOTH stores and re-seed the spine. Requires hard reset to be enabled
+    /// and `confirm` to equal the configured token (constant-time compare). The
+    /// caller rewinds the feeder afterward to relearn from the bus.
     pub fn hard_reset(&self, confirm: &str) -> Result<()> {
-        if confirm != self.confirm_token {
+        let Some(token) = &self.confirm_token else {
+            bail!(
+                "hard reset refused: disabled (set {RESET_TOKEN_ENV} to a token of at least \
+                 {MIN_RESET_TOKEN_LEN} characters to enable it)"
+            );
+        };
+        if !constant_time_eq(confirm.as_bytes(), token.as_bytes()) {
             bail!("hard reset refused: confirmation token mismatch");
         }
         self.stm.reset_store()?;
         self.ltm.reset_store()?;
-        // Restore the curated backbone; the feeder regrows the leaves.
-        self.ltm.seed_spine()?;
+        // Restore the backbone; the feeder regrows the leaves.
+        self.ltm.seed_spine_from(&self.spine)?;
         Ok(())
     }
 
@@ -164,9 +224,10 @@ pub enum ResetKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::ingestion::{DocumentCompleted, IngestionService, PageRef};
+    use crate::application::ingestion::tests::text_event;
+    use crate::application::ingestion::{DocumentEvent, IngestionService};
     use crate::domain::models::{CclDefinition, TenantId};
-    use crate::domain::ports::{ArtifactStore, ExtractedFact, FetchOutcome, LlmClient};
+    use crate::domain::ports::{ExtractedFact, LlmClient};
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::repository::SqliteMemoryRepository;
@@ -174,7 +235,8 @@ mod tests {
     use async_trait::async_trait;
 
     const DIM: usize = 8;
-    const TOKEN: &str = "CONFIRM-WIPE";
+    const TOKEN: &str = "CONFIRM-WIPE-0123456789";
+    const TENANT: &str = "default";
 
     struct StubLlm;
     #[async_trait]
@@ -197,25 +259,8 @@ mod tests {
         }
     }
 
-    struct StubArtifacts;
-    #[async_trait]
-    impl ArtifactStore for StubArtifacts {
-        async fn fetch_text(&self, uri: &str) -> Result<FetchOutcome> {
-            Ok(FetchOutcome::Found(format!("text of {uri}")))
-        }
-    }
-
-    fn event(id: &str) -> DocumentCompleted {
-        DocumentCompleted {
-            group_id: Some(id.into()),
-            data_id: None,
-            pages: vec![PageRef {
-                page_index: Some(0),
-                status: Some("ok".into()),
-                text_uri: Some("pt://archive/p0/text".into()),
-                tags: vec![],
-            }],
-        }
+    fn event(id: &str) -> DocumentEvent {
+        text_event(id)
     }
 
     struct Harness {
@@ -240,21 +285,21 @@ mod tests {
             stm.clone() as Arc<dyn MemoryRepository>,
             ltm.clone() as Arc<dyn LtmRepository>,
             Arc::new(StubLlm),
-            Arc::new(StubArtifacts),
             DIM,
-            "jarvis",
+            TENANT,
+            &crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         let reset = ResetService::new(
             stm.clone() as Arc<dyn MemoryRepository>,
             ltm.clone() as Arc<dyn LtmRepository>,
-            TOKEN,
+            Some(TOKEN),
         );
         Harness {
             reset,
             ingest,
             stm,
             ltm,
-            tenant: TenantId("jarvis".into()),
+            tenant: TenantId(TENANT.into()),
         }
     }
 
@@ -275,6 +320,13 @@ mod tests {
             }
         );
         assert!(MemoryCommand::parse(b"not json").is_err());
+
+        // A legacy `tenant` field still parses (and is ignored).
+        let legacy = MemoryCommand::parse(
+            br#"{"command":"remember","commandId":"c1","scope":"stm","fact":"f","tenant":"other"}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, MemoryCommand::Remember(r) if r.fact.as_deref() == Some("f")));
     }
 
     /// Soft reset empties STM only; the LTM leaf survives.
@@ -365,5 +417,85 @@ mod tests {
         // Nothing was wiped.
         assert!(stm_has(&h, "grp_1"));
         assert!(h.ltm.get_node_by_data_id("grp_1").unwrap().is_some());
+    }
+
+    /// SEC-01: with no token, a blank one, or one shorter than the minimum,
+    /// hard reset is disabled — even a `confirm` equal to that value (or to
+    /// the old built-in `RESET-DISABLED` default) is refused and nothing is
+    /// wiped.
+    #[tokio::test]
+    async fn test_hard_reset_disabled_without_a_strong_token() {
+        let h = harness();
+        h.ingest.ingest(&event("grp_1")).await.unwrap();
+
+        for configured in [None, Some(""), Some("   "), Some("fifteen-chars!!")] {
+            let reset = ResetService::new(
+                h.stm.clone() as Arc<dyn MemoryRepository>,
+                h.ltm.clone() as Arc<dyn LtmRepository>,
+                configured,
+            );
+            assert!(!reset.hard_reset_enabled(), "{configured:?} must disable");
+            for confirm in ["", "RESET-DISABLED", configured.unwrap_or("")] {
+                let err = reset
+                    .hard_reset(confirm)
+                    .expect_err("hard reset must be refused while disabled");
+                assert!(err.to_string().contains("disabled"), "{err}");
+            }
+        }
+        assert!(stm_has(&h, "grp_1"), "nothing was wiped");
+        assert!(h.ltm.get_node_by_data_id("grp_1").unwrap().is_some());
+    }
+
+    /// A token of exactly the minimum length enables hard reset; surrounding
+    /// whitespace in the configured value is ignored.
+    #[test]
+    fn test_usable_reset_token_rules() {
+        assert_eq!(usable_reset_token(None), None);
+        assert_eq!(usable_reset_token(Some("x".repeat(15).as_str())), None);
+        let sixteen = "y".repeat(MIN_RESET_TOKEN_LEN);
+        assert_eq!(usable_reset_token(Some(&sixteen)), Some(sixteen.clone()));
+        assert_eq!(
+            usable_reset_token(Some(&format!("  {sixteen}\n"))),
+            Some(sixteen)
+        );
+    }
+
+    #[test]
+    fn test_constant_time_eq() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"same-token-value", b"same-token-value"));
+        assert!(!constant_time_eq(b"same-token-value", b"same-token-valuf"));
+        assert!(!constant_time_eq(b"prefix", b"prefix-longer"));
+        assert!(!constant_time_eq(b"prefix-longer", b"prefix"));
+        assert!(!constant_time_eq(b"a", b""));
+    }
+
+    /// A hard reset re-seeds the configured spine (`[ltm.spine]`), not the
+    /// built-in default.
+    #[test]
+    fn test_hard_reset_reseeds_configured_spine() {
+        let h = harness();
+        let reset = ResetService::new(
+            h.stm.clone() as Arc<dyn MemoryRepository>,
+            h.ltm.clone() as Arc<dyn LtmRepository>,
+            Some(TOKEN),
+        )
+        .with_spine(vec![SpineSeed::new("research", "Papers and notes")]);
+        reset.hard_reset(TOKEN).unwrap();
+
+        let root = h.ltm.get_roots().unwrap()[0].id.unwrap();
+        let names: Vec<String> = h
+            .ltm
+            .get_children(root)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        assert!(names.contains(&"research".to_string()), "{names:?}");
+        assert!(names.contains(&"inbox".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"notes".to_string()),
+            "default not used: {names:?}"
+        );
     }
 }

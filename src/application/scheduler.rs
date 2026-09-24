@@ -25,10 +25,17 @@ pub trait PeriodicTask {
     async fn run_once(&self);
 }
 
+/// Smallest interval [`run_periodic`] will schedule.
+pub const MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Run `task` every `interval`, forever. The first tick fires immediately, then
 /// every `interval` thereafter (Tokio's default `MissedTickBehavior::Burst`).
+///
+/// A zero `interval` would panic `tokio::time::interval`; config validation
+/// rejects it, and this floors it to [`MIN_INTERVAL`] as a last line of defence
+/// so a bad value can never take the daemon down (DEV-12).
 pub async fn run_periodic(task: Arc<dyn PeriodicTask>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
+    let mut ticker = tokio::time::interval(interval.max(MIN_INTERVAL));
     loop {
         ticker.tick().await;
         task.run_once().await;
@@ -55,10 +62,10 @@ const COMMAND_ID_RETENTION_DAYS: i64 = 14;
 impl PeriodicTask for SweepTask {
     async fn run_once(&self) {
         if let Err(e) = self.app.run_decay_sweep().await {
-            eprintln!("[neurolithe] decay sweep failed: {e}");
+            tracing::warn!("decay sweep failed: {e}");
         }
         if let Err(e) = self.app.sweep_processed_commands(COMMAND_ID_RETENTION_DAYS) {
-            eprintln!("[neurolithe] processed-command sweep failed: {e}");
+            tracing::warn!("processed-command sweep failed: {e}");
         }
     }
 }
@@ -104,6 +111,25 @@ mod tests {
             runs.load(Ordering::SeqCst) >= 3,
             "expected >=3 runs, got {}",
             runs.load(Ordering::SeqCst)
+        );
+    }
+
+    /// DEV-12: a zero interval must not panic the scheduler (it used to panic
+    /// inside `tokio::time::interval`); it is floored to `MIN_INTERVAL`.
+    #[tokio::test(start_paused = true)]
+    async fn test_zero_interval_does_not_panic() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let task = Arc::new(CountingTask { runs: runs.clone() });
+
+        tokio::select! {
+            _ = run_periodic(task, Duration::ZERO) => {},
+            _ = tokio::time::sleep(MIN_INTERVAL * 2) => {},
+        }
+
+        let n = runs.load(Ordering::SeqCst);
+        assert!(
+            (1..=3).contains(&n),
+            "expected a floored cadence, got {n} runs"
         );
     }
 }

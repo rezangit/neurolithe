@@ -102,7 +102,7 @@ impl QueryService {
                 })
             }
             QueryScope::Ltm => {
-                let ltm = self.ltm_recall(&req.query).await?;
+                let ltm = self.ltm_recall(&req.query, req.k).await?;
                 Ok(QueryOutcome {
                     ltm,
                     ..Default::default()
@@ -110,7 +110,7 @@ impl QueryService {
             }
             QueryScope::Both => {
                 let stm = self.stm_search(req).await?;
-                let ltm = self.ltm_recall(&req.query).await?;
+                let ltm = self.ltm_recall(&req.query, req.k).await?;
                 Ok(QueryOutcome {
                     stm,
                     ltm,
@@ -173,10 +173,11 @@ impl QueryService {
         Ok(results)
     }
 
-    /// Embed `text` and recall the nearest LTM concept (0 or 1 result).
-    async fn ltm_recall(&self, text: &str) -> Result<Vec<RecallResult>> {
+    /// Embed `text` and recall the `k` nearest LTM nodes within the recall
+    /// distance cap (possibly none).
+    async fn ltm_recall(&self, text: &str, k: usize) -> Result<Vec<RecallResult>> {
         let embedding = self.embedder.embed_text(text).await?;
-        Ok(self.ltm.recall(&embedding)?.into_iter().collect())
+        self.ltm.recall(&embedding, k)
     }
 
     /// The compound path: STM recall → seed(query ⊕ top-k fact texts) → one
@@ -199,7 +200,7 @@ impl QueryService {
         };
 
         let embedding = self.embedder.embed_text(&seed).await?;
-        let ltm = self.ltm.recall(&embedding)?.into_iter().collect();
+        let ltm = self.ltm.recall(&embedding, req.k)?;
 
         Ok(QueryOutcome {
             stm,

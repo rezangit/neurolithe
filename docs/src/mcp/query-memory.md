@@ -1,49 +1,42 @@
 # Tool: query_memory
 
-Search the long-term knowledge graph for relevant historical context. Returns token-optimized results with 1-hop connections and temporal bounds.
+Search **short-term** working memory for relevant context. Hybrid search
+(vector + FTS5 keyword) plus 1-hop graph expansion, with optional temporal and
+layer filters. For the permanent document archive, use
+[`recall_ltm`](./recall-ltm.md).
 
-## Input Schema
+## Input
 
-```json
-{
-  "query": "string (required)",
-  "time_filter": {
-    "after": "YYYY-MM-DD (optional)",
-    "before": "YYYY-MM-DD (optional)"
-  },
-  "ccl_filter": ["string"] (optional, default: ['reality']),
-  "tenant_id": "string (optional, default: 'default')"
-}
-```
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `query` | string | yes | Non-blank (≤ 4 KiB) |
+| `k` | integer | no | Max results, 1–100, default 10 |
+| `time_filter` | object | no | `{ "after"?: "YYYY-MM-DD", "before"?: "YYYY-MM-DD" }` |
+| `ccl_filter` | string[] | no | Layers to search, default `["reality"]` |
 
 ## Output
 
-Returns an array of `MemoryResult` objects (token-optimized — no internal IDs or scores):
+A JSON array, best match first:
 
 ```json
 [
   {
-    "fact": "Alice works at Google",
+    "fact": "User lives in Berlin",
     "ccl": "reality",
-    "last_updated": "2026-02-20T10:30:00",
+    "last_updated": "2026-02-23T14:00:00",
     "connections": [
-      {
-        "relation": "WORKS_AT",
-        "entity": "Google",
-        "ccl": "reality",
-        "valid_from": "2021-01-01",
-        "valid_until": null
-      }
-    ]
+      { "relation": "LIVES_IN", "entity": "Berlin", "ccl": "reality",
+        "valid_from": "2026-01-15", "valid_until": null }
+    ],
+    "data_id": "only present for facts that came from a document"
   }
 ]
 ```
 
 ## Behavior
 
-1. Embeds the query into a vector
-2. Runs **hybrid search**: vector cosine distance + FTS5 BM25
-3. Expands results with **1-hop graph traversal** (respecting temporal bounds on edges)
-4. Applies **temporal filtering** on node creation date if `time_filter` is provided
-5. **Boosts relevance** of all accessed nodes back to 1.0 (reading resets decay)
-6. Returns token-optimized output (no `node_id`, `relevance_score`, or other internal fields)
+- Direct hits are ranked by combined vector and keyword score. Their 1-hop
+  neighbours follow.
+- Reading a fact reinforces it: its relevance resets and its decay clock
+  restarts.
+- Read-only hint: yes. The reinforcement is the only side effect.

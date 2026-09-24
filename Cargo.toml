@@ -1,6 +1,6 @@
 [package]
 name = "neurolithe"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "A plug-and-play, embedded hybrid Graph-Vector database built in Rust and SQLite that gives AI agents human-like memory."
 homepage = "https://neurolithe.com"
@@ -13,34 +13,56 @@ categories = ["database", "science"]
 [dependencies]
 anyhow = "1.0.102"
 async-trait = "0.1.89"
+# CLI parsing (`neurolithe [--home] [--config] [--workspace] <mcp|init|workspace …>`).
+clap = { version = "4", features = ["derive"] }
 config = "0.15.19"
 dotenvy = "0.15.7"
 # Vertex AI service-account auth for embeddings (mints short-lived access
-# tokens from GOOGLE_APPLICATION_CREDENTIALS). Same crate + version as Cadmus.
+# tokens from GOOGLE_APPLICATION_CREDENTIALS).
 gcp_auth = "0.12"
 libsqlite3-sys = "0.36.0"
 # Kafka feeder + command consumer + metrics producer — OPTIONAL. Enabled only by
-# the `kafka` feature (the JARVIS daemon build). Off by default so the standalone
+# the `kafka` feature (the Kafka daemon build). Off by default so the standalone
 # MCP server needs no C/librdkafka toolchain and installs/builds cleanly on every
 # platform. Builds a vendored librdkafka from source when enabled.
 rdkafka = { version = "0.39.0", optional = true }
+# Local, offline text embeddings (ONNX via `ort`) — OPTIONAL, behind the
+# `local-embeddings` feature (on by default). Default features are off so we
+# pull in neither OpenSSL (native-tls) nor the image models: rustls for the
+# one-time model download from Hugging Face, and ort's prebuilt ONNX Runtime,
+# which is fetched at *build* time and linked statically. Prebuilt runtimes
+# exist for linux x86_64/aarch64 (glibc), macOS aarch64 and Windows — NOT for
+# Intel macOS (x86_64-apple-darwin); build there with
+# `--no-default-features` (and a remote embedder) or see docs/configuration.
+fastembed = { version = "7.1.0", optional = true, default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+] }
 reqwest = { version = "0.13.2", features = ["json", "rustls"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-sqlite-vec = "0.1.6"
+sqlite-vec = "0.1.9"
 thiserror = "2.0.18"
 tokio = { version = "1.49.0", features = ["full"] }
+# Diagnostics: structured logging to STDERR only (stdout is the MCP transport).
+# Level from RUST_LOG, else config `[log] level`, else "info".
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "std", "ansi"] }
 # Mint synthetic dataIds for agent-authored LTM notes (note_<uuidv7>), matching
-# JARVIS's prefixed-UUIDv7 identity convention.
+# a prefixed-UUIDv7 id convention.
 uuid = { version = "1.11", features = ["v7"] }
 
 [features]
 # Standalone by default: just the embedded stores + the MCP server. No Kafka, no
 # rdkafka/librdkafka — `cargo install neurolithe` and run `neurolithe mcp`.
-default = []
-# The long-running JARVIS daemon: Kafka feeder + memory.command consumer +
-# memory.query door + memory.metrics publisher. Pulls in rdkafka.
+default = ["local-embeddings"]
+# Offline embeddings with fastembed-rs (ONNX Runtime). Makes
+# `llm.embedding_provider = "local"` available — the default — so NeuroLithe
+# needs no API key. Build without it: `--no-default-features`.
+local-embeddings = ["dep:fastembed"]
+# The optional long-running Kafka daemon: document feeder + command/query
+# consumers + metrics publisher. Pulls in rdkafka.
 # Build with: cargo build --release --features kafka
 kafka = ["dep:rdkafka"]
 

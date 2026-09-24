@@ -1,14 +1,14 @@
 //! Bus memory query API — wire envelopes for `memory.query` / `memory.result`.
 //!
-//! This is the delivery-layer contract for Metis ↔ NeuroLithe reads over Kafka
-//! (see `design-docs/BUS-MEMORY-API-DESIGN.md` §§4–6). It defines:
+//! This is the delivery-layer contract for agents reading NeuroLithe over Kafka.
+//! It defines:
 //!
 //! - [`MemoryQuery`] — the inbound request envelope (lenient camelCase deserialize).
 //! - [`MemoryReply`] — the outbound labelled result (STM token-optimized, LTM
 //!   reference-returning).
 //! - [`parse_query`] — a three-way routing parser: a good request, a *rejectable*
 //!   request (has a `correlationId` we can reply an error to), or an *unroutable*
-//!   one (no `correlationId` → `parking.lot`, per design §9 / ADR-0004 E3b).
+//!   one (no `correlationId` → the parking topic).
 //!
 //! The mapping helpers turn the existing application types ([`MemoryResult`],
 //! [`RecallResult`]) into wire entries without leaking STM internal ids.
@@ -19,29 +19,20 @@ use crate::domain::ltm::Provenance;
 use crate::domain::models::{MemoryResult, TimeFilter};
 use serde::{Deserialize, Serialize};
 
-/// The feeder ingests under tenant `jarvis`; the bus door must default here or
-/// Metis reads an empty store (design §11 / plan finding 5). Re-exported from the
-/// one source of truth so this door and the MCP door can never drift again.
-pub use crate::domain::models::DEFAULT_TENANT;
 /// Default recall breadth when the request omits `k`.
 pub const DEFAULT_K: usize = 5;
-
-fn default_tenant() -> String {
-    DEFAULT_TENANT.to_string()
-}
 
 fn default_k() -> usize {
     DEFAULT_K
 }
 
 /// Inbound `memory.query` envelope. Lenient: unknown fields are ignored and
-/// omitted optionals fall back to the documented defaults.
+/// omitted optionals fall back to the documented defaults. A legacy `tenant`
+/// field is accepted and ignored — one process serves one workspace.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryQuery {
     pub correlation_id: String,
-    #[serde(default = "default_tenant")]
-    pub tenant: String,
     pub scope: QueryScope,
     /// Query text. Optional for `stm_map` (recency needs no text); defaults to
     /// empty. Required in practice for the semantic scopes — the service treats
@@ -54,7 +45,7 @@ pub struct MemoryQuery {
     pub time_filter: Option<TimeFilter>,
     #[serde(default)]
     pub ccl: Vec<String>,
-    /// Working-memory thread key for `stm_map` (STM-WORKING-MEMORY §5a).
+    /// Working-memory thread key for `stm_map`.
     #[serde(default)]
     pub context_key: Option<String>,
 }
@@ -76,7 +67,7 @@ pub enum ParseOutcome {
     Unroutable { reason: String },
 }
 
-/// Parse raw request bytes into a routing outcome (design §9).
+/// Parse raw request bytes into a routing outcome.
 ///
 /// Two-stage on purpose: first fish out `correlationId` from loose JSON so a
 /// malformed-but-addressable request still yields an error *reply* rather than a
@@ -109,7 +100,7 @@ pub fn parse_query(bytes: &[u8]) -> ParseOutcome {
     }
 }
 
-/// Result status on `memory.result` (design §6).
+/// Result status on `memory.result`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplyStatus {
@@ -126,7 +117,7 @@ pub struct StmConnection {
     pub entity: String,
 }
 
-/// An STM fact on the wire — token-optimized, no internal ids (design §6).
+/// An STM fact on the wire — token-optimized, no internal ids.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StmEntry {
@@ -135,7 +126,7 @@ pub struct StmEntry {
     pub last_updated: String,
     pub connections: Vec<StmConnection>,
     /// Archive reference (`dataId`) this fact came from, when present — so a bus
-    /// consumer (Metis) can trace/fetch the source document straight from a
+    /// consumer can trace/fetch the source document straight from a
     /// search hit. Omitted on the wire when absent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_id: Option<String>,
@@ -166,7 +157,7 @@ impl StmEntry {
     }
 }
 
-/// An LTM concept+document on the wire — reference-returning (design §6): the
+/// An LTM concept+document on the wire — reference-returning: the
 /// located concept, the document `dataId` + `provenance` beneath it, distance,
 /// and the ancestor concept names for context.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -212,7 +203,7 @@ pub fn flatten_recall(r: &RecallResult) -> Vec<LtmEntry> {
         .collect()
 }
 
-/// Outbound `memory.result` envelope (design §6).
+/// Outbound `memory.result` envelope.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemoryReply {
@@ -248,7 +239,7 @@ impl MemoryReply {
         }
     }
 
-    /// An error reply — always emitted rather than hanging (design §9).
+    /// An error reply — always emitted rather than hanging.
     pub fn error(correlation_id: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             correlation_id: correlation_id.into(),
@@ -301,10 +292,17 @@ mod tests {
         let ParseOutcome::Query(q) = parse_query(bytes) else {
             panic!("expected Query");
         };
-        assert_eq!(q.tenant, "jarvis");
         assert_eq!(q.k, 5);
         assert!(q.time_filter.is_none());
         assert!(q.ccl.is_empty());
+    }
+
+    /// A legacy `tenant` field still parses (it is ignored: one workspace per
+    /// process).
+    #[test]
+    fn legacy_tenant_field_is_accepted_and_ignored() {
+        let bytes = br#"{"correlationId":"c1","tenant":"someone-else","scope":"stm","query":"hi"}"#;
+        assert!(matches!(parse_query(bytes), ParseOutcome::Query(_)));
     }
 
     #[test]

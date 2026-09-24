@@ -6,6 +6,7 @@ use crate::application::ltm_retrieval::{LeafRef, LtmRetrieval, MapNode, NodeView
 use crate::application::monitoring::{MemoryMetrics, MonitoringService, RuntimeStats};
 use crate::domain::ltm::LtmRepository;
 use crate::domain::ports::{MemoryRepository, StmNodeSummary};
+use crate::domain::thresholds::Thresholds;
 use anyhow::Result;
 use serde::Serialize;
 use std::sync::Arc;
@@ -90,15 +91,31 @@ pub struct IntrospectionService {
     ltm: Arc<dyn LtmRepository>,
     monitoring: MonitoringService,
     retrieval: LtmRetrieval,
+    /// The effective distance thresholds, reported by `placement_debug`.
+    thresholds: Thresholds,
+}
+
+/// `placement_debug` output: the thresholds in effect (with their source:
+/// config / model default / fallback) and nearest-concept distances for a
+/// sample of document leaves — compare the two to tune placement.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlacementDebug {
+    pub thresholds: Thresholds,
+    pub probes: Vec<crate::domain::ltm::PlacementProbe>,
 }
 
 impl IntrospectionService {
-    pub fn new(stm: Arc<dyn MemoryRepository>, ltm: Arc<dyn LtmRepository>) -> Self {
+    pub fn new(
+        stm: Arc<dyn MemoryRepository>,
+        ltm: Arc<dyn LtmRepository>,
+        thresholds: Thresholds,
+    ) -> Self {
         Self {
             monitoring: MonitoringService::new(stm.clone(), ltm.clone()),
             retrieval: LtmRetrieval::new(ltm.clone()),
             stm,
             ltm,
+            thresholds,
         }
     }
 
@@ -204,11 +221,11 @@ impl IntrospectionService {
     /// Placement calibration: nearest-concept distance for a sample of document
     /// leaves (read-only, no LLM). Used to tune the placement threshold to real
     /// embedding distances rather than a guessed value.
-    pub fn placement_debug(
-        &self,
-        sample: usize,
-    ) -> Result<Vec<crate::domain::ltm::PlacementProbe>> {
-        self.ltm.placement_calibration(sample)
+    pub fn placement_debug(&self, sample: usize) -> Result<PlacementDebug> {
+        Ok(PlacementDebug {
+            thresholds: self.thresholds.clone(),
+            probes: self.ltm.placement_calibration(sample)?,
+        })
     }
 
     /// A compact health summary.
@@ -257,7 +274,7 @@ mod tests {
         stm.store_node(
             &MemoryNode {
                 id: None,
-                tenant_id: TenantId("jarvis".into()),
+                tenant_id: TenantId("legacy".into()),
                 source_episode_id: None,
                 payload: json!({"fact": "metro doc", "dataId": "doc_1"}),
                 status: "active".into(),
@@ -297,6 +314,7 @@ mod tests {
         let svc = IntrospectionService::new(
             stm as Arc<dyn MemoryRepository>,
             ltm as Arc<dyn LtmRepository>,
+            crate::domain::thresholds::Thresholds::text_embedding_004(),
         );
         Fixture { svc, inbox, leaf }
     }

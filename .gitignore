@@ -9,9 +9,15 @@ docs/book
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+# ...except committed test fixtures
+!/tests/fixtures/**/*.sqlite
 
-# Secrets / local env (Pithos token, LLM API key, reset token)
+# Secrets / local env (LLM API keys, Kafka SASL credentials, reset token)
 .env
 
 # Internal design/audit docs — kept local only, not for the public repo
 /design-docs
+/project-review
+
+# Local runtime config (may hold private endpoints). Template: neurolithe.example.toml
+/neurolithe.toml

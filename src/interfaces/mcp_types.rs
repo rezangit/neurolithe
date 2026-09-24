@@ -67,7 +67,11 @@ pub struct QueryMemoryParams {
     pub query: String,
 }
 
+/// A `tools/call` result. The MCP spec names the failure flag `isError`
+/// (camelCase); a snake_case `is_error` is ignored by clients, which then treat
+/// every tool failure as a success (DEV-1 / QA-4).
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpToolResult {
     pub content: Vec<McpContent>,
     pub is_error: bool,
@@ -93,5 +97,22 @@ impl McpToolResult {
             content: vec![McpContent::Text { text: text.into() }],
             is_error: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DEV-1 / QA-4: the failure flag must serialize as the spec's `isError`.
+    #[test]
+    fn test_tool_result_serializes_is_error_camel_case() {
+        let v = serde_json::to_value(McpToolResult::err("boom")).unwrap();
+        assert_eq!(v["isError"], serde_json::json!(true));
+        assert!(v.get("is_error").is_none(), "snake_case flag leaked: {v}");
+        assert_eq!(v["content"][0]["type"], "text");
+
+        let ok = serde_json::to_value(McpToolResult::ok("fine")).unwrap();
+        assert_eq!(ok["isError"], serde_json::json!(false));
     }
 }

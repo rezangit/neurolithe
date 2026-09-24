@@ -1,25 +1,33 @@
-//! Query consumer — the `memory.query` → `memory.result` request/reply loop.
+//! Query consumer — the queries → results request/reply loop
+//! (`[kafka.topics] queries` / `results`, defaults `memory.query` /
+//! `memory.result`).
 //!
 //! Mirrors the feeder/command loops (a `StreamConsumer` + `FutureProducer` on a
 //! single-threaded `LocalSet`). Each request is parsed ([`parse_query`]),
-//! dispatched to [`QueryService`], and answered on `memory.result` keyed by its
-//! `correlationId`. Routing follows design §9:
+//! dispatched to [`QueryService`], and answered on the results topic keyed by
+//! its `correlationId`. Routing:
 //!
 //! - a well-formed request → execute → **always** reply `ok`/`empty`/`error`
-//!   (an internal failure is an `error` reply, plus a copy to `dlq.memory` for
+//!   (an internal failure is an `error` reply, plus a copy to the DLQ topic for
 //!   the operator — never an auto-retry, never a hang);
 //! - an addressable-but-malformed request → `error` reply to its id;
-//! - un-addressable bytes (no `correlationId`) → `parking.lot`.
+//! - un-addressable bytes (no `correlationId`) → the parking topic.
 //!
-//! Like the other loops, the rdkafka plumbing has a deferred live-broker smoke
-//! test; the dispatch + reply logic is unit-tested via [`QueryConsumer::respond`].
+//! Every query reads the process's single workspace; a legacy `tenant` field is
+//! ignored. The rdkafka plumbing needs a live broker; the dispatch + reply logic
+//! is unit-tested via [`QueryConsumer::respond`].
 
 use crate::application::query_service::{QueryOutcome, QueryRequest, QueryService};
+use crate::domain::models::WORKSPACE_TENANT;
+use crate::infrastructure::config::KafkaConfig;
+use crate::infrastructure::kafka_client::{
+    StopSignal, base_config, commit_on_shutdown, consumer_config, flush_on_shutdown, query_group,
+    recv_or_stop,
+};
 use crate::interfaces::bus_query::{
     MemoryQuery, MemoryReply, ParseOutcome, ReplyStatus, StmEntry, flatten_recall, parse_query,
 };
 use anyhow::{Context, Result};
-use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -50,58 +58,58 @@ pub struct QueryConsumer {
 }
 
 impl QueryConsumer {
-    pub fn new(brokers: &str, group_id: &str, query_service: Arc<QueryService>) -> Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("group.id", group_id)
-            .set("enable.auto.commit", "false")
-            // Requests are live traffic, not a replay source: start at the end.
-            .set("auto.offset.reset", "latest")
+    pub fn new(kafka: &KafkaConfig, query_service: Arc<QueryService>) -> Result<Self> {
+        let group_id = query_group(kafka);
+        // Requests are live traffic, not a replay source: start at the end.
+        let consumer: StreamConsumer = consumer_config(kafka, &group_id, "latest")
             .create()
-            .context("creating memory.query consumer")?;
+            .context("creating queries consumer")?;
 
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
+        let producer: FutureProducer = base_config(kafka)
             .create()
-            .context("creating memory.result producer")?;
+            .context("creating results producer")?;
 
         Ok(Self {
             consumer,
             producer,
             query_service,
-            topic: "memory.query".into(),
-            result_topic: "memory.result".into(),
-            dlq_topic: "dlq.memory".into(),
-            parking_topic: "parking.lot".into(),
-            group_id: group_id.into(),
+            topic: kafka.topics.queries.clone(),
+            result_topic: kafka.topics.results.clone(),
+            dlq_topic: kafka.topics.dlq.clone(),
+            parking_topic: kafka.topics.parking.clone(),
+            group_id,
         })
     }
 
-    /// Consume forever: parse → dispatch → reply → commit.
-    pub async fn run(&self) -> Result<()> {
+    /// Consume until `stop` fires: parse → dispatch → reply → commit, then
+    /// commit offsets synchronously and flush the reply producer.
+    pub async fn run(&self, mut stop: StopSignal) -> Result<()> {
         self.consumer
             .subscribe(&[&self.topic])
-            .context("subscribing to memory.query")?;
+            .with_context(|| format!("subscribing to {}", self.topic))?;
 
-        loop {
-            match self.consumer.recv().await {
-                Err(e) => eprintln!("[neurolithe] query consumer error: {e}"),
+        while let Some(next) = recv_or_stop(&self.consumer, &mut stop).await {
+            match next {
+                Err(e) => tracing::warn!("query consumer error: {e}"),
                 Ok(msg) => {
                     self.process(&msg).await;
                     if let Err(e) = self.consumer.commit_message(&msg, CommitMode::Async) {
-                        eprintln!("[neurolithe] query commit failed: {e}");
+                        tracing::warn!("query commit failed: {e}");
                     }
                 }
             }
         }
+        commit_on_shutdown(&self.consumer, "query consumer");
+        flush_on_shutdown(&self.producer, "query consumer");
+        Ok(())
     }
 
     async fn process(&self, msg: &rdkafka::message::BorrowedMessage<'_>) {
         match parse_query(msg.payload().unwrap_or_default()) {
             ParseOutcome::Query(q) => {
                 let reply = self.respond(q.as_ref()).await;
-                // On an internal error, still reply — and copy to dlq.memory so an
-                // operator sees it (design §9). Never auto-retry.
+                // On an internal error, still reply — and copy to the DLQ topic so
+                // an operator sees it. Never auto-retry.
                 if reply.status == ReplyStatus::Error {
                     let reason = reply.error.clone().unwrap_or_else(|| "query error".into());
                     self.send_aside(msg, &self.dlq_topic, &reason).await;
@@ -124,11 +132,11 @@ impl QueryConsumer {
     }
 
     /// Execute a parsed query and build its reply. Always returns a reply — an
-    /// execution error becomes an `error` reply, never a hang (design §9).
+    /// execution error becomes an `error` reply, never a hang.
     async fn respond(&self, q: &MemoryQuery) -> MemoryReply {
         let req = QueryRequest {
             scope: q.scope,
-            tenant: q.tenant.clone(),
+            tenant: WORKSPACE_TENANT.to_string(),
             query: q.query.clone(),
             k: q.k,
             time_filter: q.time_filter.clone().unwrap_or_default(),
@@ -145,7 +153,7 @@ impl QueryConsumer {
         let payload = match serde_json::to_vec(reply) {
             Ok(bytes) => bytes,
             Err(e) => {
-                eprintln!("[neurolithe] failed to serialize memory.result: {e}");
+                tracing::warn!("failed to serialize query result: {e}");
                 return;
             }
         };
@@ -153,12 +161,12 @@ impl QueryConsumer {
             .key(&reply.correlation_id)
             .payload(&payload);
         if let Err((e, _)) = self.producer.send(record, Timeout::Never).await {
-            eprintln!("[neurolithe] failed to publish memory.result: {e}");
+            tracing::warn!("failed to publish query result: {e}");
         }
     }
 
     /// Forward the original message to a dead-letter / parking topic with the
-    /// ADR-0004 E3b context headers.
+    /// context headers (reason, consumer, source topic/partition/offset).
     async fn send_aside(
         &self,
         msg: &rdkafka::message::BorrowedMessage<'_>,
@@ -196,7 +204,7 @@ impl QueryConsumer {
             .payload(payload)
             .headers(headers);
         if let Err((e, _)) = self.producer.send(record, Timeout::Never).await {
-            eprintln!("[neurolithe] failed to forward to {topic}: {e}");
+            tracing::warn!("failed to forward to {topic}: {e}");
         }
     }
 }
@@ -204,6 +212,8 @@ impl QueryConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const WORKSPACE: &str = WORKSPACE_TENANT;
     use crate::application::ltm_retrieval::LtmRetrieval;
     use crate::application::query_service::QueryScope;
     use crate::application::retrieval::RetrievalService;
@@ -299,7 +309,11 @@ mod tests {
         // A broker-less QueryConsumer: the loop/producer are never driven in unit
         // tests (respond() is the tested seam); construction points at a bogus
         // broker but never connects.
-        let consumer = QueryConsumer::new("localhost:9092", "test-query", query_service).unwrap();
+        let consumer = QueryConsumer::new(
+            &crate::infrastructure::kafka_client::tests::test_kafka(&[]),
+            query_service,
+        )
+        .unwrap();
         Fixture { consumer, llm, stm }
     }
 
@@ -320,10 +334,9 @@ mod tests {
         stm.store_node(&node, &[0.1_f32; DIM]).unwrap();
     }
 
-    fn query(scope: QueryScope, tenant: &str, text: &str) -> MemoryQuery {
+    fn query(scope: QueryScope, text: &str) -> MemoryQuery {
         serde_json::from_value(serde_json::json!({
             "correlationId": "c1",
-            "tenant": tenant,
             "scope": scope,
             "query": text,
         }))
@@ -333,12 +346,9 @@ mod tests {
     #[tokio::test]
     async fn stm_scope_returns_facts_and_no_ltm() {
         let f = fixture(false);
-        seed_stm_fact(&f.stm, "jarvis", "User likes tea");
+        seed_stm_fact(&f.stm, WORKSPACE, "User likes tea");
 
-        let reply = f
-            .consumer
-            .respond(&query(QueryScope::Stm, "jarvis", "tea"))
-            .await;
+        let reply = f.consumer.respond(&query(QueryScope::Stm, "tea")).await;
 
         assert_eq!(reply.status, ReplyStatus::Ok);
         assert_eq!(reply.stm.len(), 1);
@@ -346,27 +356,24 @@ mod tests {
         assert!(reply.ltm.is_empty());
     }
 
+    /// One workspace per process: a legacy `tenant` field is ignored, so a
+    /// query naming any tenant reads the workspace's facts.
     #[tokio::test]
-    async fn tenant_defaults_to_jarvis_and_isolates_other_tenants() {
+    async fn legacy_tenant_field_is_ignored() {
         let f = fixture(false);
-        seed_stm_fact(&f.stm, "jarvis", "User likes tea");
+        seed_stm_fact(&f.stm, WORKSPACE, "User likes tea");
 
-        // Omitting tenant → parses to "jarvis" → finds the fact.
-        let defaulted: MemoryQuery = serde_json::from_value(serde_json::json!({
-            "correlationId": "c1", "scope": "stm", "query": "tea"
-        }))
-        .unwrap();
-        assert_eq!(defaulted.tenant, "jarvis");
-        let reply = f.consumer.respond(&defaulted).await;
-        assert_eq!(reply.stm.len(), 1);
-
-        // A different tenant sees an empty store.
-        let other = f
-            .consumer
-            .respond(&query(QueryScope::Stm, "someone-else", "tea"))
-            .await;
-        assert_eq!(other.status, ReplyStatus::Empty);
-        assert!(other.stm.is_empty());
+        for tenant in [None, Some("someone-else")] {
+            let mut raw = serde_json::json!({
+                "correlationId": "c1", "scope": "stm", "query": "tea"
+            });
+            if let Some(t) = tenant {
+                raw["tenant"] = serde_json::json!(t);
+            }
+            let q: MemoryQuery = serde_json::from_value(raw).unwrap();
+            let reply = f.consumer.respond(&q).await;
+            assert_eq!(reply.stm.len(), 1, "tenant {tenant:?}: {reply:?}");
+        }
     }
 
     /// Seed a working-memory note under a context key (bypassing the LLM).
@@ -399,8 +406,8 @@ mod tests {
     #[tokio::test]
     async fn stm_map_recency_backbone_does_zero_embeds() {
         let f = fixture(false);
-        seed_working_note(&f.stm, "jarvis", "found report = doc_42", "chat.1");
-        seed_working_note(&f.stm, "jarvis", "other-thread note", "chat.2");
+        seed_working_note(&f.stm, WORKSPACE, "found report = doc_42", "chat.1");
+        seed_working_note(&f.stm, WORKSPACE, "other-thread note", "chat.2");
 
         let reply = f.consumer.respond(&stm_map_query("chat.1")).await;
 
@@ -416,14 +423,14 @@ mod tests {
         let f = fixture(false);
         // This thread's note; ANOTHER thread's working note; and a reality fact
         // — all mention "inspection" so a vector/keyword pass WOULD match each.
-        seed_working_note(&f.stm, "jarvis", "inspection report = doc_42", "chat.1");
+        seed_working_note(&f.stm, WORKSPACE, "inspection report = doc_42", "chat.1");
         seed_working_note(
             &f.stm,
-            "jarvis",
+            WORKSPACE,
             "inspection follow-up from chat 2",
             "chat.2",
         );
-        seed_stm_fact(&f.stm, "jarvis", "inspection checklist tips"); // reality
+        seed_stm_fact(&f.stm, WORKSPACE, "inspection checklist tips"); // reality
 
         // Even WITH a query, the map is pure recency in-thread: the query is not
         // used for retrieval (no embedding, no cross-context, no reality).
@@ -453,8 +460,8 @@ mod tests {
     #[tokio::test]
     async fn stm_map_without_context_is_empty() {
         let f = fixture(false);
-        seed_working_note(&f.stm, "jarvis", "some working note", "chat.9");
-        seed_stm_fact(&f.stm, "jarvis", "inspection checklist tips");
+        seed_working_note(&f.stm, WORKSPACE, "some working note", "chat.9");
+        seed_stm_fact(&f.stm, WORKSPACE, "inspection checklist tips");
 
         // No contextKey → no thread to orient by → empty (never a global
         // similarity search).
@@ -474,12 +481,9 @@ mod tests {
     #[tokio::test]
     async fn ltm_scope_skips_stm_and_embeds_the_query() {
         let f = fixture(false);
-        seed_stm_fact(&f.stm, "jarvis", "User likes tea");
+        seed_stm_fact(&f.stm, WORKSPACE, "User likes tea");
 
-        let reply = f
-            .consumer
-            .respond(&query(QueryScope::Ltm, "jarvis", "tea"))
-            .await;
+        let reply = f.consumer.respond(&query(QueryScope::Ltm, "tea")).await;
 
         // LTM-only: STM section stays empty even though a fact exists…
         assert!(reply.stm.is_empty());
@@ -490,12 +494,9 @@ mod tests {
     #[tokio::test]
     async fn both_scope_runs_stm_and_ltm() {
         let f = fixture(false);
-        seed_stm_fact(&f.stm, "jarvis", "User likes tea");
+        seed_stm_fact(&f.stm, WORKSPACE, "User likes tea");
 
-        let reply = f
-            .consumer
-            .respond(&query(QueryScope::Both, "jarvis", "tea"))
-            .await;
+        let reply = f.consumer.respond(&query(QueryScope::Both, "tea")).await;
 
         assert_eq!(reply.stm.len(), 1);
         // One embed for STM search + one for LTM recall.
@@ -507,7 +508,7 @@ mod tests {
         let f = fixture(false);
         let reply = f
             .consumer
-            .respond(&query(QueryScope::Stm, "jarvis", "anything"))
+            .respond(&query(QueryScope::Stm, "anything"))
             .await;
         assert_eq!(reply.status, ReplyStatus::Empty);
         assert!(reply.stm.is_empty() && reply.ltm.is_empty());
@@ -516,10 +517,7 @@ mod tests {
     #[tokio::test]
     async fn execution_error_always_replies_with_error_status() {
         let f = fixture(true); // embedder fails
-        let reply = f
-            .consumer
-            .respond(&query(QueryScope::Ltm, "jarvis", "tea"))
-            .await;
+        let reply = f.consumer.respond(&query(QueryScope::Ltm, "tea")).await;
         assert_eq!(reply.status, ReplyStatus::Error);
         assert!(reply.error.is_some());
         assert_eq!(reply.correlation_id, "c1");
@@ -528,11 +526,11 @@ mod tests {
     #[tokio::test]
     async fn ltm_via_stm_seeds_ltm_with_stm_fact_texts() {
         let f = fixture(false);
-        seed_stm_fact(&f.stm, "jarvis", "User likes tea");
+        seed_stm_fact(&f.stm, WORKSPACE, "User likes tea");
 
         let reply = f
             .consumer
-            .respond(&query(QueryScope::LtmViaStm, "jarvis", "beverage"))
+            .respond(&query(QueryScope::LtmViaStm, "beverage"))
             .await;
 
         // The recalled STM fact is reported as the seed…
@@ -548,7 +546,7 @@ mod tests {
         let f = fixture(false);
         let reply = f
             .consumer
-            .respond(&query(QueryScope::LtmViaStm, "jarvis", "beverage"))
+            .respond(&query(QueryScope::LtmViaStm, "beverage"))
             .await;
         // No STM facts → no seed, but still a valid (empty) reply.
         assert!(reply.seeded_by.is_empty());

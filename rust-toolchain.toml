@@ -1,0 +1,6 @@
+[toolchain]
+# Pinned to the toolchain shipped in rust:1.94-slim-trixie (scripts/cargo.sh),
+# so native and Docker builds use the same compiler and lints.
+channel = "1.94.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
