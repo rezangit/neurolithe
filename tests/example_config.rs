@@ -54,14 +54,16 @@ fn example_config_has_no_private_or_deployment_specific_values() {
     ))
     .unwrap()
     .to_lowercase();
-    for needle in [
-        "jarvis",
-        "pithos",
-        "192.168.",
-        "cadmus",
-        "embedding_project",
-    ] {
+    for needle in ["jarvis", "pithos", "192.168.", "cadmus"] {
         assert!(!text.contains(needle), "example config mentions {needle:?}");
+    }
+    // The legacy Vertex example may show `embedding_project`, but only with the
+    // placeholder, never a real GCP project id.
+    for line in text.lines().filter(|l| l.contains("embedding_project")) {
+        assert!(
+            line.contains("\"your-gcp-project-id\""),
+            "example config sets a real embedding_project: {line:?}"
+        );
     }
     // Phase 2: store paths derive from the workspace; the example must not
     // carry per-store paths any more.

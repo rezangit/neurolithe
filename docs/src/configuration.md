@@ -130,6 +130,32 @@ same entity are not overwritten.
 > [`[[ltm.spine]]`](#the-long-term-memory-spine) branches, each with a
 > `description` that says what belongs there.
 
+### Staying on the legacy 768-dim embedder
+
+NeuroLithe ≤ 0.2 embedded with Google Vertex AI `text-embedding-004` (768-dim),
+and its thresholds were measured for that model. To keep using it, for example
+to open a pre-0.3 store without `neurolithe reembed`, configure it as the
+embedder. The legacy thresholds are then applied automatically:
+
+```toml
+[llm]
+embedding_provider = "vertex"          # service-account key at GOOGLE_APPLICATION_CREDENTIALS
+embedding_model = "text-embedding-004"
+embedding_project = "your-gcp-project-id"
+embedding_location = "us-central1"
+
+# Optional: pin the legacy calibration explicitly (these are already the
+# defaults for text-embedding-004).
+[ltm]
+placement_max_distance = 1.10
+[stm]
+assimilation_threshold = 0.15
+accommodation_threshold = 0.35
+```
+
+`placement_debug` shows `source: model_default` (or `config` if pinned) with
+these values, which confirms that the legacy calibration is in effect.
+
 Distances are sqlite-vec L2 distances (for unit-length embeddings,
 L2 = √(2 − 2·cosine)). All values must be finite and greater than 0. A key in
 the wrong section is rejected, so it can't be silently ignored.

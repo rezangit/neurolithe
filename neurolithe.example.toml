@@ -50,6 +50,15 @@ provider = "none"
 # embedding_model = "text-embedding-3-small"
 # embedding_base_url = "https://api.openai.com/v1"
 
+# --- Legacy embedding: Google Vertex AI text-embedding-004 (768-dim) ---
+# The embedder used by NeuroLithe <= 0.2. Keep it to open a pre-0.3 store
+# without `neurolithe reembed`. Auth: service-account key at
+# GOOGLE_APPLICATION_CREDENTIALS (env or <home>/.env).
+# embedding_provider = "vertex"
+# embedding_model = "text-embedding-004"
+# embedding_project = "your-gcp-project-id"
+# embedding_location = "us-central1"
+
 # [mcp]
 # Whether the MCP `workspace_switch` tool may change workspace mid-session.
 # allow_workspace_switch = true
@@ -72,6 +81,16 @@ provider = "none"
 # [stm]
 # assimilation_threshold = 0.40   # a new fact this close IS the existing fact
 # accommodation_threshold = 0.58  # this close: the new fact refines the existing one
+#
+# Legacy calibration for text-embedding-004 (768-dim, NeuroLithe <= 0.2),
+# measured on a real corpus. Applied automatically whenever that embedding
+# model is configured. To pin them explicitly, uncomment this block INSTEAD of
+# the one above (a TOML table may appear only once):
+# [ltm]
+# placement_max_distance = 1.10
+# [stm]
+# assimilation_threshold = 0.15
+# accommodation_threshold = 0.35
 
 # LTM spine: the curated top branches documents are filed under (plus an
 # implicit "inbox"). Default: "notes" and "documents". `path` is "/"-separated.
