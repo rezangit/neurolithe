@@ -1,92 +1,68 @@
 # Quickstart Guide
 
-Get NeuroLithe running in under 5 minutes.
+Get NeuroLithe running in a few minutes.
 
-## Installation
+## Install
 
-### One-Line Installer (Recommended)
-
-**macOS / Linux:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/rezangit/neurolithe/main/install.sh | bash
-```
-
-**Windows (PowerShell):**
-
-```powershell
-irm https://raw.githubusercontent.com/rezangit/neurolithe/main/install.ps1 | iex
-```
-
-This will automatically:
-
-- Download the correct binary for your OS and architecture
-- Create a default `neurolithe.toml` config
-- Prompt for your API key
-- Generate a ready-to-paste MCP config for Claude Desktop / Cursor
-- Add `neurolithe` to your PATH
-
-### From Source
+NeuroLithe is built from source with a native [Rust](https://rustup.rs/) toolchain:
 
 ```bash
 git clone https://github.com/rezangit/neurolithe.git
 cd neurolithe
-cargo build --release
+cargo install --path .
+neurolithe init
 ```
 
-The binary will be at `target/release/neurolithe`.
+`neurolithe init` creates the home directory (default `~/.neurolithe`, mode `0700`),
+writes a commented `neurolithe.toml`, and prints a ready-to-paste MCP client
+snippet that uses the absolute path of the installed binary.
 
-### From Crates.io (coming soon)
+The default build embeds text locally and offline (`bge-small-en-v1.5` via ONNX
+Runtime), so no API key is needed to start. The first build downloads a prebuilt
+ONNX Runtime, and the first run downloads the model (~130 MB) into
+`<home>/models`. Platform limits apply:
 
-```bash
-cargo install neurolithe
-```
+- **macOS Intel:** has no prebuilt runtime.
+- **Linux:** needs glibc ≥ 2.38 and GCC 14's libstdc++ (e.g. Debian 13,
+  Ubuntu 24.10+).
 
-## Configuration
+On other platforms, build with `--no-default-features` and configure a remote
+embedder. Kafka mode is a separate, opt-in build (`--features kafka`, see
+[Kafka mode](./kafka.md)).
 
-Create a `neurolithe.toml` file in your working directory:
+## Connect your AI agent
 
-```toml
-[llm]
-provider = "custom"
-model = "openai/gpt-4o-mini"
-embedding_model = "openai/text-embedding-3-small"
-base_url = "https://openrouter.ai/api/v1"
-
-[database]
-path = "neurolithe.sqlite"
-vector_dimension = 1536
-```
-
-Set your API key:
-
-```bash
-export NEUROLITHE_API_KEY="your-api-key-here"
-```
-
-## Connect to Your AI Agent
-
-NeuroLithe communicates over **STDIO** using the Model Context Protocol (MCP). Add it to your MCP client config:
-
-### Claude Desktop / Cursor
+NeuroLithe talks to clients over **STDIO** using the Model Context Protocol (MCP).
+Paste the snippet from `neurolithe init` into your client config (Claude Desktop,
+Cursor, Claude Code, …):
 
 ```json
 {
   "mcpServers": {
     "neurolithe": {
-      "command": "/path/to/neurolithe",
-      "args": []
+      "command": "/Users/you/.cargo/bin/neurolithe",
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-## Try It Out
+Add `"--workspace", "<name>"` to `args` to give a client its own, separate memory.
 
-Once connected, your AI agent can use these tools:
+## Optional: a chat model
+
+Fact extraction and summaries need a chat model. Set the provider in
+`~/.neurolithe/neurolithe.toml` (see [Configuration](./configuration.md)) and its
+API key in `~/.neurolithe/.env`:
+
+```bash
+OPENAI_API_KEY=sk-...
+```
+
+## Try it out
+
+Once connected, your agent can use tools such as:
 
 1. **Store a fact:** `store_memory({fact_text: "User prefers dark mode", tags: ["preference"]})`
 2. **Query memory:** `query_memory({query: "What does the user prefer?"})`
 3. **Push dialogue:** `push_dialogue({session_id: "chat-1", new_message: "I just moved to Berlin"})`
-
-The system will automatically extract facts, build a knowledge graph, and return relevant context when queried.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Local quality gate. There is no CI, so run this before every commit.
 #
-#   scripts/check.sh            # full gate: fmt, clippy + tests (default and kafka)
-#   scripts/check.sh --quick    # fmt + clippy + tests for the default feature set only
+#   scripts/check.sh            # full gate: scrub guard, fmt, clippy + tests (default and kafka)
+#   scripts/check.sh --quick    # scrub + fmt + clippy + tests for the default feature set only
 #
 # Every step runs through scripts/cargo.sh, which uses a native cargo if one is
 # installed and falls back to the pinned rust:1.94 Docker image otherwise.
@@ -17,7 +17,9 @@ export NL_TARGET="${NL_TARGET:-check}"
 QUICK=0
 [ "${1:-}" = "--quick" ] && QUICK=1
 
+# A step whose command starts with "@" runs that script directly (not cargo).
 STEPS=(
+  "scrub|@scripts/scrub-check.sh"
   "fmt|fmt --check"
   "clippy (default)|clippy --all-targets -- -D warnings"
   "test (default)|test --no-fail-fast"
@@ -32,7 +34,8 @@ fi
 if [ -t 1 ]; then GREEN=$'\e[32m'; RED=$'\e[31m'; BOLD=$'\e[1m'; RESET=$'\e[0m'
 else GREEN=""; RED=""; BOLD=""; RESET=""; fi
 
-LOG_DIR="$ROOT/target/check-logs"
+# Per-target log dir: concurrent gates (different NL_TARGET) never clobber each other.
+LOG_DIR="$ROOT/target/check-logs/$NL_TARGET"
 mkdir -p "$LOG_DIR"
 
 results=()
@@ -43,10 +46,15 @@ for step in "${STEPS[@]}"; do
   name="${step%%|*}"
   args="${step#*|}"
   log="$LOG_DIR/$(printf '%s' "$name" | tr -cs 'a-z0-9' '-' | sed 's/-$//').log"
-  echo "${BOLD}==> $name${RESET}  (cargo $args)"
   start=$SECONDS
-  # shellcheck disable=SC2086
-  "$CARGO" $args 2>&1 | tee "$log"
+  if [[ "$args" == @* ]]; then
+    echo "${BOLD}==> $name${RESET}  (${args#@})"
+    "$ROOT/${args#@}" 2>&1 | tee "$log"
+  else
+    echo "${BOLD}==> $name${RESET}  (cargo $args)"
+    # shellcheck disable=SC2086
+    "$CARGO" $args 2>&1 | tee "$log"
+  fi
   status=${PIPESTATUS[0]}
   dur=$((SECONDS - start))
   summary=""

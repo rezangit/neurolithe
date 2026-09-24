@@ -1,19 +1,26 @@
-//! Kafka feeder — consumes `document.completed` and drives ingestion.
+//! Kafka feeder — consumes the documents topic (`[kafka.topics] documents`,
+//! default `document.completed`) and drives ingestion.
 //!
-//! Backfills from the earliest offset (the topic is compacted, so this replays
-//! the latest state per document). Routing follows ADR-0004: a tombstone (null
-//! payload) forgets the document; a valid event is ingested; a structurally
-//! bad event goes to `dlq.memory`; un-parseable bytes go to `parking.lot`. The
-//! offset is committed only AFTER the write, so a crash re-processes rather than
-//! drops.
+//! Each event carries its own text:
+//! `{"data_id": "...", "title"?: "...", "text": "...", "tags"?: [...], "ts"?: "..."}`.
+//!
+//! Backfills from the earliest offset (if the topic is compacted, this replays
+//! the latest state per document). Routing: a tombstone (null payload) forgets
+//! the document named by the message key; a valid event is ingested; an event
+//! without text is skipped with a warning; an event without a `data_id` goes to
+//! the dead-letter topic; un-parseable bytes go to the parking topic. The offset
+//! is committed only AFTER the write, so a crash re-processes rather than drops.
 //!
 //! The decision logic ([`decide`]) is pure and unit-tested; the rdkafka loop
-//! itself is exercised by a live-broker smoke test (deferred, like Chronos).
+//! itself needs a live broker.
 
-use crate::application::ingestion::{DocumentCompleted, IngestionService};
+use crate::application::ingestion::{DocumentEvent, IngestionService};
 use crate::application::monitoring::FeederStats;
+use crate::infrastructure::config::KafkaConfig;
+use crate::infrastructure::kafka_client::{
+    StopSignal, base_config, commit_on_shutdown, consumer_config, flush_on_shutdown, recv_or_stop,
+};
 use anyhow::{Context, Result};
-use rdkafka::config::ClientConfig;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
 use rdkafka::message::{Header, Message, OwnedHeaders};
 use rdkafka::producer::{FutureProducer, FutureRecord};
@@ -27,10 +34,13 @@ pub enum FeedDecision {
     /// Tombstone (null payload): forget this document id (the message key).
     Forget(String),
     /// A valid event to ingest.
-    Ingest(DocumentCompleted),
-    /// Parsed but structurally invalid (no id) — route to `dlq.memory`.
+    Ingest(DocumentEvent),
+    /// A well-formed event with no text: nothing to learn. Logged and skipped
+    /// (not dead-lettered). Carries the document id.
+    Skip(String),
+    /// Parsed but structurally invalid (no `data_id`) — route to the DLQ topic.
     BadEvent(String),
-    /// Un-parseable bytes — route to `parking.lot`.
+    /// Un-parseable bytes — route to the parking topic.
     Park(String),
 }
 
@@ -42,7 +52,7 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Classify a message by its key + payload (ADR-0004 routing). Pure.
+/// Classify a message by its key + payload. Pure.
 pub fn decide(key: Option<&str>, payload: Option<&[u8]>) -> FeedDecision {
     match payload {
         // Null payload = compaction tombstone -> forget by key.
@@ -50,16 +60,19 @@ pub fn decide(key: Option<&str>, payload: Option<&[u8]>) -> FeedDecision {
             Some(k) if !k.is_empty() => FeedDecision::Forget(k.to_string()),
             _ => FeedDecision::Park("tombstone without a key".into()),
         },
-        Some(bytes) => match serde_json::from_slice::<DocumentCompleted>(bytes) {
-            Ok(event) if event.document_id().is_some() => FeedDecision::Ingest(event),
-            Ok(_) => FeedDecision::BadEvent("event has neither groupId nor dataId".into()),
-            Err(e) => FeedDecision::Park(format!("un-parseable document.completed: {e}")),
+        Some(bytes) => match serde_json::from_slice::<DocumentEvent>(bytes) {
+            Ok(event) => match event.document_id() {
+                None => FeedDecision::BadEvent("document event has no data_id".into()),
+                Some(id) if event.body().is_none() => FeedDecision::Skip(id.to_string()),
+                Some(_) => FeedDecision::Ingest(event),
+            },
+            Err(e) => FeedDecision::Park(format!("un-parseable document event: {e}")),
         },
     }
 }
 
-/// Number of ingest attempts before giving up to `dlq.memory` (ADR-0004
-/// transient retry).
+/// Number of ingest attempts before giving up to the DLQ topic (transient
+/// retry).
 const INGEST_ATTEMPTS: u32 = 3;
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
@@ -76,22 +89,16 @@ pub struct KafkaFeeder {
 
 impl KafkaFeeder {
     pub fn new(
-        brokers: &str,
-        group_id: &str,
+        kafka: &KafkaConfig,
         ingestion: Arc<IngestionService>,
         stats: Arc<FeederStats>,
     ) -> Result<Self> {
-        let consumer: StreamConsumer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
-            .set("group.id", group_id)
-            // Backfill from the start; we manage offsets ourselves.
-            .set("enable.auto.commit", "false")
-            .set("auto.offset.reset", "earliest")
+        // Backfill from the start; we manage offsets ourselves.
+        let consumer: StreamConsumer = consumer_config(kafka, &kafka.group_id, "earliest")
             .create()
-            .context("creating document.completed consumer")?;
+            .context("creating documents consumer")?;
 
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
+        let producer: FutureProducer = base_config(kafka)
             .create()
             .context("creating dlq/parking producer")?;
 
@@ -100,10 +107,10 @@ impl KafkaFeeder {
             producer,
             ingestion,
             stats,
-            source_topic: "document.completed".into(),
-            dlq_topic: "dlq.memory".into(),
-            parking_topic: "parking.lot".into(),
-            group_id: group_id.into(),
+            source_topic: kafka.topics.documents.clone(),
+            dlq_topic: kafka.topics.dlq.clone(),
+            parking_topic: kafka.topics.parking.clone(),
+            group_id: kafka.group_id.clone(),
         })
     }
 
@@ -113,25 +120,28 @@ impl KafkaFeeder {
         self.consumer.clone()
     }
 
-    /// Consume forever: classify -> act -> commit. Never returns under normal
-    /// operation; the daemon (slice 11) owns its lifecycle.
-    pub async fn run(&self) -> Result<()> {
+    /// Consume until `stop` fires: classify -> act -> commit. Then commit
+    /// offsets synchronously and flush the dead-letter producer.
+    pub async fn run(&self, mut stop: StopSignal) -> Result<()> {
         self.consumer
             .subscribe(&[&self.source_topic])
-            .context("subscribing to document.completed")?;
+            .with_context(|| format!("subscribing to {}", self.source_topic))?;
 
-        loop {
-            match self.consumer.recv().await {
-                Err(e) => eprintln!("[neurolithe] consumer error: {e}"),
+        while let Some(next) = recv_or_stop(&self.consumer, &mut stop).await {
+            match next {
+                Err(e) => tracing::warn!("consumer error: {e}"),
                 Ok(msg) => {
                     self.process(&msg).await;
                     // Commit AFTER the write so a crash re-processes, not drops.
                     if let Err(e) = self.consumer.commit_message(&msg, CommitMode::Async) {
-                        eprintln!("[neurolithe] commit failed: {e}");
+                        tracing::warn!("commit failed: {e}");
                     }
                 }
             }
         }
+        commit_on_shutdown(&self.consumer, "documents feeder");
+        flush_on_shutdown(&self.producer, "documents feeder");
+        Ok(())
     }
 
     async fn process(&self, msg: &rdkafka::message::BorrowedMessage<'_>) {
@@ -151,6 +161,9 @@ impl KafkaFeeder {
                         .await;
                 }
             },
+            FeedDecision::Skip(id) => {
+                tracing::warn!("document event '{id}' has no text; skipped");
+            }
             FeedDecision::BadEvent(reason) => {
                 self.send_aside(msg, &self.dlq_topic, &reason).await;
             }
@@ -161,14 +174,14 @@ impl KafkaFeeder {
     }
 
     /// Retry transient ingest failures a bounded number of times before the
-    /// caller dead-letters (ADR-0004).
-    async fn ingest_with_retry(&self, event: &DocumentCompleted) -> Result<()> {
+    /// caller dead-letters.
+    async fn ingest_with_retry(&self, event: &DocumentEvent) -> Result<()> {
         let mut last_err = None;
         for attempt in 1..=INGEST_ATTEMPTS {
             match self.ingestion.ingest(event).await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
-                    eprintln!("[neurolithe] ingest attempt {attempt} failed: {e}");
+                    tracing::warn!("ingest attempt {attempt} failed: {e}");
                     last_err = Some(e);
                     if attempt < INGEST_ATTEMPTS {
                         tokio::time::sleep(RETRY_BACKOFF).await;
@@ -179,8 +192,8 @@ impl KafkaFeeder {
         Err(last_err.expect("loop ran at least once"))
     }
 
-    /// Forward a message to a dead-letter / parking topic with context headers
-    /// (ADR-0004 E3b). Failures here are only logged — we still commit and move
+    /// Forward a message to a dead-letter / parking topic with context headers.
+    /// Failures here are only logged — we still commit and move
     /// on, since the alternative is wedging the whole feeder.
     async fn send_aside(
         &self,
@@ -220,7 +233,7 @@ impl KafkaFeeder {
             .headers(headers);
 
         if let Err((e, _)) = self.producer.send(record, Timeout::Never).await {
-            eprintln!("[neurolithe] failed to forward to {topic}: {e}");
+            tracing::warn!("failed to forward to {topic}: {e}");
         }
     }
 }
@@ -232,8 +245,8 @@ mod tests {
     #[test]
     fn test_tombstone_with_key_is_forget() {
         assert_eq!(
-            decide(Some("grp_1"), None),
-            FeedDecision::Forget("grp_1".into())
+            decide(Some("doc_1"), None),
+            FeedDecision::Forget("doc_1".into())
         );
     }
 
@@ -243,28 +256,46 @@ mod tests {
         assert!(matches!(decide(Some(""), None), FeedDecision::Park(_)));
     }
 
+    /// The self-contained event shape is ingested; the text travels with it.
     #[test]
     fn test_valid_event_is_ingest() {
-        let json = br#"{"groupId":"grp_1","pageCount":1,"pages":[{"pageIndex":0,"textUri":"pt://archive/p/text","tags":["x"]}]}"#;
-        match decide(Some("grp_1"), Some(json)) {
-            FeedDecision::Ingest(e) => assert_eq!(e.document_id(), Some("grp_1")),
+        let json = br#"{"data_id":"doc_1","title":"Lease","text":"The lease runs to 2027.","tags":["x"],"ts":"2026-09-01T00:00:00Z"}"#;
+        match decide(Some("doc_1"), Some(json)) {
+            FeedDecision::Ingest(e) => {
+                assert_eq!(e.document_id(), Some("doc_1"));
+                assert_eq!(e.body(), Some("The lease runs to 2027."));
+            }
             other => panic!("expected Ingest, got {other:?}"),
         }
     }
 
+    /// No text (missing or blank) → skipped with a warning, not dead-lettered.
+    #[test]
+    fn test_event_without_text_is_skipped() {
+        for json in [
+            &br#"{"data_id":"doc_2"}"#[..],
+            &br#"{"data_id":"doc_2","text":"   "}"#[..],
+        ] {
+            assert_eq!(
+                decide(Some("k"), Some(json)),
+                FeedDecision::Skip("doc_2".into())
+            );
+        }
+    }
+
+    /// The old pointer-based event (text fetched from an archive service) has
+    /// no text and no data_id → dead-lettered, never fetched.
     #[test]
     fn test_event_without_id_is_bad_event() {
-        // Valid JSON, but no groupId/dataId -> dlq.memory.
-        let json = br#"{"pageCount":1,"pages":[]}"#;
+        let legacy = br#"{"groupId":"grp_1","pages":[{"textUri":"pt://archive/p/text"}]}"#;
         assert!(matches!(
-            decide(Some("k"), Some(json)),
+            decide(Some("k"), Some(legacy)),
             FeedDecision::BadEvent(_)
         ));
     }
 
     #[test]
     fn test_unparseable_is_parked() {
-        // Not JSON at all -> parking.lot.
         assert!(matches!(
             decide(Some("k"), Some(b"\xff\x00 not json")),
             FeedDecision::Park(_)

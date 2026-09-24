@@ -1,25 +1,26 @@
-//! Metrics publisher — sends the CT-scan snapshot to `memory.metrics`.
+//! Metrics publisher — sends the store metrics snapshot to the metrics topic
+//! (`[kafka.topics] metrics`, default `memory.metrics`).
 //!
-//! The topic is compacted and the snapshot is published under a single fixed
-//! key, so the topic always holds exactly one record (the latest brain state),
-//! never a growing log. Pharos consumes it for the dashboard.
+//! The snapshot is published under a single fixed key, so on a compacted topic
+//! it holds exactly one record (the latest state), never a growing log — handy
+//! for a dashboard.
 //!
-//! `render` (key + JSON bytes) is pure and unit-tested; the rdkafka send has a
-//! deferred live-broker smoke test.
+//! `render` (key + JSON bytes) is pure and unit-tested; the rdkafka send needs
+//! a live broker.
 
 use crate::application::monitoring::MemoryMetrics;
+use crate::infrastructure::config::KafkaConfig;
+use crate::infrastructure::kafka_client::base_config;
 use anyhow::{Context, Result};
-use rdkafka::config::ClientConfig;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::util::Timeout;
 
 /// The single compaction key — one record on the topic, always the latest.
 pub const METRICS_KEY: &str = "neurolithe";
-const METRICS_TOPIC: &str = "memory.metrics";
 
 /// The keyed message body for a snapshot: a fixed key + JSON bytes.
 pub fn render(metrics: &MemoryMetrics) -> Result<(&'static str, Vec<u8>)> {
-    let bytes = serde_json::to_vec(metrics).context("serializing memory.metrics snapshot")?;
+    let bytes = serde_json::to_vec(metrics).context("serializing metrics snapshot")?;
     Ok((METRICS_KEY, bytes))
 }
 
@@ -29,14 +30,13 @@ pub struct MetricsPublisher {
 }
 
 impl MetricsPublisher {
-    pub fn new(brokers: &str) -> Result<Self> {
-        let producer: FutureProducer = ClientConfig::new()
-            .set("bootstrap.servers", brokers)
+    pub fn new(kafka: &KafkaConfig) -> Result<Self> {
+        let producer: FutureProducer = base_config(kafka)
             .create()
-            .context("creating memory.metrics producer")?;
+            .context("creating metrics producer")?;
         Ok(Self {
             producer,
-            topic: METRICS_TOPIC.into(),
+            topic: kafka.topics.metrics.clone(),
         })
     }
 
@@ -48,8 +48,13 @@ impl MetricsPublisher {
             .send(record, Timeout::Never)
             .await
             .map_err(|(e, _)| e)
-            .context("publishing memory.metrics")?;
+            .with_context(|| format!("publishing metrics to {}", self.topic))?;
         Ok(())
+    }
+
+    /// Deliver any queued snapshot before exit (graceful shutdown).
+    pub fn flush(&self) {
+        crate::infrastructure::kafka_client::flush_on_shutdown(&self.producer, "metrics publisher");
     }
 }
 
@@ -91,5 +96,20 @@ mod tests {
 
         let decoded: MemoryMetrics = serde_json::from_slice(&payload).unwrap();
         assert_eq!(decoded, metrics());
+    }
+
+    /// The metrics topic comes from `[kafka.topics] metrics`.
+    #[test]
+    fn test_publisher_uses_configured_topic() {
+        let mut kafka = crate::infrastructure::kafka_client::tests::test_kafka(&[]);
+        assert_eq!(
+            MetricsPublisher::new(&kafka).unwrap().topic,
+            "memory.metrics"
+        );
+        kafka.topics.metrics = "ops.memory-metrics".into();
+        assert_eq!(
+            MetricsPublisher::new(&kafka).unwrap().topic,
+            "ops.memory-metrics"
+        );
     }
 }

@@ -1,59 +1,74 @@
-# NeuroLithe configuration — example.
+# NeuroLithe configuration.
 #
-# Copy to `neurolithe.toml` (git-ignored) and adjust:
-#     cp neurolithe.example.toml neurolithe.toml
+# `neurolithe init` writes this file to <home>/neurolithe.toml, where <home> is
+# `--home`, else $NEUROLITHE_HOME, else ~/.neurolithe. Use `--config <file>` or
+# $NEUROLITHE_CONFIG to point elsewhere. The current directory is never read.
 #
 # Every value can also be set by an environment variable using the
 # `NEUROLITHE__<SECTION>__<KEY>` form, e.g. NEUROLITHE__LLM__PROVIDER=gemini.
-# API keys come from the environment (or a `.env` file), never from this file:
+# API keys come from the environment (or <home>/.env), never from this file:
 #   OPENAI_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY, or NEUROLITHE_API_KEY.
 
+# --- Workspaces ---
+# Each workspace is a completely separate memory: its own STM + LTM stores in
+# <home>/workspaces/<name>/. Selected by `--workspace`, else
+# $NEUROLITHE_WORKSPACE, else this value. Created on first use.
+# workspace = "default"
+
 [llm]
-# Chat model, used for fact extraction and context compression.
-# Providers: "openai", "gemini", "anthropic", "custom" (any OpenAI-compatible API).
-provider = "openai"
-model = "gpt-4o-mini"
+# Embeddings power all memory search. The default runs fully offline: a local
+# ONNX model (bge-small-en-v1.5, 384-dim), downloaded once into <home>/models.
+# No API key needed.
+embedding_provider = "local"
+embedding_model = "bge-small-en-v1.5"
 
-# Embedding model. It must match `vector_dimension` in [stm] and [ltm] below.
-# text-embedding-3-small returns 1536-dim vectors.
-embedding_model = "text-embedding-3-small"
-# Optional: a separate embeddings provider. It is required when `provider` is
-# "anthropic", because Claude has no embeddings endpoint.
-# embedding_provider = "openai"
-# embedding_base_url = "https://api.openai.com/v1"
+# Chat LLM: optional. It is used for fact extraction (push_dialogue), context
+# compression and document summaries. With "none", NeuroLithe still stores and
+# recalls memory; push_dialogue just reports that learning is unavailable.
+provider = "none"
 
-# --- Fully local / offline via Ollama (no API key needed) ---
+# --- OpenAI chat (key: OPENAI_API_KEY) ---
+# provider = "openai"
+# model = "gpt-4o-mini"
+
+# --- Anthropic chat (key: ANTHROPIC_API_KEY) ---
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+
+# --- Google Gemini chat (key: GEMINI_API_KEY) ---
+# provider = "gemini"
+# model = "gemini-2.5-flash"
+
+# --- Fully local chat via Ollama (no API key) ---
 # provider = "custom"
 # model = "llama3.1"
 # base_url = "http://localhost:11434/v1"
-# embedding_provider = "custom"
-# embedding_model = "nomic-embed-text"          # 768-dim, so set both dimensions to 768
-# embedding_base_url = "http://localhost:11434/v1"
 
-# --- Anthropic chat + OpenAI embeddings ---
-# provider = "anthropic"
-# model = "claude-sonnet-5"
-# embedding_provider = "openai"
-# embedding_model = "text-embedding-3-small"    # 1536-dim
+# --- Remote embeddings instead of the local model ---
+# Changing the embedding model later requires `neurolithe reembed`.
+# embedding_provider = "openai"                  # or "gemini", "custom"
+# embedding_model = "text-embedding-3-small"
+# embedding_base_url = "https://api.openai.com/v1"
 
-# --- Google Gemini ---
-# provider = "gemini"
-# model = "gemini-2.5-flash"
-# embedding_model = "text-embedding-004"        # 768-dim, so set both dimensions to 768
+# [mcp]
+# Whether the MCP `workspace_switch` tool may change workspace mid-session.
+# allow_workspace_switch = true
+
+# [log]
+# Diagnostics go to stderr only (stdout is the MCP transport). RUST_LOG, when
+# set, overrides this. Examples: "info" (default), "debug", "neurolithe=debug,warn".
+# level = "info"
 
 # --- Memory stores ---
-# STM = decaying short-term working memory. LTM = permanent long-term knowledge tree.
-# `vector_dimension` is locked when a store file is created. It must equal the
-# embedding model's output size. Changing it later means deleting the file.
-# Relative paths resolve against the process working directory, so absolute
-# paths are safer when an MCP client launches the server.
-[stm]
-path = "neurolithe-stm.sqlite"
-vector_dimension = 1536
+# STM = decaying short-term working memory. LTM = permanent long-term knowledge
+# tree. Both live in <home>/workspaces/<name>/; their vector size follows the
+# embedder and is recorded in each store.
 
-[ltm]
-path = "neurolithe-ltm.sqlite"
-vector_dimension = 1536
+# LTM spine: the curated top branches documents are filed under (plus an
+# implicit "inbox"). Default: "notes" and "documents". `path` is "/"-separated.
+# [[ltm.spine]]
+# path = "work/projects"
+# description = "Active projects: plans, decisions, status."
 
 # --- Forgetting curve (STM only) ---
 [decay]
@@ -61,9 +76,26 @@ default_half_life_days = 7.0
 working_half_life_minutes = 30.0
 
 # --- Optional: Kafka daemon (only in builds with `--features kafka`) ---
+# See docs/src/kafka.md. Hard reset stays disabled unless NEUROLITHE_RESET_TOKEN
+# (env) is at least 16 characters.
 # [kafka]
 # brokers = "localhost:9092"
 # group_id = "neurolithe"
+#
+# [kafka.topics]            # defaults shown; set any subset
+# documents = "document.completed"
+# commands = "memory.command"
+# queries = "memory.query"
+# results = "memory.result"
+# metrics = "memory.metrics"
+# dlq = "dlq.memory"
+# parking = "parking.lot"
+#
+# [kafka.client]            # librdkafka properties for every Kafka client (SASL/TLS)
+# "security.protocol" = "SASL_SSL"
+# "sasl.mechanism" = "SCRAM-SHA-512"
+# "sasl.username" = "neurolithe"
+# # sasl.password: prefer NEUROLITHE__KAFKA__CLIENT__SASL_PASSWORD in the env/.env
 #
 # [sweep]
 # interval_secs = 300

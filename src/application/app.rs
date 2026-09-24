@@ -6,6 +6,9 @@ use crate::domain::ports::{LlmClient, MemoryRepository};
 use anyhow::Result;
 use std::sync::Arc;
 
+/// `learning_error` reported by `push_dialogue` when no chat LLM is configured.
+pub const LLM_NOT_CONFIGURED: &str = "LLM not configured";
+
 pub struct NeurolitheApp {
     memory_repo: Arc<dyn MemoryRepository>,
     llm_client: Arc<dyn LlmClient>,
@@ -95,9 +98,13 @@ impl NeurolitheApp {
             ccl: ccl.to_string(),
             created_at: None,
         };
-        if let Err(e) = self.sleep_worker.process_episode(&episode).await {
-            eprintln!(
-                "[neurolithe] dialogue archived as episode {episode_id}, but fact extraction failed: {e:#}"
+        if !self.llm_client.chat_available() {
+            // No chat LLM configured: nothing can be extracted. Not an error —
+            // the dialogue is archived — but reported so the caller knows.
+            ctx.learning_error = Some(LLM_NOT_CONFIGURED.to_string());
+        } else if let Err(e) = self.sleep_worker.process_episode(&episode).await {
+            tracing::warn!(
+                "dialogue archived as episode {episode_id}, but fact extraction failed: {e:#}"
             );
             ctx.learning_error = Some(format!("fact extraction failed: {e:#}"));
         }
@@ -342,7 +349,7 @@ mod tests {
             .expect("no LLM must not fail an archived push");
         assert_eq!(ctx.recent_messages, vec!["remember this".to_string()]);
         assert!(ctx.relevant_facts.is_empty());
-        assert!(ctx.learning_error.is_some());
+        assert_eq!(ctx.learning_error.as_deref(), Some(LLM_NOT_CONFIGURED));
         assert!(!ctx.warnings.is_empty(), "the failed recall is reported");
     }
 
@@ -366,6 +373,9 @@ mod tests {
         }
         async fn compress_context(&self, _m: &str) -> Result<String> {
             anyhow::bail!("LLM not configured")
+        }
+        fn chat_available(&self) -> bool {
+            false
         }
     }
 }

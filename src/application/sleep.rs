@@ -28,8 +28,8 @@ fn cap_extraction(facts: &mut Vec<ExtractedFact>, episode_id: Option<i64>) {
 
     let dropped_facts = total_facts - facts.len();
     if dropped_facts > 0 || dropped_rels > 0 {
-        eprintln!(
-            "[neurolithe] extraction capped for episode {episode_id:?}: dropped {dropped_facts} fact(s), {dropped_rels} relationship(s)"
+        tracing::warn!(
+            "extraction capped for episode {episode_id:?}: dropped {dropped_facts} fact(s), {dropped_rels} relationship(s)"
         );
     }
 }

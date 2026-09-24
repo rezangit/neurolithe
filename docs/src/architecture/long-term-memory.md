@@ -2,6 +2,11 @@
 
 Long-term memory is stored in an embedded SQLite database using a hybrid Graph-Vector architecture.
 
+> Isolation is per **workspace**: each workspace has its own store files in
+> `<home>/workspaces/<name>/`. The `tenant_id` columns shown below are a legacy
+> of the old multi-tenant design. They always hold `default` and are not exposed
+> through any tool. A full V2 architecture rewrite of these pages is planned.
+
 ## Storage Layers
 
 ### Episodes (Ground Truth)

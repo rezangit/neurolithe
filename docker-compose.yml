@@ -1,85 +1,110 @@
-# NeuroLithe memory service — the JARVIS "brain", a long-running daemon on the
-# always-on Mac mini. Consumes `document.completed`, distills each document, and
-# dual-writes it into a decaying STM and a permanent LTM knowledge tree; serves
-# recall + introspection over MCP; consumes `memory.command` (soft/hard reset)
-# and publishes a CT-scan snapshot to `memory.metrics`.
+# NeuroLithe in Kafka mode: an example Docker Compose setup.
 #
-#   docker compose up -d --build     # build + start, online + auto-restart
-#   docker compose logs -f           # watch it ingest + publish metrics
-#   docker compose down              # stop (both stores persist in the volume)
+# The container runs `neurolithe daemon`, which does four things:
+#   - consumes document events ({data_id, title?, text, tags?, ts?}) and files
+#     them into STM + LTM,
+#   - applies write/reset commands,
+#   - answers recall queries over the bus,
+#   - publishes a metrics snapshot.
 #
-# Requires the Kafka broker (jarvis-kafka) on the shared jarvis-kafka_default
-# network — see ../kafka/ — with the topics created via ../kafka/create-topics.sh
-# (document.completed, memory.command, memory.metrics, dlq.memory, parking.lot).
-# Pithos (the artifact store) must be reachable for document text.
-name: jarvis-neurolithe
+# Both memory stores live in the `neurolithe-home` volume (NEUROLITHE_HOME=/data).
+#
+#   docker compose --profile broker up -d --build   # with the bundled broker
+#   docker compose up -d --build                    # against your own broker
+#   docker compose logs -f neurolithe
+#
+# Configuration comes from the environment (NEUROLITHE__SECTION__KEY) and from
+# an optional .env next to this file. Nothing host-specific is mounted. For a
+# full config file, put neurolithe.toml in the volume (/data/neurolithe.toml).
+#
+# Security notes:
+#   - The bundled broker is PLAINTEXT with no auth and is NOT published to the
+#     host. Anyone who can produce to the commands topic can write and forget
+#     memories. For a real deployment use SASL/TLS (NEUROLITHE__KAFKA__CLIENT__*,
+#     see README "Kafka mode") and broker ACLs.
+#   - Hard reset stays disabled unless NEUROLITHE_RESET_TOKEN is set to at least
+#     16 characters.
+name: neurolithe
 
 services:
   neurolithe:
     build: .
-    image: neurolithe:latest
-    container_name: jarvis-neurolithe
+    image: neurolithe:0.3
     restart: unless-stopped
-    # Optional .env (git-ignored) for secrets/overrides: the Claude chat key
-    # (ANTHROPIC_API_KEY), the Pithos read token (NEUROLITHE__PITHOS__TOKEN), and
-    # the hard-reset guard token (NEUROLITHE_RESET_TOKEN). Vertex embeddings
-    # authenticate via the mounted service-account key (below), not an API key.
+    # On SIGTERM the daemon drains in-flight Kafka messages (up to 8 s), then
+    # checkpoints the stores' WAL. Docker's default 10 s grace is too tight.
+    stop_grace_period: 15s
+    # Optional, git-ignored. Typical contents:
+    #   NEUROLITHE__KAFKA__BROKERS=broker.example:9093
+    #   NEUROLITHE__KAFKA__CLIENT__SECURITY_PROTOCOL=SASL_SSL
+    #   NEUROLITHE__KAFKA__CLIENT__SASL_MECHANISM=SCRAM-SHA-512
+    #   NEUROLITHE__KAFKA__CLIENT__SASL_USERNAME=neurolithe
+    #   NEUROLITHE__KAFKA__CLIENT__SASL_PASSWORD=...
+    #   NEUROLITHE_RESET_TOKEN=<at least 16 random characters>
+    #   OPENAI_API_KEY=...        # only if you configure a cloud chat/embedding provider
     env_file:
       - path: .env
         required: false
     environment:
-      # --- bus + archive ---
-      # Reach the broker by container name over the shared network (DOCKER
-      # listener, advertised as jarvis-kafka:29092).
-      NEUROLITHE__KAFKA__BROKERS: jarvis-kafka:29092
+      NEUROLITHE_HOME: /data
+      # The bundled broker (profile "broker"). Override in .env for your own.
+      NEUROLITHE__KAFKA__BROKERS: ${NEUROLITHE_KAFKA_BROKERS:-kafka:9092}
       NEUROLITHE__KAFKA__GROUP_ID: neurolithe
-      # Pithos on the NAS (LAN) — the feeder fetches pt:// document text here.
-      # The read token is a secret: set NEUROLITHE__PITHOS__TOKEN in .env (without
-      # it, reads return 401 and every document dead-letters to dlq.memory).
-      NEUROLITHE__PITHOS__BASE_URL: http://192.168.4.48:8080
-
-      # --- embeddings / LLM (CONFIGURABLE) ---
-      # Chat/reasoning = Claude API (Sonnet 5); embeddings = Google Vertex AI
-      # (text-embedding-004, 768-dim), reusing Cadmus's service-account access.
-      # The feeder writes ONE embedding to both stores, so STM and LTM dimensions
-      # MUST match the embedding model (text-embedding-004 = 768).
-      #
-      # NOTE (privacy): this sends document text to Anthropic + Google — a CLOUD
-      # egress, against JARVIS's offline-first default, chosen consciously. For a
-      # fully offline setup, point both halves at a local Ollama instead
-      # (provider=custom, base_url=http://host.docker.internal:11434/v1).
-      NEUROLITHE__LLM__PROVIDER: anthropic
-      NEUROLITHE__LLM__MODEL: claude-sonnet-5
-      NEUROLITHE__LLM__EMBEDDING_PROVIDER: vertex
-      NEUROLITHE__LLM__EMBEDDING_MODEL: text-embedding-004
-      NEUROLITHE__LLM__EMBEDDING_PROJECT: jarvis-cadmus
-      NEUROLITHE__LLM__EMBEDDING_LOCATION: us-central1
-      # In-container path of the mounted service-account key (see volumes below);
-      # overrides any host path inherited from .env.
-      GOOGLE_APPLICATION_CREDENTIALS: /etc/neurolithe/key.json
-      NEUROLITHE__STM__VECTOR_DIMENSION: 768
-      NEUROLITHE__LTM__VECTOR_DIMENSION: 768
-
-      # --- behavior ---
+      # Topic names (these are the defaults):
+      # NEUROLITHE__KAFKA__TOPICS__DOCUMENTS: document.completed
+      # NEUROLITHE__KAFKA__TOPICS__COMMANDS: memory.command
+      # NEUROLITHE__KAFKA__TOPICS__QUERIES: memory.query
+      # NEUROLITHE__KAFKA__TOPICS__RESULTS: memory.result
+      # NEUROLITHE__KAFKA__TOPICS__METRICS: memory.metrics
+      # NEUROLITHE__KAFKA__TOPICS__DLQ: dlq.memory
+      # NEUROLITHE__KAFKA__TOPICS__PARKING: parking.lot
       NEUROLITHE__FEEDER__ENABLED: "true"
-      # Both SQLite stores live on the persistent named volume.
-      NEUROLITHE__STM__PATH: /data/neurolithe-stm.sqlite
-      NEUROLITHE__LTM__PATH: /data/neurolithe-ltm.sqlite
-      RUST_LOG: info
-    # Lets NEUROLITHE__LLM__BASE_URL reach a model server running on the mini
-    # host (Ollama). Harmless if a cloud provider is used instead.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      NEUROLITHE__BUS_QUERY__ENABLED: "true"
     volumes:
-      - neurolithe-data:/data
-      # Vertex service-account key (read-only), same key/path Cadmus mounts.
-      - /Users/mymini/.config/jarvis/cadmus-vertex-key.json:/etc/neurolithe/key.json:ro
+      - neurolithe-home:/data
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+        required: false
 
-# Join the broker's existing Compose network instead of creating a new one.
-networks:
-  default:
-    name: jarvis-kafka_default
-    external: true
+  # --- Optional single-node broker for trying Kafka mode locally ---
+  kafka:
+    profiles: ["broker"]
+    image: apache/kafka:3.9.1
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    # Not published to the host. To produce test events from the host, add a
+    # loopback-only port and an extra listener advertised as localhost.
+    # ports: ["127.0.0.1:9092:9092"]
+
+  # Creates the topics NeuroLithe uses (idempotent), then exits.
+  kafka-init:
+    profiles: ["broker"]
+    image: apache/kafka:3.9.1
+    depends_on: [kafka]
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        B=kafka:9092
+        until /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$B --list >/dev/null 2>&1; do sleep 1; done
+        for t in document.completed memory.command memory.query memory.result dlq.memory parking.lot; do
+          /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$B --create --if-not-exists --topic $$t
+        done
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server $$B --create --if-not-exists \
+          --topic memory.metrics --config cleanup.policy=compact
 
 volumes:
-  neurolithe-data:
+  neurolithe-home:

@@ -62,10 +62,10 @@ const COMMAND_ID_RETENTION_DAYS: i64 = 14;
 impl PeriodicTask for SweepTask {
     async fn run_once(&self) {
         if let Err(e) = self.app.run_decay_sweep().await {
-            eprintln!("[neurolithe] decay sweep failed: {e}");
+            tracing::warn!("decay sweep failed: {e}");
         }
         if let Err(e) = self.app.sweep_processed_commands(COMMAND_ID_RETENTION_DAYS) {
-            eprintln!("[neurolithe] processed-command sweep failed: {e}");
+            tracing::warn!("processed-command sweep failed: {e}");
         }
     }
 }

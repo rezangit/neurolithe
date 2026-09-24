@@ -4,17 +4,29 @@
 //! LTM database) and serializes access. Concept-node embeddings go into the
 //! `vec_ltm` sqlite-vec index; summaries are kept in `fts_ltm` via triggers.
 
-use crate::domain::ltm::{Leaf, LtmRepository, Provenance, TreeEdge, TreeNode, TreeNodeKind};
+use crate::domain::ltm::{
+    Leaf, LtmRepository, Provenance, SpineSeed, TreeEdge, TreeNode, TreeNodeKind,
+};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
 pub struct SqliteLtmRepository {
     conn: Connection,
+    /// Keeps the workspace marked "open" (its shared advisory lock) for
+    /// exactly as long as this connection lives — i.e. as long as anything
+    /// still holds the repository.
+    _lease: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 impl SqliteLtmRepository {
     pub fn new(conn: Connection) -> Self {
-        Self { conn }
+        Self { conn, _lease: None }
+    }
+
+    /// Tie a workspace lease to this repository's connection lifetime.
+    pub fn with_lease(mut self, lease: std::sync::Arc<dyn std::any::Any + Send + Sync>) -> Self {
+        self._lease = Some(lease);
+        self
     }
 
     /// The id of the first node with this exact `name` (used by additive spine
@@ -25,6 +37,20 @@ impl SqliteLtmRepository {
             .query_row(
                 "SELECT id FROM tree_nodes WHERE name = ?1 ORDER BY id LIMIT 1",
                 params![name],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?)
+    }
+
+    /// The concept (non-leaf) child of `parent_id` named `name`, if any.
+    fn child_by_name(&self, parent_id: i64, name: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT n.id FROM tree_edges e JOIN tree_nodes n ON n.id = e.child_id
+                 WHERE e.parent_id = ?1 AND n.name = ?2 AND n.kind IN ('spine', 'grown')
+                 ORDER BY n.id LIMIT 1",
+                params![parent_id, name],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?)
@@ -50,79 +76,42 @@ impl SqliteLtmRepository {
 }
 
 impl LtmRepository for SqliteLtmRepository {
-    /// Seed the curated spine (the user's main branches + an inbox) under a root.
-    ///
-    /// **Additive & idempotent per branch** (not "no-op if any node exists"): it
-    /// ensures the root, the inbox, and every branch below exist *by name*,
-    /// creating only the missing ones. A redeploy that adds a new branch to the
-    /// list therefore grows the spine of a live tree, and existing branches (with
-    /// their accumulated leaves and rolling summaries) are left untouched.
-    ///
-    /// Branch summaries are the curated *definition* of the concept — the
-    /// daemon embeds these into `vec_ltm` so placement has real match targets
-    /// (see `concepts_missing_embedding` / the daemon's spine-embed step). We add
-    /// real personal-life domains (health, home, vehicles, insurance, family,
-    /// admin) so a scanned document has somewhere sensible to land instead of the
-    /// inbox (field-report §3).
-    fn seed_spine(&self) -> Result<()> {
-        // Ensure a single spine root named "root".
+    /// Seeds `root`, the inbox, and each configured branch by *path*, creating
+    /// only what is missing. Branch summaries are the curated definition of the
+    /// concept; startup embeds them (`concepts_missing_embedding`) so placement
+    /// has real match targets. Nested paths (`a/b`) create `a` first; a branch
+    /// is identified by name **under its parent**, so the same name may appear
+    /// in different subtrees.
+    fn seed_spine_from(&self, seeds: &[SpineSeed]) -> Result<()> {
         let root = match self.find_node_by_name("root")? {
             Some(id) => id,
             None => self.create_node(
-                &TreeNode::new(
-                    "root",
-                    "Root of the personal knowledge tree.",
-                    TreeNodeKind::Spine,
-                ),
+                &TreeNode::new("root", "Root of the knowledge tree.", TreeNodeKind::Spine),
                 None,
             )?,
         };
 
-        // Curated main branches (the spine). The AI grows leaves below these.
-        let branches = [
-            ("job", "Work, employer, projects, career, and colleagues."),
-            (
-                "learning",
-                "Study, courses, skills, certifications, and reading.",
-            ),
-            (
-                "investment",
-                "Finances, banking, investing, tax, assets, and receipts.",
-            ),
-            (
-                "self-improvement",
-                "Habits, mindset, meditation, and personal growth.",
-            ),
-            (
-                "health",
-                "Medical, dental, prescriptions, insurance, and wellness.",
-            ),
-            (
-                "home",
-                "Residence, strata/HOA, building, utilities, and repairs.",
-            ),
-            (
-                "vehicles",
-                "Cars, registration, insurance, and maintenance.",
-            ),
-            (
-                "insurance",
-                "Insurance policies and claims — home, auto, life, health.",
-            ),
-            (
-                "family",
-                "Family, relationships, and personal correspondence.",
-            ),
-            (
-                "admin",
-                "Government, legal, identity, accounts, and official letters.",
-            ),
-        ];
-        for (name, summary) in branches {
-            if self.find_node_by_name(name)?.is_none() {
-                let child =
-                    self.create_node(&TreeNode::new(name, summary, TreeNodeKind::Spine), None)?;
-                self.add_edge(&TreeEdge::new(root, child))?;
+        for seed in seeds {
+            let segments = seed.segments();
+            let mut parent = root;
+            for (i, name) in segments.iter().enumerate() {
+                let is_last = i + 1 == segments.len();
+                parent = match self.child_by_name(parent, name)? {
+                    Some(id) => id,
+                    None => {
+                        let summary = if is_last {
+                            seed.description.as_str()
+                        } else {
+                            ""
+                        };
+                        let child = self.create_node(
+                            &TreeNode::new(*name, summary, TreeNodeKind::Spine),
+                            None,
+                        )?;
+                        self.add_edge(&TreeEdge::new(parent, child))?;
+                        child
+                    }
+                };
             }
         }
 
@@ -263,6 +252,20 @@ impl LtmRepository for SqliteLtmRepository {
                 other => Err(other),
             })?;
         Ok(node)
+    }
+
+    fn get_nodes_by_data_id(&self, data_id: &str) -> Result<Vec<TreeNode>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT n.id, n.name, n.summary, n.kind, n.permanent, n.created_at, n.updated_at
+             FROM tree_nodes n
+             JOIN leaves l ON n.id = l.tree_node_id
+             WHERE l.data_id = ?1
+             ORDER BY n.id",
+        )?;
+        let nodes = stmt
+            .query_map(params![data_id], Self::row_to_node)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(nodes)
     }
 
     fn find_similar_concepts(
@@ -724,45 +727,50 @@ mod tests {
         }
     }
 
-    /// The spine seeds a root + branches + inbox, and re-seeding is idempotent
-    /// (no duplicates).
+    /// The default spine is generic: root → notes, documents, inbox — no
+    /// personal-life branches. Re-seeding creates no duplicates.
     #[test]
     fn test_spine_seeded_once() {
         let repo = setup();
 
         repo.seed_spine().unwrap();
-        let count_after_first: i64 = repo
-            .conn
-            .query_row("SELECT COUNT(*) FROM tree_nodes", [], |r| r.get(0))
-            .unwrap();
-        // root + 10 branches + inbox = 12.
-        assert_eq!(count_after_first, 12);
+        let count = |repo: &SqliteLtmRepository| -> i64 {
+            repo.conn
+                .query_row("SELECT COUNT(*) FROM tree_nodes", [], |r| r.get(0))
+                .unwrap()
+        };
+        // root + notes + documents + inbox.
+        assert_eq!(count(&repo), 4);
 
-        // Seeding again adds nothing (additive-by-name, so no duplicate branches).
         repo.seed_spine().unwrap();
-        let count_after_second: i64 = repo
-            .conn
-            .query_row("SELECT COUNT(*) FROM tree_nodes", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(count_after_second, 12, "re-seed creates no duplicates");
+        assert_eq!(count(&repo), 4, "re-seed creates no duplicates");
 
-        // The root has all spine branches plus the inbox as children.
         let root = repo
             .find_node_by_name("root")
             .unwrap()
             .expect("root exists");
-        let children = repo.get_children(root).unwrap();
-        assert_eq!(children.len(), 11, "10 branches + inbox");
-        assert!(children.iter().any(|n| n.kind == TreeNodeKind::Inbox));
-        assert!(children.iter().any(|n| n.name == "health"));
+        let mut names: Vec<String> = repo
+            .get_children(root)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["documents", "inbox", "notes"]);
+        for legacy in ["job", "health", "family", "investment"] {
+            assert!(
+                repo.find_node_by_name(legacy).unwrap().is_none(),
+                "{legacy}"
+            );
+        }
     }
 
-    /// Seeding is additive: a tree that predates a branch gains it on re-seed,
-    /// without disturbing existing branches or their leaves.
+    /// A configured spine seeds nested paths (creating intermediate branches),
+    /// keeps descriptions on the leaf segment, and is additive: an older tree
+    /// keeps its branches and reuses its root and inbox.
     #[test]
-    fn test_seed_spine_adds_missing_branch_to_existing_tree() {
+    fn test_seed_spine_from_config_is_nested_and_additive() {
         let repo = setup();
-        // Simulate an older, sparsely-seeded tree: root + one branch + inbox.
         let root = repo
             .create_node(&TreeNode::new("root", "root", TreeNodeKind::Spine), None)
             .unwrap();
@@ -775,17 +783,39 @@ mod tests {
             .unwrap();
         repo.add_edge(&TreeEdge::new(root, inbox)).unwrap();
 
-        repo.seed_spine().unwrap();
+        let seeds = vec![
+            SpineSeed::new("work/projects", "Active projects."),
+            SpineSeed::new(" work / clients ", "Client accounts."),
+            SpineSeed::new("reading", "Books and papers."),
+        ];
+        repo.seed_spine_from(&seeds).unwrap();
+        repo.seed_spine_from(&seeds).unwrap(); // idempotent
 
-        // The missing branches were added under the SAME root; job/inbox reused.
+        assert_eq!(repo.find_node_by_name("root").unwrap(), Some(root));
+        let mut top: Vec<String> = repo
+            .get_children(root)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.name)
+            .collect();
+        top.sort();
+        assert_eq!(top, vec!["inbox", "job", "reading", "work"]);
+
+        let work = repo.find_node_by_name("work").unwrap().unwrap();
+        let mut sub: Vec<(String, String)> = repo
+            .get_children(work)
+            .unwrap()
+            .into_iter()
+            .map(|n| (n.name, n.summary))
+            .collect();
+        sub.sort();
         assert_eq!(
-            repo.find_node_by_name("root").unwrap(),
-            Some(root),
-            "no second root"
+            sub,
+            vec![
+                ("clients".to_string(), "Client accounts.".to_string()),
+                ("projects".to_string(), "Active projects.".to_string()),
+            ]
         );
-        assert!(repo.find_node_by_name("health").unwrap().is_some());
-        let children = repo.get_children(root).unwrap();
-        assert_eq!(children.len(), 11, "10 branches + the pre-existing inbox");
     }
 
     /// Concept embeddings can be set and are then no longer reported as missing;
