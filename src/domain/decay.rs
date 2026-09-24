@@ -55,6 +55,17 @@ impl DecayEngine {
     }
 
     fn decay(&self, current_score: f64, days_elapsed: f64, half_life_days: f64) -> f64 {
+        // No time passed (or clock skew, or NaN) → no decay. Checked first so a
+        // zero half-life can't produce 0/0 = NaN (DEV-12).
+        if days_elapsed.is_nan() || days_elapsed <= 0.0 {
+            return current_score;
+        }
+        // A non-positive / non-finite half-life is a misconfiguration (config
+        // validation rejects it); degrade to "forget immediately" rather than
+        // writing NaN/inf scores into the store.
+        if !(half_life_days.is_finite() && half_life_days > 0.0) {
+            return 0.0;
+        }
         // score = current_score * (0.5 ^ (days_elapsed / half_life))
         current_score * 0.5f64.powf(days_elapsed / half_life_days)
     }
@@ -135,6 +146,20 @@ mod tests {
             reality > 0.9,
             "a reality fact should barely decay over hours, got {reality}"
         );
+    }
+
+    /// DEV-12: a zero half-life must never yield NaN/inf (which would poison
+    /// ranking and the archive threshold).
+    #[test]
+    fn test_zero_half_life_never_nan() {
+        let engine = DecayEngine::with_half_lives(0.0, 0.0);
+        for elapsed in [0.0, 1e-9, 1.0, -1.0] {
+            let s = engine.calculate_decay_for(0.8, elapsed, "reality");
+            assert!(s.is_finite(), "elapsed {elapsed} gave {s}");
+            assert!((0.0..=0.8).contains(&s));
+        }
+        // No elapsed time → unchanged, even with a broken half-life.
+        assert_eq!(engine.calculate_decay_for(0.8, 0.0, WORKING_CCL), 0.8);
     }
 
     /// `half_life_for` routes `working` to the working curve and everything else

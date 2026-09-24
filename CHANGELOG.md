@@ -3,6 +3,70 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [Unreleased] — 0.2.1
+
+Correctness and hardening release from the 2026-09 multi-discipline review
+(`project-review/`). Phase 0 (safety net) + Phase 1 (make it correct).
+
+### Fixed
+
+- **`push_dialogue` never learned anything.** Extracted facts were stored under a
+  placeholder episode id `0`, failed the foreign key, and the error was discarded.
+  Facts now persist. An extraction failure no longer fails the call; it is reported
+  as `learning_error` on a successful context window, so a retry does not duplicate
+  the turn.
+- **Conflict resolver corrupted memories.** A "modify" replaced a node's text but
+  kept its old embedding and dropped payload keys such as `dataId`. It now
+  re-embeds, preserves payload, unions tags, and never merges nodes with different
+  `dataId`s. `assimilation_threshold` is now used.
+- **`delete_tenant` failed for any tenant with graph edges** (FK error). It now
+  deletes edges, vectors, nodes, episodes and CCL registry rows in one
+  transaction. It also **requires** `tenant_id` plus a matching `confirm`
+  instead of defaulting to the `jarvis` tenant.
+- **MCP clients saw every tool failure as success.** Tool results now carry
+  `isError` (camelCase) as the spec requires. An unknown tool is a JSON-RPC
+  `-32602` error.
+- **Search ignored `k` and could return nothing.** The hard-coded `LIMIT 5` is
+  gone, filters run before the limit, zero-vector anchors and archived nodes are
+  kept out of the vector index (existing stores are cleaned on startup), and LTM
+  recall returns the top-k hits instead of one.
+- **"database is locked" with several processes.** `busy_timeout` is set before
+  WAL, write transactions begin `IMMEDIATE`, and store open retries briefly.
+- The Anthropic JSON extraction could panic, and a zero half-life produced NaN.
+
+### Changed
+
+- **Every LLM call has timeouts** via one shared HTTP client
+  (`llm.request_timeout_secs`, default 120).
+- **No more `dummy_key`.** A missing key logs a startup warning, and LLM tools
+  return "LLM not configured: …".
+- **Config is validated at load** and every problem is reported at once.
+- **MCP:**
+  - Supports `ping`, advertises `listChanged: false` and negotiates the protocol version.
+  - Validates and clamps tool arguments.
+  - Caps sizes: message 64 KiB, fact 16 KiB, query 4 KiB, line 4 MiB.
+  - Tool schemas declare all accepted params and include read-only/destructive hints.
+- **Sessions are keyed by (tenant, session)**, with LRU (256) and idle-TTL (6 h)
+  eviction. Each extraction is capped at 32 facts and 32 relationships.
+- **Secrets:**
+  - The Gemini key is sent in the `x-goog-api-key` header, not the URL.
+  - `provider = "custom"` only reads `NEUROLITHE_API_KEY`.
+  - Errors are stripped of URLs and upstream bodies are truncated.
+
+### Added
+
+- `scripts/check.sh`: local quality gate (fmt, clippy `-D warnings`, tests on
+  default and `kafka` features), with an optional `scripts/pre-commit` hook.
+  `scripts/cargo.sh` runs cargo in Docker when no local toolchain exists.
+- End-to-end MCP STDIO tests (`tests/`) driving the real binary against an
+  in-process fake LLM, including regression tests tagged by issue ID.
+- `rust-toolchain.toml` (1.94.1) and a generic `neurolithe.example.toml`. The
+  private `neurolithe.toml` is no longer tracked.
+
+### Removed
+
+- The dead CI badge.
+
 ## [0.2.0] — 2026-07-10
 
 A reliability release driven by real-world MCP testing: search actually works

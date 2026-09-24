@@ -15,7 +15,7 @@ use crate::application::query_service::QueryService;
 use crate::application::retrieval::RetrievalService;
 use crate::domain::ltm::LtmRepository;
 use crate::domain::ports::{LlmClient, MemoryRepository};
-use crate::infrastructure::config::{AppConfig, LlmProvider};
+use crate::infrastructure::config::AppConfig;
 use crate::infrastructure::database::{MemoryStores, init_stores};
 use crate::infrastructure::llm::create_llm_client;
 use crate::infrastructure::ltm_repository::SqliteLtmRepository;
@@ -24,18 +24,16 @@ use crate::interfaces::mcp_server::McpServer;
 use anyhow::Result;
 use std::sync::Arc;
 
-fn resolve_api_key(provider: &LlmProvider) -> String {
-    let primary = match provider {
-        LlmProvider::Openai | LlmProvider::Custom => "OPENAI_API_KEY",
-        LlmProvider::Gemini => "GEMINI_API_KEY",
-        LlmProvider::Anthropic => "ANTHROPIC_API_KEY",
-        // Vertex authenticates via gcp_auth (GOOGLE_APPLICATION_CREDENTIALS), not
-        // an API key; the returned value is unused by VertexClient.
-        LlmProvider::Vertex => return "vertex_uses_gcp_auth".to_string(),
-    };
-    std::env::var(primary)
-        .or_else(|_| std::env::var("NEUROLITHE_API_KEY"))
-        .unwrap_or_else(|_| "dummy_key".to_string())
+/// Build the LLM client from config + the process environment, logging any
+/// startup warnings (e.g. a missing API key). A missing key does not abort
+/// startup: LLM-backed tools then fail with "LLM not configured: set …" while
+/// introspection keeps working (no `dummy_key` is ever sent — QA-10).
+fn build_llm(config: &AppConfig) -> Arc<dyn LlmClient> {
+    let setup = create_llm_client(&config.llm, &|name| std::env::var(name).ok());
+    for warning in &setup.warnings {
+        eprintln!("[neurolithe] warning: {warning}");
+    }
+    setup.client
 }
 
 /// Run ONLY the MCP server over stdio — no feeder, consumers, or schedulers.
@@ -50,11 +48,7 @@ pub async fn run_mcp(config: AppConfig) -> Result<()> {
     let ltm_repo: Arc<dyn LtmRepository> = Arc::new(SqliteLtmRepository::new(ltm));
     ltm_repo.seed_spine()?;
 
-    let llm: Arc<dyn LlmClient> = create_llm_client(
-        &config.llm,
-        resolve_api_key(&config.llm.provider),
-        resolve_api_key(config.llm.effective_embedding_provider()),
-    );
+    let llm = build_llm(&config);
     let app = Arc::new(NeurolitheApp::new(
         stm_repo.clone(),
         llm.clone(),
@@ -169,11 +163,7 @@ mod full {
         ltm_repo.seed_spine()?;
 
         // --- external adapters ---
-        let llm: Arc<dyn LlmClient> = create_llm_client(
-            &config.llm,
-            resolve_api_key(&config.llm.provider),
-            resolve_api_key(config.llm.effective_embedding_provider()),
-        );
+        let llm = build_llm(&config);
         let pithos: Arc<dyn ArtifactStore> = Arc::new(PithosClient::new(
             &config.pithos.base_url,
             &config.pithos.token,

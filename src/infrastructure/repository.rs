@@ -30,6 +30,39 @@ fn fts_or_query(raw: &str) -> Option<String> {
     }
 }
 
+/// How many vector candidates to pull per requested result. The vec0 `k` cut
+/// runs before the tenant/status filters (no partition key yet — Phase 2
+/// workspaces remove the tenant filter entirely), so over-fetching keeps the
+/// filters from starving the result set.
+const KNN_OVERFETCH: usize = 4;
+
+/// sqlite-vec's default upper bound on `k` for a vec0 KNN query.
+const KNN_MAX_K: usize = 4096;
+
+/// KNN `k` for a request of `limit` results: over-fetched, clamped to vec0's bound.
+fn knn_k(limit: usize) -> i64 {
+    limit.saturating_mul(KNN_OVERFETCH).clamp(1, KNN_MAX_K) as i64
+}
+
+/// View an `f32` embedding as the little-endian byte blob sqlite-vec expects.
+fn vec_bytes(embedding: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no padding or invalid bit patterns; the byte slice
+    // borrows the same memory for the same lifetime with the exact byte length.
+    unsafe {
+        std::slice::from_raw_parts(
+            embedding.as_ptr() as *const u8,
+            std::mem::size_of_val(embedding),
+        )
+    }
+}
+
+/// Whether an embedding carries meaning worth indexing. Empty or all-zero
+/// vectors (graph-anchor `subject` nodes) are equidistant from everything, so
+/// indexing them only burns KNN slots that real matches need (ARC-17).
+fn is_indexable(embedding: &[f32]) -> bool {
+    embedding.iter().any(|x| *x != 0.0)
+}
+
 pub struct SqliteMemoryRepository {
     conn: Connection,
 }
@@ -150,17 +183,15 @@ impl MemoryRepository for SqliteMemoryRepository {
         )?;
         let node_id = tx.last_insert_rowid();
 
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
-
-        tx.execute(
-            "INSERT INTO vec_nodes(node_id, embedding) VALUES (?1, ?2)",
-            params![node_id, embedding_bytes],
-        )?;
+        // Only active nodes with a meaningful vector enter the KNN index:
+        // zero-vector anchors and archived nodes would otherwise occupy top-k
+        // slots and push real matches out (ARC-17).
+        if node.status == "active" && is_indexable(embedding) {
+            tx.execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?1, ?2)",
+                params![node_id, vec_bytes(embedding)],
+            )?;
+        }
 
         tx.commit()?;
         Ok(node_id)
@@ -189,12 +220,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         tenant_id: &TenantId,
         limit: usize,
     ) -> Result<Vec<MemoryNode>> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                query_embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(query_embedding),
-            )
-        };
+        let embedding_bytes = vec_bytes(query_embedding);
 
         // The keyword leg is included only when the query yields safe FTS terms;
         // otherwise the search is vector-only (still returns nearest neighbors).
@@ -209,11 +235,16 @@ impl MemoryRepository for SqliteMemoryRepository {
             "
             WITH hybrid_matches AS (
                 -- Semantic
-                SELECT node_id, distance as score FROM vec_nodes WHERE embedding MATCH ?1 AND k = 10
+                SELECT node_id, distance as score FROM vec_nodes WHERE embedding MATCH ?1 AND k = ?5
                 {keyword_leg}
             ),
+            -- Tenant/status are filtered BEFORE the limit, so rows the caller
+            -- can never see (other tenants, archived) don't take result slots.
             ranked_matches AS (
-                SELECT node_id, SUM(score) as combined_score FROM hybrid_matches GROUP BY node_id ORDER BY combined_score LIMIT ?3
+                SELECT h.node_id, SUM(h.score) as combined_score
+                FROM hybrid_matches h JOIN nodes rn ON rn.id = h.node_id
+                WHERE rn.tenant_id = ?4 AND rn.status = 'active'
+                GROUP BY h.node_id ORDER BY combined_score LIMIT ?3
             )
             SELECT
                 n.id, n.tenant_id, n.source_episode_id, n.payload, n.status, n.ccl, n.is_explicit, n.support_count, n.relevance_score, n.context_key
@@ -231,7 +262,8 @@ impl MemoryRepository for SqliteMemoryRepository {
                 embedding_bytes,
                 fts.unwrap_or_default(),
                 limit as i64,
-                tenant_id.0
+                tenant_id.0,
+                knn_k(limit)
             ],
             |row| {
                 let payload_str: String = row.get(3)?;
@@ -269,12 +301,7 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> Result<Vec<crate::domain::models::MemoryResult>> {
         let ccl_json = serde_json::to_string(ccl_filter)?;
 
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                query_embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(query_embedding),
-            )
-        };
+        let embedding_bytes = vec_bytes(query_embedding);
 
         // Blueprint section 2.5: Hybrid + Graph + Temporal query.
         // Keyword leg is included only when the query yields safe FTS terms
@@ -289,11 +316,21 @@ impl MemoryRepository for SqliteMemoryRepository {
         let query = format!(
             "
             WITH hybrid_matches AS (
-                SELECT node_id, distance as score FROM vec_nodes WHERE embedding MATCH ?1 AND k = 10
+                SELECT node_id, distance as score FROM vec_nodes WHERE embedding MATCH ?1 AND k = ?8
                 {keyword_leg}
             ),
+            -- Direct hits honour the caller's breadth (`?4`); the old hard-coded
+            -- `LIMIT 5` silently capped every k > 5 (DEV-8).
+            -- Visibility filters (tenant, status, layer, time) run BEFORE the
+            -- limit so invisible rows never take one of the k slots.
             ranked_matches AS (
-                SELECT node_id, SUM(score) as combined_score FROM hybrid_matches GROUP BY node_id ORDER BY combined_score LIMIT 5
+                SELECT h.node_id, SUM(h.score) as combined_score
+                FROM hybrid_matches h JOIN nodes rn ON rn.id = h.node_id
+                WHERE rn.tenant_id = ?3 AND rn.status = 'active'
+                  AND rn.ccl IN (SELECT value FROM json_each(?7))
+                  AND (rn.created_at >= ?5 OR ?5 IS NULL)
+                  AND (rn.created_at <= ?6 OR ?6 IS NULL)
+                GROUP BY h.node_id ORDER BY combined_score LIMIT ?4
             ),
             graph_context AS (
                 SELECT node_id FROM ranked_matches
@@ -342,6 +379,7 @@ impl MemoryRepository for SqliteMemoryRepository {
                     time_filter.after,
                     time_filter.before,
                     &ccl_json,
+                    knn_k(limit),
                 ],
                 |row| {
                     Ok((
@@ -517,14 +555,7 @@ impl MemoryRepository for SqliteMemoryRepository {
         tenant_id: &TenantId,
         threshold: f64,
         limit: usize,
-    ) -> Result<Vec<MemoryNode>> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
-
+    ) -> Result<Vec<(MemoryNode, f64)>> {
         let query = "
             SELECT n.id, n.tenant_id, n.source_episode_id, n.payload, n.status, n.ccl, n.is_explicit, n.support_count, n.relevance_score, n.context_key, v.distance
             FROM vec_nodes v
@@ -532,16 +563,23 @@ impl MemoryRepository for SqliteMemoryRepository {
             WHERE v.embedding MATCH ?1 AND k = ?2
               AND n.tenant_id = ?3 AND n.status = 'active'
               AND v.distance <= ?4
-            ORDER BY v.distance ASC;
+            ORDER BY v.distance ASC
+            LIMIT ?5;
         ";
 
         let mut stmt = self.conn.prepare(query)?;
 
         let node_iter = stmt.query_map(
-            params![embedding_bytes, limit as i64, tenant_id.0, threshold],
+            params![
+                vec_bytes(embedding),
+                knn_k(limit),
+                tenant_id.0,
+                threshold,
+                limit as i64
+            ],
             |row| {
                 let payload_str: String = row.get(3)?;
-                Ok(MemoryNode {
+                let node = MemoryNode {
                     id: Some(row.get(0)?),
                     tenant_id: TenantId(row.get(1)?),
                     source_episode_id: row.get::<_, Option<i64>>(2)?,
@@ -552,16 +590,12 @@ impl MemoryRepository for SqliteMemoryRepository {
                     support_count: row.get(7)?,
                     relevance_score: row.get(8)?,
                     context_key: row.get(9)?,
-                })
+                };
+                Ok((node, row.get::<_, f64>(10)?))
             },
         )?;
 
-        let mut results = Vec::new();
-        for node in node_iter {
-            results.push(node?);
-        }
-
-        Ok(results)
+        Ok(node_iter.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn update_node_support(
@@ -584,20 +618,62 @@ impl MemoryRepository for SqliteMemoryRepository {
         Ok(())
     }
 
+    fn update_node_content(
+        &self,
+        node_id: i64,
+        payload: &serde_json::Value,
+        embedding: &[f32],
+    ) -> Result<()> {
+        let payload_json = serde_json::to_string(payload)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let status: String = tx.query_row(
+            "SELECT status FROM nodes WHERE id = ?1",
+            params![node_id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE nodes SET support_count = support_count + 1, relevance_score = 1.0, updated_at = CURRENT_TIMESTAMP, payload = ?1 WHERE id = ?2",
+            params![payload_json, node_id],
+        )?;
+        // The text changed, so the vector must follow it — a stale embedding
+        // would keep matching the *old* meaning (ARC-2/DEV-10).
+        tx.execute("DELETE FROM vec_nodes WHERE node_id = ?1", params![node_id])?;
+        if status == "active" && is_indexable(embedding) {
+            tx.execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?1, ?2)",
+                params![node_id, vec_bytes(embedding)],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn delete_tenant(&self, tenant_id: &TenantId) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
 
+        // FK-safe order (foreign_keys = ON): edges touching the tenant's nodes
+        // in either direction, then vectors, nodes, episodes, and finally the
+        // tenant's CCL registry (DEV-2/QA-3).
+        tx.execute(
+            "DELETE FROM edges
+             WHERE source_id IN (SELECT id FROM nodes WHERE tenant_id = ?1)
+                OR target_id IN (SELECT id FROM nodes WHERE tenant_id = ?1)",
+            params![tenant_id.0],
+        )?;
         tx.execute(
             "DELETE FROM vec_nodes WHERE node_id IN (SELECT id FROM nodes WHERE tenant_id = ?1)",
             params![tenant_id.0],
         )?;
-
         tx.execute(
             "DELETE FROM nodes WHERE tenant_id = ?1",
             params![tenant_id.0],
         )?;
         tx.execute(
             "DELETE FROM episodes WHERE tenant_id = ?1",
+            params![tenant_id.0],
+        )?;
+        tx.execute(
+            "DELETE FROM ccl_registry WHERE tenant_id = ?1",
             params![tenant_id.0],
         )?;
 
@@ -667,6 +743,11 @@ impl MemoryRepository for SqliteMemoryRepository {
                 "UPDATE nodes SET relevance_score = ?1, status = ?2, last_decayed_at = CURRENT_TIMESTAMP WHERE id = ?3",
                 params![new_score, new_status, id],
             )?;
+            // Archival is terminal in STM: drop the vector so archived nodes
+            // stop consuming KNN slots (ARC-17).
+            if new_status == "archived" {
+                tx.execute("DELETE FROM vec_nodes WHERE node_id = ?1", params![id])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1062,12 +1143,12 @@ mod tests {
         // Reading nearest to emb_a returns the note with its key preserved.
         let near_a = repo.find_similar_nodes(&emb_a, &tenant, 2.0, 1).unwrap();
         assert_eq!(near_a.len(), 1);
-        assert_eq!(near_a[0].context_key.as_deref(), Some("chat.jid:123"));
+        assert_eq!(near_a[0].0.context_key.as_deref(), Some("chat.jid:123"));
 
         // Reading nearest to emb_b returns the knowledge node with NULL key.
         let near_b = repo.find_similar_nodes(&emb_b, &tenant, 2.0, 1).unwrap();
         assert_eq!(near_b.len(), 1);
-        assert_eq!(near_b[0].context_key, None);
+        assert_eq!(near_b[0].0.context_key, None);
     }
 
     #[test]
@@ -1591,5 +1672,305 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM keep", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ltm_rows, 1, "LTM store survives a soft reset");
+    }
+}
+
+/// Phase 1 regressions (review findings DEV-2/QA-3, DEV-8, ARC-17, ARC-2).
+#[cfg(test)]
+mod phase1_regression_tests {
+    use super::*;
+    use crate::domain::models::{CclDefinition, Edge, SessionId, TimeFilter};
+    use crate::infrastructure::database::init_db;
+    use crate::infrastructure::schema::init_schema;
+    use serde_json::json;
+
+    fn repo() -> SqliteMemoryRepository {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&conn, 4).unwrap();
+        SqliteMemoryRepository::new(conn)
+    }
+
+    fn node(tenant: &str, payload: serde_json::Value, status: &str) -> MemoryNode {
+        MemoryNode {
+            id: None,
+            tenant_id: TenantId(tenant.into()),
+            source_episode_id: None,
+            payload,
+            status: status.into(),
+            ccl: "reality".into(),
+            is_explicit: false,
+            support_count: 1,
+            relevance_score: 1.0,
+            context_key: None,
+        }
+    }
+
+    fn fact(tenant: &str, text: &str) -> MemoryNode {
+        node(tenant, json!({ "fact": text }), "active")
+    }
+
+    fn count(repo: &SqliteMemoryRepository, sql: &str) -> i64 {
+        repo.conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn edge(source_id: i64, target_id: i64) -> Edge {
+        Edge {
+            source_id,
+            target_id,
+            relation: "knows".into(),
+            ccl: "reality".into(),
+            valid_from: None,
+            valid_until: None,
+            weight: 1.0,
+        }
+    }
+
+    fn search(repo: &SqliteMemoryRepository, tenant: &str, k: usize) -> Vec<MemoryResult> {
+        repo.query_with_graph(
+            "zzz",
+            &[1.0, 0.0, 0.0, 0.0],
+            &TenantId(tenant.into()),
+            &TimeFilter::default(),
+            &["reality".to_string()],
+            k,
+        )
+        .unwrap()
+    }
+
+    /// DEV-2/QA-3: a tenant with edges (both directions, incl. an edge whose
+    /// source is another tenant's node pointing in) is fully erased — edges,
+    /// vectors, nodes, episodes, CCL registry — and nothing of tenant B is lost.
+    #[test]
+    fn delete_tenant_with_edges_removes_everything_and_spares_others() {
+        let r = repo();
+        let ep = r
+            .store_episode(&Episode {
+                id: None,
+                tenant_id: TenantId("A".into()),
+                session_id: SessionId("s".into()),
+                raw_dialogue: "hi".into(),
+                ccl: "reality".into(),
+                created_at: None,
+            })
+            .unwrap();
+        let mut a1 = fact("A", "alice");
+        a1.source_episode_id = Some(ep);
+        let a1 = r.store_node(&a1, &[0.1, 0.0, 0.0, 0.0]).unwrap();
+        let a2 = r
+            .store_node(&fact("A", "bob"), &[0.2, 0.0, 0.0, 0.0])
+            .unwrap();
+        let b1 = r
+            .store_node(&fact("B", "carol"), &[0.3, 0.0, 0.0, 0.0])
+            .unwrap();
+        let b2 = r
+            .store_node(&fact("B", "dave"), &[0.4, 0.0, 0.0, 0.0])
+            .unwrap();
+        r.store_edge(&edge(a1, a2)).unwrap(); // A -> A
+        r.store_edge(&edge(a2, a1)).unwrap(); // reverse direction
+        r.store_edge(&edge(b1, b2)).unwrap(); // B -> B (must survive)
+        for t in ["A", "B"] {
+            r.store_ccl_definition(&CclDefinition {
+                id: None,
+                tenant_id: TenantId(t.into()),
+                name: "dream".into(),
+                description: "d".into(),
+            })
+            .unwrap();
+        }
+
+        r.delete_tenant(&TenantId("A".into()))
+            .expect("delete_tenant must succeed with edges present");
+
+        assert_eq!(
+            count(&r, "SELECT COUNT(*) FROM nodes WHERE tenant_id='A'"),
+            0
+        );
+        assert_eq!(
+            count(&r, "SELECT COUNT(*) FROM episodes WHERE tenant_id='A'"),
+            0
+        );
+        assert_eq!(
+            count(&r, "SELECT COUNT(*) FROM ccl_registry WHERE tenant_id='A'"),
+            0
+        );
+        assert_eq!(
+            count(
+                &r,
+                &format!("SELECT COUNT(*) FROM vec_nodes WHERE node_id IN ({a1},{a2})")
+            ),
+            0
+        );
+        // Tenant B is intact.
+        assert_eq!(
+            count(&r, "SELECT COUNT(*) FROM nodes WHERE tenant_id='B'"),
+            2
+        );
+        assert_eq!(count(&r, "SELECT COUNT(*) FROM edges"), 1);
+        assert_eq!(
+            count(&r, "SELECT COUNT(*) FROM ccl_registry WHERE tenant_id='B'"),
+            1
+        );
+    }
+
+    /// DEV-8: `k` above 5 is honoured (the old hard-coded `LIMIT 5` capped it).
+    #[test]
+    fn query_with_graph_honours_k_above_five() {
+        let r = repo();
+        for i in 0..10 {
+            r.store_node(
+                &fact("A", &format!("fact{i}")),
+                &[1.0, i as f32 * 0.01, 0.0, 0.0],
+            )
+            .unwrap();
+        }
+        assert_eq!(search(&r, "A", 10).len(), 10);
+        assert_eq!(search(&r, "A", 3).len(), 3);
+    }
+
+    /// ARC-17: zero-vector graph anchors are not indexed, so a crowd of them
+    /// can't push the real (farther) match out of the KNN top-k.
+    #[test]
+    fn zero_vector_anchors_do_not_starve_recall() {
+        let r = repo();
+        for i in 0..12 {
+            r.store_node(
+                &node(
+                    "A",
+                    json!({ "fact": format!("anchor{i}"), "kind": "subject" }),
+                    "active",
+                ),
+                &[0.0; 4],
+            )
+            .unwrap();
+        }
+        r.store_node(&fact("A", "the real fact"), &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+
+        assert_eq!(count(&r, "SELECT COUNT(*) FROM vec_nodes"), 1);
+        let out = search(&r, "A", 5);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].fact, "the real fact");
+    }
+
+    /// ARC-17: archived nodes are never indexed, and a sweep that archives a
+    /// node drops its vector — so archived rows can't consume top-k slots.
+    #[test]
+    fn archived_nodes_leave_the_vector_index() {
+        let r = repo();
+        for i in 0..12 {
+            r.store_node(
+                &node("A", json!({ "fact": format!("old{i}") }), "archived"),
+                &[1.0, 0.0, 0.0, 0.0],
+            )
+            .unwrap();
+        }
+        let live = r
+            .store_node(&fact("A", "live fact"), &[0.9, 0.3, 0.0, 0.0])
+            .unwrap();
+        assert_eq!(count(&r, "SELECT COUNT(*) FROM vec_nodes"), 1);
+        assert_eq!(search(&r, "A", 5).len(), 1);
+
+        // A sweep that archives the live node removes its vector too.
+        r.conn
+            .execute(
+                "UPDATE nodes SET relevance_score = 0.05 WHERE id = ?1",
+                params![live],
+            )
+            .unwrap();
+        r.sweep_decay(&crate::domain::decay::DecayEngine::new(7.0))
+            .unwrap();
+        assert_eq!(count(&r, "SELECT COUNT(*) FROM vec_nodes"), 0);
+    }
+
+    /// ARC-17: re-initialising the schema purges vectors that older stores kept
+    /// for archived nodes and `subject` anchors.
+    #[test]
+    fn init_schema_purges_legacy_unindexable_vectors() {
+        let r = repo();
+        let anchor = r
+            .store_node(
+                &node(
+                    "A",
+                    json!({ "fact": "anchor", "kind": "subject" }),
+                    "active",
+                ),
+                &[0.0; 4],
+            )
+            .unwrap();
+        let old = r
+            .store_node(&fact("A", "old"), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let keep = r
+            .store_node(&fact("A", "keep"), &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        // Simulate a legacy store: anchor vector present, `old` archived with vector.
+        r.conn
+            .execute(
+                "INSERT INTO vec_nodes(node_id, embedding) VALUES (?1, ?2)",
+                params![anchor, vec_bytes(&[0.0; 4])],
+            )
+            .unwrap();
+        r.conn
+            .execute(
+                "UPDATE nodes SET status = 'archived' WHERE id = ?1",
+                params![old],
+            )
+            .unwrap();
+        assert_eq!(count(&r, "SELECT COUNT(*) FROM vec_nodes"), 3);
+
+        init_schema(&r.conn, 4).unwrap();
+
+        assert_eq!(
+            count(&r, "SELECT COUNT(*) FROM vec_nodes"),
+            1,
+            "only the active, embedded node stays indexed"
+        );
+        assert_eq!(
+            count(
+                &r,
+                &format!("SELECT COUNT(*) FROM vec_nodes WHERE node_id = {keep}")
+            ),
+            1
+        );
+    }
+
+    /// ARC-2/DEV-10: `update_node_content` replaces the vector with the payload,
+    /// so the node is found by its new meaning and no longer by its old one.
+    #[test]
+    fn update_node_content_reembeds() {
+        let r = repo();
+        let id = r
+            .store_node(&fact("A", "old text"), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        r.update_node_content(id, &json!({ "fact": "new text" }), &[0.0, 0.0, 1.0, 0.0])
+            .unwrap();
+
+        let near_new = r
+            .find_similar_nodes(&[0.0, 0.0, 1.0, 0.0], &TenantId("A".into()), 0.01, 1)
+            .unwrap();
+        assert_eq!(near_new.len(), 1);
+        assert_eq!(near_new[0].0.payload["fact"], "new text");
+        let near_old = r
+            .find_similar_nodes(&[1.0, 0.0, 0.0, 0.0], &TenantId("A".into()), 0.01, 1)
+            .unwrap();
+        assert!(near_old.is_empty(), "the stale vector must be gone");
+    }
+
+    /// DEV-4 mitigation: `find_similar_nodes` over-fetches, so nearer nodes of
+    /// another tenant don't hide this tenant's match.
+    #[test]
+    fn find_similar_nodes_survives_other_tenant_crowding() {
+        let r = repo();
+        for i in 0..3 {
+            r.store_node(&fact("B", &format!("b{i}")), &[1.0, 0.0, 0.0, 0.0])
+                .unwrap();
+        }
+        r.store_node(&fact("A", "mine"), &[0.9, 0.1, 0.0, 0.0])
+            .unwrap();
+        let hits = r
+            .find_similar_nodes(&[1.0, 0.0, 0.0, 0.0], &TenantId("A".into()), 2.0, 1)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.payload["fact"], "mine");
     }
 }

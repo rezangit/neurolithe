@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Optional git pre-commit hook: runs the quick quality gate (fmt, clippy, and
+# tests for the default features). The full gate, including kafka, is
+# scripts/check.sh.
+#
+# Install:  ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
+# Bypass once:  git commit --no-verify
+set -euo pipefail
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/scripts/check.sh" --quick

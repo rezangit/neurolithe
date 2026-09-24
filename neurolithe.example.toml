@@ -1,0 +1,78 @@
+# NeuroLithe configuration — example.
+#
+# Copy to `neurolithe.toml` (git-ignored) and adjust:
+#     cp neurolithe.example.toml neurolithe.toml
+#
+# Every value can also be set by an environment variable using the
+# `NEUROLITHE__<SECTION>__<KEY>` form, e.g. NEUROLITHE__LLM__PROVIDER=gemini.
+# API keys come from the environment (or a `.env` file), never from this file:
+#   OPENAI_API_KEY / GEMINI_API_KEY / ANTHROPIC_API_KEY, or NEUROLITHE_API_KEY.
+
+[llm]
+# Chat model, used for fact extraction and context compression.
+# Providers: "openai", "gemini", "anthropic", "custom" (any OpenAI-compatible API).
+provider = "openai"
+model = "gpt-4o-mini"
+
+# Embedding model. It must match `vector_dimension` in [stm] and [ltm] below.
+# text-embedding-3-small returns 1536-dim vectors.
+embedding_model = "text-embedding-3-small"
+# Optional: a separate embeddings provider. It is required when `provider` is
+# "anthropic", because Claude has no embeddings endpoint.
+# embedding_provider = "openai"
+# embedding_base_url = "https://api.openai.com/v1"
+
+# --- Fully local / offline via Ollama (no API key needed) ---
+# provider = "custom"
+# model = "llama3.1"
+# base_url = "http://localhost:11434/v1"
+# embedding_provider = "custom"
+# embedding_model = "nomic-embed-text"          # 768-dim, so set both dimensions to 768
+# embedding_base_url = "http://localhost:11434/v1"
+
+# --- Anthropic chat + OpenAI embeddings ---
+# provider = "anthropic"
+# model = "claude-sonnet-5"
+# embedding_provider = "openai"
+# embedding_model = "text-embedding-3-small"    # 1536-dim
+
+# --- Google Gemini ---
+# provider = "gemini"
+# model = "gemini-2.5-flash"
+# embedding_model = "text-embedding-004"        # 768-dim, so set both dimensions to 768
+
+# --- Memory stores ---
+# STM = decaying short-term working memory. LTM = permanent long-term knowledge tree.
+# `vector_dimension` is locked when a store file is created. It must equal the
+# embedding model's output size. Changing it later means deleting the file.
+# Relative paths resolve against the process working directory, so absolute
+# paths are safer when an MCP client launches the server.
+[stm]
+path = "neurolithe-stm.sqlite"
+vector_dimension = 1536
+
+[ltm]
+path = "neurolithe-ltm.sqlite"
+vector_dimension = 1536
+
+# --- Forgetting curve (STM only) ---
+[decay]
+default_half_life_days = 7.0
+working_half_life_minutes = 30.0
+
+# --- Optional: Kafka daemon (only in builds with `--features kafka`) ---
+# [kafka]
+# brokers = "localhost:9092"
+# group_id = "neurolithe"
+#
+# [sweep]
+# interval_secs = 300
+#
+# [metrics]
+# interval_secs = 60
+#
+# [feeder]
+# enabled = false
+#
+# [bus_query]
+# enabled = false
