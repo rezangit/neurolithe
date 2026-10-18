@@ -7,11 +7,16 @@ All notable changes to NeuroLithe are documented here. Format loosely follows
 
 ### Fixed
 
-- Kafka mode: the command consumer (`<group_id>-cmd`) now starts at the end of
-  `memory.command` when its group has no committed offset (first start, a
-  renamed group, or offsets the broker expired). Before, it replayed every
-  retained command, so an old `reset_soft`, `forget` or `remember` could run
-  again against the current memory.
+- Kafka mode: the command consumer (`<group_id>-cmd`) no longer replays old
+  commands. Before, a group without a committed offset (first start, a renamed
+  group, or offsets the broker expired) read `memory.command` from the
+  beginning, so an old `reset_soft`, `forget` or `remember` could run again
+  against the current memory. Now, before joining, such a group starts at the
+  end of the topic and commits that position, so a later restart still applies
+  the commands sent while the daemon was down. A group that already has
+  committed offsets is left as it is. The startup log names the command group
+  and where each partition starts. If the topic doesn't exist yet, or the
+  position can't be read, a warning is logged and the daemon starts anyway.
 
 ### Added
 

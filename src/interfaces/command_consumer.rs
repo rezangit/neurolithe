@@ -197,20 +197,35 @@ pub fn describe_command_start(group: &str, topic: &str, plan: &[(i32, StartPosit
     )
 }
 
+/// The topic's partitions, or an error when it has none (the topic doesn't
+/// exist yet): the caller logs a warning and the daemon starts anyway.
+fn require_partitions(topic: &str, partitions: Vec<i32>) -> Result<Vec<i32>> {
+    if partitions.is_empty() {
+        anyhow::bail!("topic '{topic}' not found (or it has no partitions)");
+    }
+    Ok(partitions)
+}
+
 /// Read each partition's committed offset and end offset for the command
 /// group, commit the end for partitions without an offset, and log the plan.
-/// Blocking (broker round trips); runs before the group is joined.
+/// Partitions that already have a committed offset are left untouched.
+/// Blocking (broker round trips). It runs before this consumer subscribes, so
+/// the commit can't race its own join; if another member already holds the
+/// group, the broker rejects the commit and the caller logs a warning.
 fn pin_command_start(consumer: &StreamConsumer, group: &str, topic: &str) -> Result<String> {
     let timeout = Timeout::After(START_PROBE_TIMEOUT);
     let metadata = consumer
         .fetch_metadata(Some(topic), timeout)
         .context("reading topic metadata")?;
-    let partitions: Vec<i32> = metadata
-        .topics()
-        .iter()
-        .filter(|t| t.name() == topic)
-        .flat_map(|t| t.partitions().iter().map(|p| p.id()))
-        .collect();
+    let partitions = require_partitions(
+        topic,
+        metadata
+            .topics()
+            .iter()
+            .filter(|t| t.name() == topic && t.error().is_none())
+            .flat_map(|t| t.partitions().iter().map(|p| p.id()))
+            .collect(),
+    )?;
     let mut tpl = TopicPartitionList::new();
     for p in &partitions {
         tpl.add_partition(topic, *p);
@@ -249,6 +264,32 @@ fn pin_command_start(consumer: &StreamConsumer, group: &str, topic: &str) -> Res
 
 /// Per broker call while probing the command group's start position.
 const START_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Probe attempts, and the pause between them. A group's first request on a
+/// fresh cluster can fail with a transient `NotCoordinator` while the broker
+/// creates its offsets topic.
+const START_PROBE_ATTEMPTS: u32 = 5;
+const START_PROBE_PAUSE: Duration = Duration::from_secs(1);
+
+/// Run `f` up to `attempts` times (blocking `pause` in between), returning its
+/// first success or the last error.
+fn retry_blocking<T>(
+    attempts: u32,
+    pause: Duration,
+    mut f: impl FnMut() -> Result<T>,
+) -> Result<T> {
+    let mut attempt = 1;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt >= attempts => return Err(e),
+            Err(e) => {
+                tracing::debug!("command start probe attempt {attempt}/{attempts} failed: {e:#}");
+                std::thread::sleep(pause);
+                attempt += 1;
+            }
+        }
+    }
+}
 
 impl CommandConsumer {
     pub fn new(
@@ -292,8 +333,12 @@ impl CommandConsumer {
             self.group.clone(),
             self.topic.clone(),
         );
-        match tokio::task::spawn_blocking(move || pin_command_start(&consumer, &group, &topic))
-            .await
+        match tokio::task::spawn_blocking(move || {
+            retry_blocking(START_PROBE_ATTEMPTS, START_PROBE_PAUSE, || {
+                pin_command_start(&consumer, &group, &topic)
+            })
+        })
+        .await
         {
             Ok(Ok(line)) => tracing::info!("{line}"),
             Ok(Err(e)) => tracing::warn!(
@@ -467,5 +512,40 @@ mod tests {
              resumes at offset 12; partition 1 had no committed offset, starts at \
              the end (offset 3; older commands are skipped)"
         );
+    }
+
+    /// The start probe is retried on transient errors (e.g. `NotCoordinator`
+    /// on a group's first request) and gives up after the last attempt.
+    #[test]
+    fn test_retry_blocking() {
+        let mut calls = 0;
+        let ok = retry_blocking(5, Duration::ZERO, || {
+            calls += 1;
+            if calls < 3 {
+                anyhow::bail!("NotCoordinator")
+            }
+            Ok(calls)
+        });
+        assert_eq!(ok.unwrap(), 3);
+
+        let mut calls = 0;
+        let err = retry_blocking(4, Duration::ZERO, || -> Result<()> {
+            calls += 1;
+            anyhow::bail!("down {calls}")
+        });
+        assert_eq!(err.unwrap_err().to_string(), "down 4");
+        assert_eq!(calls, 4);
+    }
+
+    /// A missing commands topic is an error for the probe (logged as a
+    /// warning), not a silent empty plan.
+    #[test]
+    fn test_require_partitions() {
+        assert_eq!(
+            require_partitions("memory.command", vec![0, 1]).unwrap(),
+            vec![0, 1]
+        );
+        let err = require_partitions("memory.command", vec![]).unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err}");
     }
 }

@@ -87,10 +87,14 @@ redelivered event does no harm.
   beginning. A message that was being handled when the reset arrived isn't
   committed afterwards.
 - **Commands are not replayed.** The documents topic is a replay source, but
-  `memory.command` is not: when the command group (`<group_id>-cmd`) has no
-  committed offset (first start, a new `group_id`, or offsets the broker
-  expired after `offsets.retention.minutes`), it starts at the end of the
-  topic. Commands sent while it has no offset yet are skipped.
+  `memory.command` is not. When the command group (`<group_id>-cmd`) has no
+  committed offset, it starts at the end of the topic and commits that
+  position at once. That happens on a first start, with a new `group_id`, and
+  after the broker expires the offsets (`offsets.retention.minutes`). Commands
+  already on the topic are skipped. After that, a restart resumes where the
+  group stopped, so commands sent while the daemon was down are still applied.
+  The startup log shows where each partition starts:
+  `command consumer: group '<group_id>-cmd' on 'memory.command': partition 0 resumes at offset N`.
 - **Tombstones** are idempotent too. Forgetting a `data_id` that is unknown
   or already forgotten succeeds.
 
@@ -169,7 +173,7 @@ key is read as a dot. That lets secrets come from the environment:
      `parking.lot` again.
    - The commands group (`<group_id>-cmd`) starts at the end of
      `memory.command` when it has no committed offset, so old commands are
-     never replayed.
+     never replayed (see [Redelivery and offsets](#redelivery-and-offsets)).
    - **0.4.1 and earlier replayed every retained command in that case.** That
      included `reset_soft`, which needs no token and wipes STM. On those
      versions, pin the commands group to the end of the topic before the first
@@ -205,12 +209,20 @@ key is read as a dot. That lets secrets come from the environment:
 - **The log** shows any store migrations, with their backup paths, and
   `daemon running (workspace: …, feeder: true, …)`.
 - **The group drains:** `kafka-consumer-groups.sh --describe --group
-  <group_id>` shows the lag falling to 0 on every partition.
+  <group_id>` shows the lag falling to 0 on every partition. After a crash
+  (rather than a clean stop), the broker keeps the dead member until its
+  session times out (45 s by default), so the restarted daemon can wait that
+  long before it gets its partitions back.
 - **The data is there:** MCP `inspect` with `view: "stats"` shows the expected
   counts, and `view: "trace"` with a known `data_id` shows one leaf and one STM
   fact.
+- **The commands group** is logged as
+  `command consumer: group '<group_id>-cmd' on 'memory.command': …`, with each
+  partition's start: it resumes at an offset, or starts at the end.
 - **No unexplained errors:** `dlq.memory` and `parking.lot` get no new
-  entries, or each new entry's `x-reason` header explains it.
+  entries, or each new entry's `x-reason` header explains it. After a hard
+  reset, the replay forwards earlier poison messages to `dlq.memory` and
+  `parking.lot` again, so those topics can hold the same message twice.
 
 ### Rollback
 
