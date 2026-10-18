@@ -3,6 +3,35 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.4.2] — 2026-10-18
+
+### Fixed
+
+- Kafka mode: the command consumer (`<group_id>-cmd`) no longer replays old
+  commands. Before, a group without a committed offset (first start, a renamed
+  group, or offsets the broker expired) read `memory.command` from the
+  beginning, so an old `reset_soft`, `forget` or `remember` could run again
+  against the current memory. Now, before joining, such a group starts at the
+  end of the topic and commits that position, so a later restart still applies
+  the commands sent while the daemon was down. A group that already has
+  committed offsets is left as it is. The startup log names the command group
+  and where each partition starts. If the topic doesn't exist yet, or the
+  position can't be read, a warning is logged and the daemon starts anyway.
+
+### Documentation
+
+- Corrected the 0.4.0 notes: a redelivered pre-0.4.0 document is fully
+  reprocessed once (summary, embedding, placement and STM fact), not only
+  given its full text. Thanks to the user report.
+
+### Added
+
+- An "Operating and upgrading" section in the Kafka docs covers consumer
+  groups, topics and keying, test instances, post-start checks and rollback.
+  Kafka mode was tested against a real broker: ingest, duplicates, changed and
+  deleted documents, crashes and SIGTERM mid-burst, poison messages, hard
+  reset, a rebalance, and an upgrade from 0.3.0 with rollback.
+
 ## [0.4.1] — 2026-10-17
 
 ### Changed
@@ -51,6 +80,22 @@ adds a full-text index of documents. LTM never stored a document's full text
 before, so existing documents are indexed by their title and summary only.
 To make one searchable by its full text, send it again with
 `remember_document` and the same `data_id` (or re-send its Kafka event).
+
+Kafka mode: documents stored by 0.3.x have no content fingerprint, so the
+first redelivery of each one after the upgrade is not recognised as a
+duplicate. That includes a replay of the documents topic with a new
+`group_id`. Each such document is reprocessed once, as if it had changed:
+- it is summarised again (a chat-model call, if one is configured) and
+  embedded again;
+- it is filed again under the current placement rules, so it may move to
+  another branch;
+- its STM fact is replaced by a fresh one, which resets that fact's decay
+  and relevance, makes it active again if it had been archived, and drops
+  graph links other facts had to it.
+
+After that, redeliveries of the same content are free. Budget for one full
+ingest per old document if you replay the topic.
+
 Both migrations are one-way: 0.3.x refuses the new stores, so to go back,
 restore both backups made at migration.
 
@@ -144,11 +189,13 @@ restore both backups made at migration.
 - `forget` removes a document's stored full text too, even when the
   document was never filed.
 - Kafka ingest is idempotent. Document events upsert by `data_id`: a
-  redelivered event adds nothing (it only fills in the full text of a
-  document stored before the upgrade), and a changed event replaces the stored
+  redelivered event adds nothing, and a changed event replaces the stored
   version in both stores instead of adding a second LTM leaf and STM fact. A
   crash between the two stores' writes is repaired when the event is
-  redelivered.
+  redelivered. Documents stored before 0.4.0 carry no content fingerprint,
+  so the first redelivery of each one after the upgrade (for example a
+  replay with a new `group_id`) fully reprocesses it once; see *Upgrading
+  from 0.3.x*.
 - The Kafka documents feeder commits an offset only once the message is
   written or forwarded to `dlq`/`parking`. A failed forward is retried instead
   of skipped, and shutdown no longer commits a message that wasn't handled.

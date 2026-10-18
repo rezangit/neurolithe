@@ -86,6 +86,15 @@ redelivered event does no harm.
   so a restart before the replay commits anything still replays from the
   beginning. A message that was being handled when the reset arrived isn't
   committed afterwards.
+- **Commands are not replayed.** The documents topic is a replay source, but
+  `memory.command` is not. When the command group (`<group_id>-cmd`) has no
+  committed offset, it starts at the end of the topic and commits that
+  position at once. That happens on a first start, with a new `group_id`, and
+  after the broker expires the offsets (`offsets.retention.minutes`). Commands
+  already on the topic are skipped. After that, a restart resumes where the
+  group stopped, so commands sent while the daemon was down are still applied.
+  The startup log shows where each partition starts:
+  `command consumer: group '<group_id>-cmd' on 'memory.command': partition 0 resumes at offset N`.
 - **Tombstones** are idempotent too. Forgetting a `data_id` that is unknown
   or already forgotten succeeds.
 
@@ -133,3 +142,107 @@ key is read as a dot. That lets secrets come from the environment:
   topic. It is disabled unless `NEUROLITHE_RESET_TOKEN` is set to at least 16
   characters. A `reset_hard` command must carry `"confirm": "<that token>"`, and
   the comparison is constant-time.
+
+## Operating and upgrading
+
+### Before the first start
+
+1. **Back up.** Stop the old instance (SIGTERM), then copy its home directory:
+   the workspaces, `.env` and `neurolithe.toml`. An upgrade also backs up each
+   store before migrating it (`stm.sqlite.bak-v<N>-<ts>`,
+   `ltm.sqlite.bak-v<N>-<ts>`), but keep your own copy.
+2. **Build with Kafka:** `cargo install --path . --features kafka`, or the
+   repository `Dockerfile`.
+3. **Create the topics.** They are not created automatically:
+   - `document.completed`
+   - `memory.command`
+   - `memory.query`
+   - `memory.result`
+   - `dlq.memory`
+   - `parking.lot`
+   - `memory.metrics` (compacted)
+
+   Producers must **key document events by `data_id`**. Tombstones need the
+   key, and keying keeps every version of a document in order on one
+   partition.
+4. **Choose the consumer group (`[kafka] group_id`).**
+   - Keep the old `group_id` to resume where the previous instance stopped.
+   - A new `group_id` replays the whole documents topic from the start. That's
+     safe, because ingest is idempotent, and earlier poison messages are
+     forwarded to `dlq.memory` / `parking.lot` again.
+     - Documents stored by 0.4.0 or later are recognised by their content
+       fingerprint and skipped at almost no cost.
+     - **Documents stored by 0.3.x have no fingerprint, so each one is fully
+       reprocessed once.** It is summarised again (a chat-model call, if
+       configured), embedded again and filed again under the current
+       placement rules. Its STM fact is also replaced by a fresh one, which
+       resets its decay, makes it active again if it had been archived, and
+       drops graph links other facts had to it.
+     - On a store upgraded from 0.3.x, budget one full ingest per old
+       document for a replay.
+   - The commands group (`<group_id>-cmd`) starts at the end of
+     `memory.command` when it has no committed offset, so old commands are
+     never replayed (see [Redelivery and offsets](#redelivery-and-offsets)).
+   - **0.4.1 and earlier replayed every retained command in that case.** That
+     included `reset_soft`, which needs no token and wipes STM. On those
+     versions, pin the commands group to the end of the topic before the first
+     start, and after any outage longer than the broker's
+     `offsets.retention.minutes`:
+     ```sh
+     kafka-consumer-groups.sh --bootstrap-server <broker> --group <group_id>-cmd \
+       --topic memory.command --reset-offsets --to-latest --execute
+     ```
+5. **Use the embedder the stores were written with.** It is recorded in each
+   store, and a change needs `neurolithe reembed`. With local embeddings, the
+   first start downloads about 130 MB into `<home>/models`.
+6. **Hard reset.** Leave `NEUROLITHE_RESET_TOKEN` unset unless you need hard
+   reset. `reset_soft` needs no token, so restrict who can produce to
+   `memory.command`; see [Security](#security).
+7. **Shutdown grace.** Give the process or container at least 15 s
+   (`stop_grace_period`). SIGTERM drains the in-flight message and commits its
+   offset.
+
+### Test instances
+
+- **Never** start a test instance against production topics with the
+  production `group_id`. It joins the group, takes partitions away from the
+  production instance, and files those documents into its own store.
+- A test instance with a different `group_id` replays the whole documents
+  topic into its own store.
+- For anything that isn't production, use a separate broker, or separate topic
+  names (`[kafka.topics]`) and a separate `group_id`.
+- Run exactly one daemon per `group_id` and workspace.
+
+### After the start
+
+- **The log** shows any store migrations, with their backup paths, and
+  `daemon running (workspace: …, feeder: true, …)`.
+- **The group drains:** `kafka-consumer-groups.sh --describe --group
+  <group_id>` shows the lag falling to 0 on every partition. After a crash
+  (rather than a clean stop), the broker keeps the dead member until its
+  session times out (45 s by default), so the restarted daemon can wait that
+  long before it gets its partitions back.
+- **The data is there:** MCP `inspect` with `view: "stats"` shows the expected
+  counts, and `view: "trace"` with a known `data_id` shows one leaf and one STM
+  fact.
+- **The commands group** is logged as
+  `command consumer: group '<group_id>-cmd' on 'memory.command': …`, with each
+  partition's start: it resumes at an offset, or starts at the end.
+- **No unexplained errors:** `dlq.memory` and `parking.lot` get no new
+  entries, or each new entry's `x-reason` header explains it. After a hard
+  reset, the replay forwards earlier poison messages to `dlq.memory` and
+  `parking.lot` again, so those topics can hold the same message twice.
+
+### Rollback
+
+1. Stop the new version (SIGTERM).
+2. An older version refuses a migrated store ("schema version … supports up
+   to …"). Put the automatic backups back in place of `stm.sqlite` and
+   `ltm.sqlite`, and delete any `-wal`/`-shm` files next to them. Or restore
+   your own copy.
+3. Documents that arrived after the upgrade are still on the documents topic.
+   To re-ingest them, move the group back to the upgrade time with
+   `--reset-offsets --to-datetime <time>` on `document.completed`. Versions
+   before 0.4.0 don't ingest idempotently, so documents already in the backup
+   get duplicates.
+4. Commands sent after the upgrade are not replayed.
