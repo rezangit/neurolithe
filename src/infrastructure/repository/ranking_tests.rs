@@ -117,6 +117,7 @@ fn rrf_k_changes_how_much_agreement_counts() {
     let top = |rrf_k: f64| {
         let r = repo_with(Ranking {
             rrf_k,
+            keyword_weight: 1.0,
             leg_k_factor: 1,
             ..Ranking::default()
         });
@@ -197,8 +198,10 @@ fn scores_are_reported_only_when_enabled() {
     assert_eq!(facts(&hits), ["alpha", "beta", "neighbour"]);
     let (s0, s1) = (hits[0].score.unwrap(), hits[1].score.unwrap());
     assert!(s0 > s1, "{s0} > {s1}");
-    // alpha: vector 1st + keyword 1st = 2 / 61.
-    assert!((s0 - 2.0 / 61.0).abs() < 1e-9, "{s0}");
+    // alpha: vector 1st + keyword 1st.
+    let d = Ranking::default();
+    let expected = (d.vector_weight + d.keyword_weight) / (d.rrf_k + 1.0);
+    assert!((s0 - expected).abs() < 1e-9, "{s0} vs {expected}");
     assert_eq!(hits[2].score, None, "graph neighbours carry no score");
 }
 

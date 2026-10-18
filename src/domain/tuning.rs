@@ -52,8 +52,14 @@ pub struct Ranking {
     pub include_scores: bool,
 }
 
-/// Default RRF damping constant (the common choice from the RRF paper).
-pub const DEFAULT_RRF_K: f64 = 60.0;
+/// Default RRF damping constant. The RRF paper's 60 barely separates rank 1
+/// from rank 40 at our leg depths; a small constant ranked better on every
+/// search path in our retrieval evaluation.
+pub const DEFAULT_RRF_K: f64 = 5.0;
+/// Default keyword-leg weight. Slightly above the vector leg's 1.0 so that
+/// the two legs' top hits don't tie exactly, which otherwise always favoured
+/// the vector hit and cost rank-1 precision.
+pub const DEFAULT_KEYWORD_WEIGHT: f64 = 1.05;
 /// Default per-leg candidate list length, as a multiple of `k`.
 pub const DEFAULT_LEG_K_FACTOR: usize = 4;
 /// Largest accepted `leg_k_factor` (it multiplies the KNN breadth).
@@ -66,7 +72,7 @@ impl Default for Ranking {
         Self {
             rrf_k: DEFAULT_RRF_K,
             vector_weight: 1.0,
-            keyword_weight: 1.0,
+            keyword_weight: DEFAULT_KEYWORD_WEIGHT,
             leg_k_factor: DEFAULT_LEG_K_FACTOR,
             fts_stopwords: true,
             include_scores: false,
@@ -113,6 +119,19 @@ mod tests {
     #[test]
     fn default_ranking_is_valid() {
         assert!(Ranking::default().problems().is_empty());
+    }
+
+    /// The defaults chosen by the retrieval evaluation: a small `rrf_k`, and
+    /// a keyword weight just above the vector's so top hits don't tie.
+    #[test]
+    fn default_ranking_uses_the_evaluated_values() {
+        let r = Ranking::default();
+        assert_eq!(r.rrf_k, 5.0);
+        assert_eq!(r.vector_weight, 1.0);
+        assert_eq!(r.keyword_weight, 1.05);
+        assert_eq!(r.leg_k_factor, 4);
+        assert!(r.fts_stopwords);
+        assert!(!r.include_scores);
     }
 
     #[test]

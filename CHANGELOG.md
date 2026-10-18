@@ -3,6 +3,17 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.4.1] — 2026-10-17
+
+### Changed
+
+- New `[retrieval]` defaults: `rrf_k = 5` (was 60) and `keyword_weight = 1.05`
+  (was 1.0), for both `query_memory` and `recall_ltm`. In our retrieval
+  evaluation a small `rrf_k` ranked better on every search path. The slightly
+  higher keyword weight stops the two lists' top hits from tying exactly
+  (ties always went to the vector hit), which had cost rank-1 precision.
+  To keep 0.4.0's ranking, set `rrf_k = 60` and `keyword_weight = 1.0`.
+
 ## [0.4.0] — 2026-10-17
 
 **Better search.** `query_memory` and `recall_ltm` rank results by
@@ -100,7 +111,8 @@ restore both backups made at migration.
 ### Added
 
 - A `[retrieval]` config section tunes the ranking of both stores:
-  `rrf_k` (default 60), `vector_weight` and `keyword_weight` (1.0 each),
+  `rrf_k` (default 60), `vector_weight` and `keyword_weight` (1.0 each;
+  see 0.4.1 for the current defaults),
   `leg_k_factor` (4), `fts_stopwords` (true) and `include_scores` (false).
   Invalid values and unknown keys are rejected at startup.
 - With `[retrieval] include_scores = true`, `query_memory` and `recall_ltm`
