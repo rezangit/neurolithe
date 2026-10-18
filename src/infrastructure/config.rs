@@ -467,17 +467,17 @@ impl Default for DecayConfig {
     }
 }
 
-/// `[retrieval]`: how STM search ranks its hits (reciprocal rank fusion of
+/// `[retrieval]`: how STM and LTM search rank their hits (reciprocal rank fusion of
 /// the vector and keyword legs; see `domain::tuning::Ranking`). Every key is
 /// optional; the defaults are the tuned values.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct RetrievalConfig {
-    /// RRF damping constant (default 60).
+    /// RRF damping constant (default 5).
     pub rrf_k: f64,
     /// Weight of the vector (semantic) leg (default 1.0).
     pub vector_weight: f64,
-    /// Weight of the keyword (FTS5) leg (default 1.0).
+    /// Weight of the keyword (FTS5) leg (default 1.05).
     pub keyword_weight: f64,
     /// Each leg ranks `leg_k_factor × k` candidates (default 4).
     pub leg_k_factor: usize,
@@ -1334,7 +1334,7 @@ description = "Project work"
         assert_eq!(r.rrf_k, 20.0);
         assert_eq!(r.vector_weight, 2.0);
         assert!(r.include_scores);
-        assert_eq!(r.keyword_weight, 1.0);
+        assert_eq!(r.keyword_weight, 1.05);
         assert_eq!(r.leg_k_factor, 4);
         assert!(r.fts_stopwords);
         cfg.validate().unwrap();

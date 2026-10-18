@@ -70,9 +70,9 @@ provider = "none"
 # reciprocal rank fusion: a hit scores Σ weight / (rrf_k + rank) over the lists
 # it appears in. Every key is optional; these are the defaults.
 # [retrieval]
-# rrf_k = 60             # larger flattens the gap between top ranks (0–10000)
+# rrf_k = 5              # larger flattens the gap between top ranks (0–10000)
 # vector_weight = 1.0    # weight of the meaning (vector) list (>= 0)
-# keyword_weight = 1.0   # weight of the keyword list (>= 0; not both 0)
+# keyword_weight = 1.05  # weight of the keyword list (>= 0; not both 0)
 # leg_k_factor = 4       # each list ranks leg_k_factor × k candidates (1–50)
 # fts_stopwords = true   # drop English stop-words from the keyword query
 # include_scores = false # add each direct hit's fused `score` to results

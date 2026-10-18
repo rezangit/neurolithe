@@ -93,6 +93,27 @@ under either. For filing to work, define descriptive `[[ltm.spine]]` branches,
 each with a `description` of what belongs there. See also
 [Distance thresholds](#distance-thresholds).
 
+## Search ranking
+
+`query_memory` and `recall_ltm` each rank two lists: hits by meaning (vector
+search) and hits by keyword (full-text search). They merge the lists by
+reciprocal rank fusion: a hit scores Σ weight / (`rrf_k` + rank) over the
+lists it appears in. Every key is optional:
+
+```toml
+[retrieval]
+rrf_k = 5              # larger flattens the gap between top ranks (0–10000)
+vector_weight = 1.0    # weight of the meaning list (>= 0)
+keyword_weight = 1.05  # weight of the keyword list (>= 0; not both 0)
+leg_k_factor = 4       # each list ranks leg_k_factor × k candidates (1–50)
+fts_stopwords = true   # drop English stop-words from the keyword query
+include_scores = false # add each direct hit's fused `score` to results
+```
+
+A weight of `0` switches that list off. The keyword weight is just above the
+vector weight so that the two lists' first hits don't tie. To get 0.4.0's
+ranking back, set `rrf_k = 60` and `keyword_weight = 1.0`.
+
 ## Distance thresholds
 
 Three vector-distance thresholds decide what NeuroLithe does with a new piece of

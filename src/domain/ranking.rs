@@ -292,7 +292,11 @@ mod tests {
 
     #[test]
     fn rrf_rewards_agreement_and_respects_weights() {
-        let r = Ranking::default(); // rrf_k 60, weights 1:1
+        let r = Ranking {
+            rrf_k: 60.0,
+            keyword_weight: 1.0,
+            ..Ranking::default()
+        };
         let fused = rrf_fuse(&["a", "b", "c"], &["c", "d"], &r);
         let keys: Vec<&str> = fused.iter().map(|(k, _)| *k).collect();
         // c is in both legs: 1/63 + 1/61 beats a's 1/61.
@@ -320,7 +324,7 @@ mod tests {
         let r = Ranking::default();
         let fused = rrf_fuse(&["a", "a", "b"], &[], &r);
         assert_eq!(fused.len(), 2);
-        assert!((fused[0].1 - 1.0 / 61.0).abs() < 1e-12);
+        assert!((fused[0].1 - r.vector_weight / (r.rrf_k + 1.0)).abs() < 1e-12);
         assert!(rrf_fuse::<&str>(&[], &[], &r).is_empty());
         assert_eq!(leg_depth(10, &r), 40);
         assert_eq!(leg_depth(0, &r), 4);

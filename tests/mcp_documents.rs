@@ -292,9 +292,9 @@ fn recall_ltm_finds_words_deep_in_a_long_document() {
     )
     .assert_ok();
 
-    // Fused top 3. (At k = 1 a keyword-only first hit ties with the vector
-    // leg's first hit under equal weights, and ties go to the vector leg.)
-    let res = h.call("recall_ltm", json!({"query": "zephyrine valve", "k": 3}));
+    // Top 1: the keyword leg's first hit outranks the vector leg's first hit
+    // (the default keyword weight is just above the vector's, so they don't tie).
+    let res = h.call("recall_ltm", json!({"query": "zephyrine valve", "k": 1}));
     res.assert_ok();
     let hits = res.json().as_array().cloned().unwrap();
     assert!(hit_ids(&hits).contains(&"doc_deep".to_string()), "{hits:?}");
