@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,7 +42,15 @@ pub struct FakeLlm {
     pub port: u16,
     pub dim: usize,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    /// Extra latency (ms) added to every `/embeddings` request.
+    embed_delay_ms: Arc<AtomicU64>,
 }
+
+/// A request body containing this marker is answered after [`SLOW_DELAY`]:
+/// a slow model call, to hold a tool call in flight.
+pub const SLOW_MARKER: &str = "SLOWSLOW";
+/// Longer than rmcp's fixed 5 s response drain at EOF.
+pub const SLOW_DELAY: Duration = Duration::from_secs(6);
 
 impl FakeLlm {
     /// Bind 127.0.0.1:0 and serve forever on a background thread with its own
@@ -57,6 +66,8 @@ impl FakeLlm {
         let port = std_listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();
+        let embed_delay_ms = Arc::new(AtomicU64::new(0));
+        let delay = embed_delay_ms.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -69,8 +80,9 @@ impl FakeLlm {
                         continue;
                     };
                     let recorded = recorded.clone();
+                    let delay = delay.clone();
                     tokio::spawn(async move {
-                        let _ = serve_connection(sock, recorded, dim).await;
+                        let _ = serve_connection(sock, recorded, dim, delay).await;
                     });
                 }
             });
@@ -79,7 +91,15 @@ impl FakeLlm {
             port,
             dim,
             requests,
+            embed_delay_ms,
         }
+    }
+
+    /// Delay every `/embeddings` reply by `delay` from now on (a cold or
+    /// slow embedding model).
+    pub fn set_embed_delay(&self, delay: Duration) {
+        self.embed_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// OpenAI-style base URL (`…/v1`) to put in the generated config.
@@ -104,6 +124,7 @@ async fn serve_connection(
     mut sock: tokio::net::TcpStream,
     recorded: Arc<Mutex<Vec<RecordedRequest>>>,
     dim: usize,
+    embed_delay_ms: Arc<AtomicU64>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut buf: Vec<u8> = Vec::new();
@@ -157,6 +178,13 @@ async fn serve_connection(
             body: body.clone(),
         });
 
+        if body.to_string().contains(SLOW_MARKER) {
+            tokio::time::sleep(SLOW_DELAY).await;
+        }
+        let delay = embed_delay_ms.load(Ordering::SeqCst);
+        if delay > 0 && path.ends_with("/embeddings") {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
         let (status, payload) = fake_response(&path, &body, dim);
         let bytes = serde_json::to_vec(&payload).unwrap();
         let head = format!(
@@ -459,6 +487,21 @@ impl McpProcess {
         self.stderr.lock().unwrap().clone()
     }
 
+    /// Close the server's stdin (the client ending the session).
+    pub fn close_stdin(&mut self) {
+        drop(self.stdin.take());
+    }
+
+    /// Send a Unix signal (e.g. `"TERM"`) to the server process.
+    #[cfg(unix)]
+    pub fn signal(&self, name: &str) {
+        let status = Command::new("kill")
+            .args([&format!("-{name}"), &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(status.success(), "kill -{name} failed");
+    }
+
     /// Write one raw line to the server's stdin.
     pub fn send_raw(&mut self, line: &str) {
         let stdin = self.stdin.as_mut().expect("stdin already closed");
@@ -664,7 +707,7 @@ impl Harness {
     /// Facts visible via `stm_list` (fact texts only).
     #[track_caller]
     pub fn stm_facts(&mut self) -> Vec<String> {
-        let res = self.call("stm_list", json!({"limit": 1000}));
+        let res = self.call("inspect", json!({"view": "stm", "limit": 500}));
         res.assert_ok();
         res.json()
             .as_array()

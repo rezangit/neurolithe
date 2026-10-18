@@ -3,7 +3,8 @@
 //! hints). The Kafka feeder runs this on the text carried by each document event.
 
 use crate::domain::ports::LlmClient;
-use anyhow::{Result, bail};
+use crate::infrastructure::embedding_codec::check_dim;
+use anyhow::Result;
 use std::sync::Arc;
 
 /// The distilled meaning of a document.
@@ -63,13 +64,7 @@ impl Distiller {
         };
         let embedding = self.llm.embed_text(&summary).await?;
 
-        if embedding.len() != self.expected_dim {
-            bail!(
-                "embedding dimension {} does not match LTM dimension {}",
-                embedding.len(),
-                self.expected_dim
-            );
-        }
+        check_dim(&embedding, self.expected_dim, "embedder (LTM summary)")?;
 
         Ok(Distillate {
             summary,

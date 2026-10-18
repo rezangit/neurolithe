@@ -1,5 +1,6 @@
 use crate::domain::models::{Episode, MemoryResult, SessionId, TenantId, TimeFilter};
 use crate::domain::ports::{LlmClient, MemoryRepository};
+use crate::domain::tuning::{CHARS_PER_TOKEN, SESSION_CONTEXT_K};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -117,9 +118,9 @@ impl SessionManager {
         }
     }
 
-    /// Rough token estimation: ~4 characters per token (GPT tokenizer heuristic)
+    /// Rough token estimation: [`CHARS_PER_TOKEN`] characters per token.
     fn estimate_tokens(text: &str) -> usize {
-        text.len() / 4
+        text.len() / CHARS_PER_TOKEN
     }
 
     /// Number of session buffers currently held in memory.
@@ -239,7 +240,7 @@ impl SessionManager {
             tenant_id,
             &TimeFilter::default(),
             &[ccl.to_string()],
-            5,
+            SESSION_CONTEXT_K,
         )
     }
 

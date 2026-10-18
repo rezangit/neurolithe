@@ -38,9 +38,9 @@ pub struct LeafPage {
     pub summary_max_chars: Option<usize>,
 }
 
-/// Default page size for `inspect_node` children/leaves when unspecified.
+/// Default page size for the `node` view's children/leaves when unspecified.
 const DEFAULT_CHILD_LIMIT: usize = 50;
-/// Default summary cap for `inspect_node` — headlines by default; opt into more.
+/// Default summary cap for the `node` view — headlines by default; opt into more.
 const DEFAULT_SUMMARY_MAX_CHARS: usize = 200;
 
 /// Truncate a summary to `max` chars on a char boundary (0 = unbounded).
@@ -91,11 +91,11 @@ pub struct IntrospectionService {
     ltm: Arc<dyn LtmRepository>,
     monitoring: MonitoringService,
     retrieval: LtmRetrieval,
-    /// The effective distance thresholds, reported by `placement_debug`.
+    /// The effective distance thresholds, reported by the `placement` view.
     thresholds: Thresholds,
 }
 
-/// `placement_debug` output: the thresholds in effect (with their source:
+/// `placement` view output: the thresholds in effect (with their source:
 /// config / model default / fallback) and nearest-concept distances for a
 /// sample of document leaves — compare the two to tune placement.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -387,7 +387,7 @@ mod tests {
         assert!(f.svc.inspect_node(99999, full).unwrap().is_none());
     }
 
-    /// trace_dataId finds the document in BOTH LTM (leaf + branch) and STM.
+    /// The `trace` view finds the document in BOTH LTM (leaf + branch) and STM.
     #[test]
     fn test_trace_data_id_spans_both_stores() {
         let f = fixture();

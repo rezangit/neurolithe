@@ -90,7 +90,7 @@ pub struct MemoryResult {
     pub connections: Vec<MemoryConnection>,
     /// The document/archive reference this fact came from (`dataId` in the
     /// payload), when present. Lets the agent go straight from a `query_memory`
-    /// hit to fetching the source without a second `stm_list` scan.
+    /// hit to fetching the source without a second scan of the `stm` view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data_id: Option<String>,
     /// Working-memory context key, populated only by the recency read

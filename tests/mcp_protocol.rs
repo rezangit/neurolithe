@@ -70,14 +70,7 @@ const EXPECTED_TOOLS: &[&str] = &[
     "workspace_switch",
     "workspace_export",
     "workspace_delete",
-    "memory_stats",
-    "health",
-    "placement_debug",
-    "stm_list",
-    "ltm_map",
-    "inspect_node",
-    "subtree",
-    "trace_dataId",
+    "inspect",
 ];
 
 #[test]
@@ -119,17 +112,20 @@ fn tools_list_matches_expected_surface_with_valid_schemas() {
     }
 }
 
-/// QA-4 golden shape (success): `{"content":[{"type":"text","text":…}],"isError":false}`.
+/// QA-4 golden shape (success): `{"content":[{"type":"text","text":…}],
+/// "structuredContent":{…},"isError":false}`. The harness speaks 2025-06-18,
+/// so a JSON result also comes as `structuredContent`, equal to the text.
 #[test]
 fn tool_success_result_has_mcp_golden_shape() {
     let mut h = Harness::start();
-    let res = h.call("health", json!({}));
+    let res = h.call("inspect", json!({"view": "health"}));
     assert_eq!(
         keys(&res.raw),
-        set(&["content", "isError"]),
+        set(&["content", "isError", "structuredContent"]),
         "QA-4: result keys: {}",
         res.raw
     );
+    assert_eq!(res.raw["structuredContent"], res.json(), "{}", res.raw);
     assert_eq!(res.raw["isError"], json!(false), "QA-4");
     let content = res.raw["content"].as_array().expect("content array");
     assert_eq!(content.len(), 1);
@@ -189,7 +185,7 @@ fn unknown_tool_is_json_rpc_invalid_params() {
         "REV-6: error should name the tool: {resp}"
     );
     // Still serving.
-    h.call("health", json!({})).assert_ok();
+    h.call("inspect", json!({"view": "health"})).assert_ok();
 }
 
 #[test]
@@ -212,7 +208,7 @@ fn malformed_line_yields_parse_error_and_server_keeps_serving() {
     assert_eq!(resp["error"]["code"], -32700, "{resp}");
     assert_eq!(resp["id"], Value::Null);
     // Still alive.
-    h.call("health", json!({})).assert_ok();
+    h.call("inspect", json!({"view": "health"})).assert_ok();
 }
 
 #[test]
@@ -265,15 +261,15 @@ fn introspection_answers_quickly_without_calling_the_llm() {
     });
     let before = h.llm.requests().len();
     let started = std::time::Instant::now();
-    for tool in [
-        "health",
-        "memory_stats",
-        "stm_list",
-        "ltm_map",
-        "workspace_current",
-        "workspace_list",
+    for (tool, args) in [
+        ("inspect", json!({"view": "health"})),
+        ("inspect", json!({"view": "stats"})),
+        ("inspect", json!({"view": "stm"})),
+        ("inspect", json!({"view": "ltm_map"})),
+        ("workspace_current", json!({})),
+        ("workspace_list", json!({})),
     ] {
-        h.call(tool, json!({})).assert_ok();
+        h.call(tool, args).assert_ok();
     }
     assert!(started.elapsed() < Duration::from_secs(10));
     assert_eq!(
@@ -323,19 +319,11 @@ fn workspace_tool_schemas_are_annotated() {
     assert_eq!(hints("workspace_delete")["destructiveHint"], json!(true));
     assert_eq!(hints("workspace_delete")["idempotentHint"], json!(true));
     for name in [
-        "query_memory",
         "recall_ltm",
         "workspace_current",
         "workspace_list",
         "workspace_export",
-        "memory_stats",
-        "health",
-        "placement_debug",
-        "stm_list",
-        "ltm_map",
-        "inspect_node",
-        "subtree",
-        "trace_dataId",
+        "inspect",
     ] {
         assert_eq!(
             hints(name)["readOnlyHint"],
@@ -357,6 +345,12 @@ fn workspace_tool_schemas_are_annotated() {
         );
     }
     assert_eq!(hints("remember_document")["destructiveHint"], json!(false));
+    // W1R-3: reading reinforces (relevance boost, decay clock reset), so
+    // query_memory writes — harmlessly and idempotently.
+    let q = hints("query_memory");
+    assert_eq!(q["readOnlyHint"], json!(false), "{q}");
+    assert_eq!(q["destructiveHint"], json!(false), "{q}");
+    assert_eq!(q["idempotentHint"], json!(true), "{q}");
     for name in [
         "workspace_create",
         "workspace_switch",
@@ -375,4 +369,71 @@ fn workspace_tool_schemas_are_annotated() {
         required.as_array().unwrap().iter().any(|r| r == "confirm"),
         "workspace_delete must require confirm: {required}"
     );
+}
+
+/// 3.2: the inspection tools were folded into `inspect`; their old names are
+/// unknown tools now (JSON-RPC -32602).
+#[test]
+fn folded_inspection_tools_are_gone() {
+    let mut h = Harness::start();
+    for gone in [
+        "memory_stats",
+        "health",
+        "placement_debug",
+        "stm_list",
+        "ltm_map",
+        "inspect_node",
+        "subtree",
+        "trace_dataId",
+    ] {
+        let resp = h
+            .server
+            .request("tools/call", json!({"name": gone, "arguments": {}}));
+        assert_eq!(resp["error"]["code"], -32602, "{gone}: {resp}");
+    }
+}
+
+/// 3.1 (RES-F2): version negotiation on the rmcp server. A supported
+/// revision is echoed, including the newest one with an `initialize`
+/// handshake; an unknown one gets that newest revision instead.
+#[test]
+fn initialize_negotiates_the_protocol_version() {
+    for (asked, agreed) in [
+        ("2024-11-05", "2024-11-05"),
+        ("2025-06-18", "2025-06-18"),
+        ("2025-11-25", "2025-11-25"),
+        ("2099-01-01", "2025-11-25"),
+    ] {
+        let llm = common::FakeLlm::start();
+        let home = common::Home::new(&llm.base_url());
+        let mut server = home.spawn_mcp(&[], &[]);
+        let resp = server.request(
+            "initialize",
+            json!({
+                "protocolVersion": asked,
+                "capabilities": {},
+                "clientInfo": {"name": "neurolithe-tests", "version": "0"}
+            }),
+        );
+        assert_eq!(resp["result"]["protocolVersion"], agreed, "{asked}: {resp}");
+    }
+}
+
+/// 3.1: a malformed `initialize` (no clientInfo/capabilities) is answered
+/// with -32602 naming the problem, and the session can still start.
+#[test]
+fn malformed_initialize_is_invalid_params() {
+    let llm = common::FakeLlm::start();
+    let home = common::Home::new(&llm.base_url());
+    let mut server = home.spawn_mcp(&[], &[]);
+    let resp = server.request("initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert_eq!(resp["error"]["code"], -32602, "{resp}");
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("capabilities") || m.contains("clientInfo")),
+        "{resp}"
+    );
+    let init = server.initialize();
+    assert_eq!(init["serverInfo"]["name"], "NeuroLithe", "{init}");
 }

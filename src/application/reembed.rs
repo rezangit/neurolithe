@@ -25,6 +25,7 @@
 use crate::application::migrations::{StoreKind, backup_store, migrate_store, record_embedding};
 use crate::domain::ports::{EmbeddingIdentity, LlmClient};
 use crate::infrastructure::database::init_db;
+use crate::infrastructure::embedding_codec::{as_blob, check_dim};
 use crate::infrastructure::schema::drop_vec_tables;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
@@ -129,21 +130,14 @@ async fn embed_all(
     let mut out = Vec::with_capacity(items.len());
     for (id, text) in items {
         let embedding = embedder.embed_text(&text).await?;
-        if embedding.len() != identity.dim {
-            bail!(
-                "embedder returned {} dimensions, expected {} ({})",
-                embedding.len(),
-                identity.dim,
-                identity.model
-            );
-        }
+        check_dim(
+            &embedding,
+            identity.dim,
+            &format!("embedder ({})", identity.model),
+        )?;
         out.push((id, embedding));
     }
     Ok(out)
-}
-
-fn to_bytes(embedding: &[f32]) -> Vec<u8> {
-    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 fn insert_vectors(conn: &Connection, table: &str, rows: &[(i64, Vec<f32>)]) -> Result<()> {
@@ -151,7 +145,7 @@ fn insert_vectors(conn: &Connection, table: &str, rows: &[(i64, Vec<f32>)]) -> R
         "INSERT INTO {table} (node_id, embedding) VALUES (?1, ?2)"
     ))?;
     for (id, embedding) in rows {
-        stmt.execute(params![id, to_bytes(embedding)])?;
+        stmt.execute(params![id, as_blob(embedding)])?;
     }
     Ok(())
 }
@@ -244,26 +238,6 @@ fn write_ltm(
     Ok((vectors.concepts.len(), vectors.leaves.len()))
 }
 
-/// Re-embed a single (already migrated) STM store: embed, then rewrite.
-pub async fn reembed_stm(
-    conn: &Connection,
-    embedder: &dyn LlmClient,
-    identity: &EmbeddingIdentity,
-) -> Result<usize> {
-    let vectors = embed_stm(conn, embedder, identity).await?;
-    write_stm(conn, identity, &vectors)
-}
-
-/// Re-embed a single (already migrated) LTM store: embed, then rewrite.
-pub async fn reembed_ltm(
-    conn: &Connection,
-    embedder: &dyn LlmClient,
-    identity: &EmbeddingIdentity,
-) -> Result<(usize, usize)> {
-    let vectors = embed_ltm(conn, embedder, identity).await?;
-    write_ltm(conn, identity, &vectors)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -304,6 +278,16 @@ mod tests {
         async fn compress_context(&self, _m: &str) -> Result<String> {
             Ok(String::new())
         }
+    }
+
+    /// Re-embed one (already migrated) STM store: embed, then rewrite.
+    async fn reembed_stm(
+        conn: &Connection,
+        embedder: &dyn LlmClient,
+        identity: &EmbeddingIdentity,
+    ) -> Result<usize> {
+        let vectors = embed_stm(conn, embedder, identity).await?;
+        write_stm(conn, identity, &vectors)
     }
 
     fn ident(model: &str, dim: usize) -> EmbeddingIdentity {
@@ -378,7 +362,7 @@ mod tests {
             let stm = init_db(Some(&stm_path)).unwrap();
             stm.execute(
                 "INSERT INTO vec_nodes (node_id, embedding) VALUES (1, ?1)",
-                [to_bytes(&[1.0; 8])],
+                [as_blob(&[1.0; 8])],
             )
             .unwrap();
             let err = prepare_store(&stm, StoreKind::Stm, Some(&stm_path), &new)
@@ -439,7 +423,7 @@ mod tests {
             prepare_store(&stm, StoreKind::Stm, Some(&stm_path), &old).unwrap();
             stm.execute(
                 "INSERT INTO vec_nodes (node_id, embedding) VALUES (1, ?1)",
-                [to_bytes(&[1.0; 8])],
+                [as_blob(&[1.0; 8])],
             )
             .unwrap();
             let ltm = init_db(Some(&ltm_path)).unwrap();
@@ -523,7 +507,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO vec_nodes (node_id, embedding) VALUES (1, ?1)",
-            [to_bytes(&[1.0; 8])],
+            [as_blob(&[1.0; 8])],
         )
         .unwrap();
 

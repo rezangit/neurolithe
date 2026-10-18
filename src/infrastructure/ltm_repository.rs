@@ -7,6 +7,7 @@
 use crate::domain::ltm::{
     Leaf, LtmRepository, Provenance, SpineSeed, TreeEdge, TreeNode, TreeNodeKind,
 };
+use crate::infrastructure::embedding_codec::{as_blob, from_blob};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -152,12 +153,7 @@ impl LtmRepository for SqliteLtmRepository {
         let node_id = tx.last_insert_rowid();
 
         if let Some(embedding) = embedding {
-            let embedding_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    embedding.as_ptr() as *const u8,
-                    std::mem::size_of_val(embedding),
-                )
-            };
+            let embedding_bytes = as_blob(embedding);
             // Concepts and document leaves live in separate vector indexes (see
             // schema): placement searches concepts only, recall searches both.
             let table = if node.kind == TreeNodeKind::Leaf {
@@ -274,12 +270,7 @@ impl LtmRepository for SqliteLtmRepository {
         max_distance: f64,
         limit: usize,
     ) -> Result<Vec<(TreeNode, f64)>> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
+        let embedding_bytes = as_blob(embedding);
 
         // Node columns first (mapped by row_to_node), then the vector distance.
         let mut stmt = self.conn.prepare(
@@ -310,12 +301,7 @@ impl LtmRepository for SqliteLtmRepository {
         max_distance: f64,
         limit: usize,
     ) -> Result<Vec<(TreeNode, f64)>> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
+        let embedding_bytes = as_blob(embedding);
 
         // Search the concept index and the leaf index independently (they are
         // separate vec0 tables), then merge by distance. Each is queried for the
@@ -395,12 +381,7 @@ impl LtmRepository for SqliteLtmRepository {
     }
 
     fn set_concept_embedding(&self, node_id: i64, embedding: &[f32]) -> Result<()> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
+        let embedding_bytes = as_blob(embedding);
         // vec0 rows are replaced by delete-then-insert on the primary key.
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM vec_ltm WHERE node_id = ?1", params![node_id])?;
@@ -434,12 +415,7 @@ impl LtmRepository for SqliteLtmRepository {
         let mut out = Vec::new();
         for row in rows {
             let (id, blob) = row?;
-            // vec0 stores float32 little-endian; decode back to Vec<f32>.
-            let emb: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            out.push((id, emb));
+            out.push((id, from_blob(&blob)?));
         }
         Ok(out)
     }

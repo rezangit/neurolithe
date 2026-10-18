@@ -8,7 +8,8 @@
 
 use crate::domain::ltm::{Leaf, LtmRepository, Provenance, TreeEdge, TreeNode, TreeNodeKind};
 use crate::domain::ports::LlmClient;
-use anyhow::{Result, anyhow, bail};
+use crate::infrastructure::embedding_codec::check_dim;
+use anyhow::{Result, anyhow};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -32,14 +33,11 @@ pub async fn embed_spine_concepts(
             format!("{}: {}", node.name, node.summary)
         };
         let embedding = llm.embed_text(&text).await?;
-        if embedding.len() != expected_dim {
-            bail!(
-                "concept '{}' embedding dim {} != LTM dim {}",
-                node.name,
-                embedding.len(),
-                expected_dim
-            );
-        }
+        check_dim(
+            &embedding,
+            expected_dim,
+            &format!("embedder (concept '{}')", node.name),
+        )?;
         ltm.set_concept_embedding(id, &embedding)?;
         embedded += 1;
     }

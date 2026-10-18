@@ -3,6 +3,73 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [Unreleased]
+
+**Breaking**: the eight inspection tools are merged into one `inspect` tool.
+
+### Upgrading from 0.3.x
+
+Replace calls to the old inspection tools with `inspect` and a `view`:
+
+| Old tool | `inspect` view | Argument changes |
+|---|---|---|
+| `memory_stats` | `stats` | |
+| `health` | `health` | |
+| `stm_list` | `stm` | |
+| `ltm_map` | `ltm_map` | |
+| `inspect_node` | `node` | |
+| `subtree` | `subtree` | `node` is now `id` |
+| `trace_dataId` | `trace` | `dataId` is now `data_id` |
+| `placement_debug` | `placement` | |
+
+The old names now return an "unknown tool" error. Prompts or agent
+instructions that mention them need updating.
+
+### Changed
+
+- The MCP server is built on the official Rust SDK, `rmcp`. It negotiates
+  protocol versions up to 2025-11-25. Clients on 2025-06-18 or later also
+  receive `structuredContent` alongside the unchanged text result; arrays are
+  wrapped as `{"items": [...]}`.
+- Every tool carries a `title` and annotations: `readOnlyHint`,
+  `destructiveHint` (on `workspace_delete`), `idempotentHint` and
+  `openWorldHint`. `query_memory` is not marked read-only, because reading a
+  fact reinforces it.
+- With `[mcp] allow_workspace_switch = false`, `workspace_switch`,
+  `workspace_create` and `workspace_delete` are no longer listed. Calling one
+  still returns an explanatory error.
+- `initialize` must include `capabilities` and `clientInfo`, as the spec
+  requires. Malformed params get a -32602 error.
+- A request sent before `initialize` (other than `ping`) is rejected with a
+  -32602 error instead of being answered.
+- `tools/call` with non-object `arguments` is a JSON-RPC -32602 error instead
+  of an `isError` tool result.
+- Shutdown waits for tool calls in flight. At stdin EOF, every accepted call
+  finishes and is answered before the server exits (up to 300 s); a call the
+  client cancelled gets no answer but still finishes its work. On SIGTERM or
+  SIGINT, the running call gets up to 8 s, and calls not yet started get a
+  "shutting down" `isError` result.
+- A request that reuses the id of a request still in flight is rejected with
+  a -32600 error.
+- Default logging shows the MCP SDK's (`rmcp`) messages only at `warn` and
+  above. An explicit `RUST_LOG` or a `[log] level` that names `rmcp`
+  overrides this.
+- `inspect` with `view: "node"` or `"subtree"` returns an error for an unknown
+  id instead of a `null` result. An argument that belongs to another view is
+  rejected.
+- A stored vector whose byte length isn't a multiple of 4 is reported as
+  corrupt instead of being silently truncated.
+
+### Added
+
+- `neurolithe tools [--markdown|--json]` prints the tool reference from the
+  same registry the server uses. `docs/src/mcp/tools.md` is generated from it.
+
+### Removed
+
+- Unused dependencies `thiserror` and `libsqlite3-sys` (direct); the `config`
+  crate is built with TOML support only.
+
 ## [0.3.0] — 2026-09-24
 
 A clean standalone product: one user, isolated **workspaces**, **local

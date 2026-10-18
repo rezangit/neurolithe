@@ -57,7 +57,11 @@ fn memory_works_without_a_chat_llm() {
     assert_eq!(res.json()["summarized"], false, "{}", res.text);
 
     // Introspection is unaffected.
-    assert!(!server.call_tool("health", json!({})).is_error);
+    assert!(
+        !server
+            .call_tool("inspect", json!({"view": "health"}))
+            .is_error
+    );
 
     // The chat endpoint was never called; embeddings were.
     assert_eq!(llm.count("/chat/completions"), 0);

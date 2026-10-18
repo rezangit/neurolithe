@@ -14,7 +14,7 @@ use crate::application::distill::Distiller;
 use crate::application::ltm_placement::{DocumentToPlace, LtmPlacement};
 use crate::domain::cognition::conflict_resolver::{AdaptationResult, ConflictResolver};
 use crate::domain::ltm::{LtmRepository, Provenance};
-use crate::domain::models::{MemoryNode, TenantId};
+use crate::domain::models::{MemoryNode, REALITY_CCL, TenantId};
 use crate::domain::ports::{LlmClient, MemoryRepository};
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
@@ -153,7 +153,7 @@ impl IngestionService {
                 source_episode_id: None,
                 payload,
                 status: "active".into(),
-                ccl: "reality".into(),
+                ccl: REALITY_CCL.into(),
                 is_explicit: true,
                 support_count: 1,
                 relevance_score: 1.0,

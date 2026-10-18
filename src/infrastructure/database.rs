@@ -736,12 +736,7 @@ mod tests {
         // The STM vec table accepts a vector of the STM dimension — proof the
         // dimension applied to STM and was not crossed with LTM's.
         let embedding = vec![0.0_f32; DIM];
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding.as_slice()),
-            )
-        };
+        let bytes = crate::infrastructure::embedding_codec::as_blob(&embedding);
         stores
             .stm
             .execute(

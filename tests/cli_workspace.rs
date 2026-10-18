@@ -2,7 +2,7 @@
 //! import of a legacy (v0.2.x) store from `tests/fixtures/legacy-v0.2`.
 mod common;
 
-use common::{FakeLlm, Home};
+use common::{FakeLlm, Home, home_config_toml_with};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -178,7 +178,15 @@ fn import_brings_a_legacy_store_into_a_workspace() {
     let before_ltm = std::fs::read(fixture.join("ltm.sqlite")).unwrap();
 
     let llm = FakeLlm::start();
-    let home = Home::new(&llm.base_url());
+    // The fixture's facts were last accessed when it was recorded; at the 7-day
+    // default the server's startup decay sweep would archive them all a few
+    // weeks later. A ~100-year half-life keeps them live, so the test doesn't
+    // depend on the calendar.
+    let home = Home::with_config(&home_config_toml_with(
+        &llm.base_url(),
+        "",
+        "[decay]\ndefault_half_life_days = 36500.0\n",
+    ));
     let (stm, ltm) = (fixture.join("stm.sqlite"), fixture.join("ltm.sqlite"));
     let out = home.cli(&[
         "workspace",

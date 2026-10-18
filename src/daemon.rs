@@ -29,7 +29,7 @@ use crate::infrastructure::database::{
 use crate::infrastructure::llm::create_llm_client;
 use crate::infrastructure::ltm_repository::SqliteLtmRepository;
 use crate::infrastructure::repository::SqliteMemoryRepository;
-use crate::interfaces::mcp_server::McpServer;
+use crate::interfaces::mcp::McpServer;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -306,13 +306,13 @@ pub async fn serve_mcp<R, W>(
     writer: W,
 ) -> Result<()>
 where
-    R: tokio::io::AsyncBufRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     // Cheap checks fail fast, before serving (a bad name must exit non-zero
     // even if the client disconnects immediately).
     validate_name(&config.workspace)?;
-    let server = McpServer::pending();
+    let server = McpServer::pending(config.mcp.allow_workspace_switch);
     let host = SqliteWorkspaceHost::new(config.clone(), llm);
     let startup = async {
         let manager = WorkspaceManager::start(
@@ -356,10 +356,16 @@ where
     let served = tokio::select! {
         served = serve => {
             tracing::info!("stdin closed; shutting down");
+            // Every reply owed is out, but a call the client cancelled may
+            // still be running: let it finish before the checkpoint.
+            server.drain_calls(MCP_DRAIN_TIMEOUT).await;
             served
         }
         signal = shutdown => {
             tracing::info!("received {signal}; shutting down");
+            // Let running tool calls finish (and answer) before the
+            // checkpoint; the session loop keeps running meanwhile.
+            server.drain_calls(MCP_DRAIN_TIMEOUT).await;
             Ok(())
         }
         () = sweeping => Ok(()),
@@ -369,6 +375,10 @@ where
     checkpoint_on_shutdown(&config, &[workspaces.current_name()]);
     served
 }
+
+/// How long a shutdown signal waits for running MCP tool calls. Below the
+/// usual supervisor grace period (`docker stop`: 10 s).
+pub const MCP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Resolve on SIGINT (Ctrl-C) or, on Unix, SIGTERM (`docker stop`, a
 /// supervisor, an MCP client ending the session). Returns the signal's name.
@@ -635,7 +645,7 @@ mod full {
             },
             config.mcp.allow_workspace_switch,
         ));
-        let server = Arc::new(McpServer::new(workspaces.clone()));
+        let server = McpServer::new(workspaces.clone(), config.mcp.allow_workspace_switch);
 
         // --- spawn all loops on the LocalSet ---
         let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -687,15 +697,22 @@ mod full {
         let signal = shutdown_signal().await;
         tracing::info!("received {signal}; shutting down");
 
-        // 1. No new work: end the MCP session and the schedulers.
+        // One budget for the whole drain, so it stays below the
+        // supervisor's grace period.
+        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+        // 1. No new work: the Kafka loops are told to stop (they finish their
+        // in-flight message), and running MCP tool calls finish meanwhile.
+        // Then the MCP session and the schedulers end.
+        let _ = stop_tx.send(true);
+        server
+            .drain_calls(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await;
         let mcp_workspace = workspaces.current_name();
         for task in std::iter::once(mcp_task).chain(schedulers) {
             task.abort();
             let _ = task.await;
         }
-        // 2. Kafka loops finish their in-flight message, commit, flush.
-        let _ = stop_tx.send(true);
-        let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+        // 2. Kafka loops commit and flush (within what's left of the budget).
         for task in kafka_loops {
             if tokio::time::timeout_at(deadline, task).await.is_err() {
                 tracing::warn!("a Kafka loop did not stop within {DRAIN_TIMEOUT:?}; abandoning it");
@@ -762,7 +779,7 @@ mod tests {
 
     /// Thresholds are resolved once from config + the embedder's model and
     /// reach the services: a configured placement distance is reported (as
-    /// `config`) by `placement_debug`, and the unset values come from the
+    /// `config`) by the `placement` view, and the unset values come from the
     /// fallback (the stub embedder's model id is unknown).
     #[tokio::test]
     async fn test_thresholds_resolved_from_config_reach_services() {
@@ -952,7 +969,7 @@ mod tests {
         let client = async {
             let prompt = Duration::from_millis(500);
             cli_w
-                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}\n")
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}\n")
                 .await
                 .unwrap();
             let line = timeout(prompt, replies.next_line())
@@ -986,10 +1003,15 @@ mod tests {
                 .unwrap();
             assert!(line.contains("\\\"name\\\":\\\"default\\\""), "{line}");
         };
-        tokio::select! {
-            r = server => panic!("server ended early: {r:?}"),
-            () = client => {}
-        }
+        // rmcp spawns its request handlers locally.
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                tokio::select! {
+                    r = server => panic!("server ended early: {r:?}"),
+                    () = client => {}
+                }
+            })
+            .await;
     }
 
     /// P2R-3: a daemon keeps its own workspace open (leased) for its whole run,

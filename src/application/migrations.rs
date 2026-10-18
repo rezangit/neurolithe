@@ -455,6 +455,7 @@ pub(crate) fn reserve_private_file(db_path: &Path, tag: &str) -> Result<PathBuf>
 mod tests {
     use super::*;
     use crate::infrastructure::database::init_db;
+    use crate::infrastructure::embedding_codec::as_blob;
 
     fn ident(model: &str, dim: usize) -> EmbeddingIdentity {
         EmbeddingIdentity {
@@ -489,10 +490,9 @@ mod tests {
         )
         .unwrap();
         let id = conn.last_insert_rowid();
-        let bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
         conn.execute(
             "INSERT INTO vec_nodes (node_id, embedding) VALUES (?1, ?2)",
-            params![id, bytes],
+            params![id, as_blob(emb)],
         )
         .unwrap();
     }

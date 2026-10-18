@@ -1,5 +1,7 @@
 pub mod config;
 pub mod database;
+// [f32] <-> sqlite-vec blob codec and the shared embedding dimension check.
+pub mod embedding_codec;
 pub mod llm;
 // tracing subscriber (stderr only; stdout is the MCP transport).
 pub mod logging;

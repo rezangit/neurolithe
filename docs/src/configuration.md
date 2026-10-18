@@ -153,7 +153,7 @@ assimilation_threshold = 0.15
 accommodation_threshold = 0.35
 ```
 
-`placement_debug` shows `source: model_default` (or `config` if pinned) with
+`inspect` with `view: "placement"` shows `source: model_default` (or `config` if pinned) with
 these values, which confirms that the legacy calibration is in effect.
 
 Distances are sqlite-vec L2 distances (for unit-length embeddings,
@@ -169,16 +169,16 @@ assimilation_threshold = 0.25
 accommodation_threshold = 0.40
 ```
 
-### Calibrating with `placement_debug`
+### Calibrating with `inspect` (`view: "placement"`)
 
-The `placement_debug` MCP tool reports the effective `thresholds`, each with its
+The `inspect` MCP tool with `view: "placement"` reports the effective `thresholds`, each with its
 `source` (`config`, `model_default` or `fallback`). It also reports `probes`: for
 a sample of stored documents, the distance to their nearest concept. To tune
 placement:
 
 1. Store a representative set of documents (for example with
    `remember_document`).
-2. Call `placement_debug` with `sample` 100–500 and look at the `distance`
+2. Call `inspect` with `view: "placement"` and `sample` 100–500 and look at the `distance`
    values.
 3. Set `placement_max_distance` just above the distances of documents that
    clearly belong to their concept. Documents with larger distances go to

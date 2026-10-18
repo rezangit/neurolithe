@@ -22,7 +22,8 @@ pub const RECALL_MAX_K: usize = 50;
 
 /// Per hit, at most this many child concepts and this many document leaves are
 /// returned, so a broad concept with thousands of documents cannot flood the
-/// caller's context (ARC-15). Use `drill`/`inspect_node` to page further.
+/// caller's context (ARC-15). Use `drill` or the `inspect` tool's `node` view to
+/// page further.
 pub const RECALL_MAX_CHILDREN: usize = 20;
 pub const RECALL_MAX_LEAVES: usize = 20;
 

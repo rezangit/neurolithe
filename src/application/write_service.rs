@@ -16,7 +16,7 @@ use crate::application::reset_service::{
     ForgetCommand, MemoryCommand, RememberCommand, WriteScope,
 };
 use crate::domain::ltm::{LtmRepository, Provenance};
-use crate::domain::models::{Edge, MemoryNode, TenantId};
+use crate::domain::models::{Edge, MemoryNode, REALITY_CCL, TenantId};
 use crate::domain::ports::{LlmClient, MemoryRepository};
 use anyhow::{Result, bail};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// field on the command is ignored).
 const AGENT_TENANT: &str = crate::domain::models::WORKSPACE_TENANT;
 /// Default cognitive-context layer for agent-remembered facts (design §7).
-const DEFAULT_CCL: &str = "reality";
+const DEFAULT_CCL: &str = REALITY_CCL;
 /// Provenance source stamped on agent-authored LTM notes.
 const NOTE_SOURCE: &str = "agent";
 /// Max characters of note text used as the LTM leaf's display name.

@@ -45,8 +45,8 @@ impl NeurolitheApp {
             session_manager: SessionManager::new(
                 memory_repo.clone(),
                 llm_client.clone(),
-                4000, // ~4000 token threshold (configurable)
-                10,   // keep 10 most recent messages raw
+                crate::domain::tuning::SESSION_TOKEN_THRESHOLD,
+                crate::domain::tuning::SESSION_KEEP_RECENT,
             ),
         }
     }

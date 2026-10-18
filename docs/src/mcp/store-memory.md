@@ -5,11 +5,8 @@ Works without a chat LLM (only the embedder is used).
 
 ## Input
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `fact_text` | string | yes | The fact, non-blank (≤ 16 KiB) |
-| `tags` | string[] | no | Up to 64 tags |
-| `ccl` | string | no | Cognitive context layer, default `reality` |
+See [`store_memory` in the tool reference](./tools.md#store_memory) for the arguments,
+their limits and the tool's annotations.
 
 ## Output
 

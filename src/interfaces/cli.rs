@@ -12,6 +12,7 @@
 //!   workspace backup <name> [--out DIR]
 //!   workspace import <name> --stm FILE --ltm FILE
 //!   reembed                               re-embed the selected workspace with the current embedder
+//!   tools [--markdown | --json]           print the MCP tool reference
 //! ```
 //! The global flags may appear before or after the subcommand.
 
@@ -79,6 +80,17 @@ pub enum Command {
     /// Re-embed the selected workspace (--workspace) with the configured
     /// embedder, after changing embedding model. Backs up both stores first.
     Reembed,
+    /// Print the MCP tool reference: Markdown (the docs page) or the
+    /// `tools/list` JSON. Reads no config.
+    Tools {
+        /// Markdown reference (the default)
+        #[arg(long, conflicts_with = "json")]
+        markdown: bool,
+        /// The `tools/list` result as JSON (every tool, including those a
+        /// pinned server hides)
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,8 +203,25 @@ pub fn main_entry() -> Result<i32> {
             })?;
             Ok(0)
         }
+        Some(Command::Tools { markdown: _, json }) => {
+            tools_command(json, &mut std::io::stdout())?;
+            Ok(0)
+        }
         None => no_command(&opts),
     }
+}
+
+/// `neurolithe tools`: the tool reference, straight from the registry.
+fn tools_command(json: bool, out: &mut dyn Write) -> Result<()> {
+    use crate::interfaces::mcp::{docs, registry};
+    if json {
+        let tools: Vec<_> = registry::TOOLS.iter().map(|t| t.to_tool()).collect();
+        let listing = serde_json::json!({ "tools": tools });
+        writeln!(out, "{}", serde_json::to_string_pretty(&listing)?)?;
+    } else {
+        write!(out, "{}", docs::markdown())?;
+    }
+    Ok(())
 }
 
 /// With the `kafka` feature, a bare `neurolithe` starts the daemon (the
@@ -646,6 +675,39 @@ mod tests {
         let mut out = Vec::new();
         workspace_command(config, cmd, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// 3.1: `tools` prints the generated reference (Markdown by default) or
+    /// the full `tools/list` JSON, from the same registry the server lists.
+    #[test]
+    fn test_tools_command_prints_reference_and_json() {
+        use crate::interfaces::mcp::{docs, registry};
+        assert!(matches!(
+            parse(&["tools"]).command,
+            Some(Command::Tools { json: false, .. })
+        ));
+        assert!(matches!(
+            parse(&["tools", "--markdown"]).command,
+            Some(Command::Tools { json: false, .. })
+        ));
+        assert!(Cli::try_parse_from(["neurolithe", "tools", "--markdown", "--json"]).is_err());
+
+        let mut out = Vec::new();
+        tools_command(false, &mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), docs::markdown());
+
+        let mut out = Vec::new();
+        tools_command(true, &mut out).unwrap();
+        let listing: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let names: Vec<&str> = listing["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let expected: Vec<&str> = registry::TOOLS.iter().map(|t| t.name).collect();
+        assert_eq!(names, expected);
+        assert!(listing["tools"][0]["inputSchema"].is_object());
     }
 
     /// The global flags work before or after the subcommand.

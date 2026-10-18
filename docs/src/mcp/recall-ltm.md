@@ -6,10 +6,8 @@ and its ancestor concepts, so the caller can fetch the original.
 
 ## Input
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `query` | string | yes | What to look for (≤ 4 KiB) |
-| `k` | integer | no | Max concept/document hits, 1–100 (capped at 50), default 10 |
+See [`recall_ltm` in the tool reference](./tools.md#recall_ltm) for the arguments,
+their limits and the tool's annotations.
 
 ## Output
 
@@ -35,5 +33,6 @@ appears once, with a null `data_id`.
 - No distance cutoff is applied: the nearest `k` hits are always returned, each
   with its `distance`. Judge relevance from that value. An unrelated archive
   still returns its nearest nodes.
+- At most 50 hits are returned, whatever `k` asks for.
 - A concept hit lists at most 20 child documents. Use
-  [`inspect_node`](./introspection.md) to page further.
+  [`inspect`](./tools.md#inspect) with `view: "node"` to page further.

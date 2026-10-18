@@ -60,7 +60,9 @@ provider = "none"
 # embedding_location = "us-central1"
 
 # [mcp]
-# Whether the MCP `workspace_switch` tool may change workspace mid-session.
+# Whether an MCP session may leave its startup workspace. false pins the
+# server: workspace_switch, workspace_create and workspace_delete are not
+# listed, and no other workspace can be reached (one fixed memory per entry).
 # allow_workspace_switch = true
 
 # [log]
@@ -75,7 +77,7 @@ provider = "none"
 
 # Distance thresholds (optional). Defaults are picked per embedding model; see
 # docs/src/configuration.md ("Distance thresholds"). Calibrate placement with
-# the `placement_debug` MCP tool, which reports the values in effect.
+# the MCP `inspect` tool (view "placement"), which reports the values in effect.
 # [ltm]
 # placement_max_distance = 0.96   # file under the nearest concept within this L2 distance
 # [stm]

@@ -138,7 +138,7 @@ pub trait MemoryRepository {
         contains: Option<&str>,
     ) -> Result<Vec<StmNodeSummary>>;
 
-    /// How many STM nodes carry a given `dataId` (for `trace_dataId`).
+    /// How many STM nodes carry a given `dataId` (for the `inspect` tool's `trace` view).
     fn count_by_data_id(&self, data_id: &str) -> Result<i64>;
 
     /// Idempotency: has a `memory.command` with this `commandId` already been

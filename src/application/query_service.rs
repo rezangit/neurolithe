@@ -12,7 +12,7 @@
 
 use crate::application::ltm_retrieval::{LtmRetrieval, RecallResult};
 use crate::application::retrieval::RetrievalService;
-use crate::domain::models::{MemoryResult, TenantId, TimeFilter, WORKING_CCL};
+use crate::domain::models::{MemoryResult, REALITY_CCL, TenantId, TimeFilter, WORKING_CCL};
 use crate::domain::ports::LlmClient;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ const SEED_FACT_COUNT: usize = 3;
 /// the MCP `query_memory` default and the agent-writes-default-`reality`
 /// convention (design §7 / plan finding). Callers wanting another layer pass it
 /// explicitly.
-const DEFAULT_CCL: &str = "reality";
+const DEFAULT_CCL: &str = REALITY_CCL;
 
 /// What kind of read a `memory.query` asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

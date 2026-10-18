@@ -1,5 +1,6 @@
-use crate::domain::models::{MemoryNode, MemoryResult, TenantId, TimeFilter};
+use crate::domain::models::{MemoryResult, TenantId, TimeFilter};
 use crate::domain::ports::{LlmClient, MemoryRepository};
+use crate::domain::tuning::STM_RECALL_K;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ impl RetrievalService {
             tenant_id,
             time_filter,
             ccl_filter,
-            10,
+            STM_RECALL_K,
         )?;
 
         Ok(results)
@@ -53,18 +54,5 @@ impl RetrievalService {
     ) -> Result<Vec<MemoryResult>> {
         self.memory_repo
             .recent_in_context(tenant_id, ccl_filter, context_key, limit)
-    }
-
-    /// Legacy: simple hybrid search without graph traversal (for backward compatibility)
-    pub async fn query_simple(
-        &self,
-        tenant_id: &TenantId,
-        raw_query: &str,
-    ) -> Result<Vec<MemoryNode>> {
-        let embedding = self.llm_client.embed_text(raw_query).await?;
-        let results = self
-            .memory_repo
-            .hybrid_search(raw_query, &embedding, tenant_id, 10)?;
-        Ok(results)
     }
 }

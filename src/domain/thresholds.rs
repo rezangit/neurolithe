@@ -12,7 +12,8 @@
 //!
 //! Resolution, per value: explicit config → the model's entry in
 //! [`MODEL_DEFAULTS`] → the fallback (the default local model's values, with a
-//! startup warning suggesting calibration via `placement_debug`).
+//! startup warning suggesting calibration via
+//! `inspect` with `view: "placement"`).
 
 use anyhow::{Result, bail};
 use serde::Serialize;
@@ -26,7 +27,8 @@ pub struct ThresholdValues {
 }
 
 /// Measured defaults for Google `text-embedding-004` (768-d, unit-normalised) —
-/// the legacy hard-coded values. Placement: `placement_debug` over a real corpus
+/// the legacy hard-coded values. Placement: the placement probes of the `inspect`
+/// tool over a real corpus
 /// showed document→concept L2 distances in ~[0.91, 1.16] (median 1.05, cosine
 /// ~0.33–0.59); 1.10 (cosine ≈ 0.40) files the confident majority and leaves the
 /// ambiguous tail in the inbox (earlier guesses 0.5 and 0.85 filed everything
@@ -111,7 +113,7 @@ pub struct ThresholdOverrides {
 }
 
 /// The effective thresholds for a process, resolved once at startup and
-/// reported by `placement_debug`.
+/// reported by the `inspect` tool's `placement` view.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Thresholds {
     /// The embedding model they were resolved for.
@@ -166,7 +168,8 @@ impl Thresholds {
             format!(
                 "no calibrated distance thresholds for embedding model '{model_id}'; using \
                  generic defaults (placement {}, assimilation {}, accommodation {}). Calibrate \
-                 with the `placement_debug` tool and set `[ltm] placement_max_distance` / \
+                 with the `inspect` tool (`view: \"placement\"`) and set \
+                 `[ltm] placement_max_distance` / \
                  `[stm] assimilation_threshold` / `[stm] accommodation_threshold`.",
                 thresholds.placement_max_distance.value,
                 thresholds.assimilation.value,
@@ -278,7 +281,11 @@ mod tests {
         );
         assert_eq!(t.assimilation.source, ThresholdSource::Fallback);
         let warn = warn.expect("fallback warns");
-        assert!(warn.contains("placement_debug") && warn.contains("placement_max_distance"));
+        assert!(
+            warn.contains("`inspect` tool (`view: \"placement\"`)")
+                && warn.contains("placement_max_distance")
+        );
+        assert!(!warn.contains("placement_debug"), "{warn}");
 
         // Unknown model fully configured → no fallback, no warning.
         let (t, warn) = Thresholds::resolve(

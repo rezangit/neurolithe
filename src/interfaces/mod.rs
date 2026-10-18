@@ -6,7 +6,6 @@ pub mod cli;
 pub mod command_consumer;
 #[cfg(feature = "kafka")]
 pub mod kafka_feeder;
-pub mod mcp_server;
-pub mod mcp_types;
+pub mod mcp;
 #[cfg(feature = "kafka")]
 pub mod query_consumer;

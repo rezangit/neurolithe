@@ -66,7 +66,7 @@ fn remember_document_then_recall_it() {
     assert_eq!(hit["provenance"]["source"], "remember_document", "{hit}");
     assert!(hit["ancestors"].is_array(), "{hit}");
 
-    let trace = h.call("trace_dataId", json!({"dataId": data_id}));
+    let trace = h.call("inspect", json!({"view": "trace", "data_id": data_id}));
     trace.assert_ok();
     assert!(!trace.json()["ltm_leaf"].is_null(), "{}", trace.text);
 
@@ -178,7 +178,7 @@ fn documents_are_isolated_per_workspace_and_survive_restart() {
         "leaked across workspaces: {}",
         hits.text
     );
-    let trace = server.call_tool("trace_dataId", json!({"dataId": "pp-1"}));
+    let trace = server.call_tool("inspect", json!({"view": "trace", "data_id": "pp-1"}));
     assert!(trace.json()["ltm_leaf"].is_null(), "{}", trace.text);
 }
 
@@ -195,7 +195,7 @@ fn concept_names(nodes: &Value, out: &mut Vec<String>) {
 }
 
 fn map_names(server: &mut common::McpProcess) -> Vec<String> {
-    let res = server.call_tool("ltm_map", json!({"depth": 5}));
+    let res = server.call_tool("inspect", json!({"view": "ltm_map", "depth": 5}));
     assert!(!res.is_error, "{}", res.text);
     let mut names = Vec::new();
     concept_names(&res.json(), &mut names);
