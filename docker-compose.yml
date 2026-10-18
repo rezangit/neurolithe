@@ -29,7 +29,7 @@ name: neurolithe
 services:
   neurolithe:
     build: .
-    image: neurolithe:0.3
+    image: neurolithe:0.4
     restart: unless-stopped
     # On SIGTERM the daemon drains in-flight Kafka messages (up to 8 s), then
     # checkpoints the stores' WAL. Docker's default 10 s grace is too tight.

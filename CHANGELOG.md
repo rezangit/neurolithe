@@ -3,6 +3,24 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
+## [0.4.2] — 2026-10-17
+
+### Fixed
+
+- Kafka mode: the command consumer (`<group_id>-cmd`) now starts at the end of
+  `memory.command` when its group has no committed offset (first start, a
+  renamed group, or offsets the broker expired). Before, it replayed every
+  retained command, so an old `reset_soft`, `forget` or `remember` could run
+  again against the current memory.
+
+### Added
+
+- An "Operating and upgrading" section in the Kafka docs covers consumer
+  groups, topics and keying, test instances, post-start checks and rollback.
+  Kafka mode was tested against a real broker: ingest, duplicates, changed and
+  deleted documents, crashes and SIGTERM mid-burst, poison messages, hard
+  reset, a rebalance, and an upgrade from 0.3.0 with rollback.
+
 ## [0.4.1] — 2026-10-17
 
 ### Changed
