@@ -3,7 +3,7 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [0.4.2] — 2026-10-17
+## [0.4.2] — 2026-10-18
 
 ### Fixed
 
