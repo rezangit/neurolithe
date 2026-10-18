@@ -177,8 +177,8 @@ pub fn main_entry() -> Result<i32> {
         Some(Command::Workspace(WorkspaceCommand::Import { name, stm, ltm })) => {
             let config = load_config(&opts)?;
             let identity = run_local(async {
-                let llm = crate::daemon::build_llm(&config);
-                crate::daemon::resolve_identity(llm.as_ref()).await
+                let models = crate::daemon::build_models(&config);
+                crate::daemon::resolve_identity(models.embedder.as_ref()).await
             })?;
             import_workspace(
                 &config,
@@ -198,8 +198,8 @@ pub fn main_entry() -> Result<i32> {
         Some(Command::Reembed) => {
             let config = load_config(&opts)?;
             run_local(async {
-                let llm = crate::daemon::build_llm(&config);
-                reembed_command(&config, llm, &mut std::io::stdout()).await
+                let models = crate::daemon::build_models(&config);
+                reembed_command(&config, models.embedder, &mut std::io::stdout()).await
             })?;
             Ok(0)
         }
@@ -540,7 +540,7 @@ pub fn workspace_command(
 /// No other process may have the workspace open.
 pub async fn reembed_command(
     config: &AppConfig,
-    embedder: std::sync::Arc<dyn crate::domain::ports::LlmClient>,
+    embedder: std::sync::Arc<dyn crate::domain::ports::Embedder>,
     out: &mut dyn Write,
 ) -> Result<()> {
     let dir = existing_workspace(config, &config.workspace)?;
@@ -978,24 +978,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::domain::ports::LlmClient for DimStub {
-        async fn extract_facts(
-            &self,
-            _d: &str,
-            _c: &[crate::domain::models::CclDefinition],
-        ) -> Result<Vec<crate::domain::ports::ExtractedFact>> {
-            Ok(Vec::new())
-        }
-        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
-            Ok(String::new())
-        }
+    impl crate::domain::ports::Embedder for DimStub {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             let mut v = vec![0.1_f32; self.dim];
             v[0] = text.len() as f32;
             Ok(v)
-        }
-        async fn compress_context(&self, m: &str) -> Result<String> {
-            Ok(m.to_string())
         }
         fn embedding_model_id(&self) -> String {
             format!("stub:{}", self.model)
@@ -1010,12 +997,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let config = config_in(home.path());
         let dir = config.workspaces_dir().join(&config.workspace);
-        let old: std::sync::Arc<dyn crate::domain::ports::LlmClient> =
+        let old: std::sync::Arc<dyn crate::domain::ports::Embedder> =
             std::sync::Arc::new(DimStub {
                 dim: 4,
                 model: "old",
             });
-        let new: std::sync::Arc<dyn crate::domain::ports::LlmClient> =
+        let new: std::sync::Arc<dyn crate::domain::ports::Embedder> =
             std::sync::Arc::new(DimStub {
                 dim: 6,
                 model: "new",
@@ -1063,7 +1050,7 @@ mod tests {
         // A workspace that doesn't exist is an error, not a silent create.
         let mut other = config.clone();
         other.workspace = "missing".into();
-        let old_again: std::sync::Arc<dyn crate::domain::ports::LlmClient> =
+        let old_again: std::sync::Arc<dyn crate::domain::ports::Embedder> =
             std::sync::Arc::new(DimStub {
                 dim: 4,
                 model: "old",
@@ -1205,7 +1192,7 @@ mod tests {
         assert!(err.to_string().contains("in use"), "{err}");
         assert!(dir.exists());
 
-        let embedder: std::sync::Arc<dyn crate::domain::ports::LlmClient> =
+        let embedder: std::sync::Arc<dyn crate::domain::ports::Embedder> =
             std::sync::Arc::new(DimStub { dim: 4, model: "m" });
         let err = reembed_command(&config, embedder, &mut Vec::new())
             .await

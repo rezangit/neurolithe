@@ -28,7 +28,11 @@ their limits and the tool's annotations.
 
 ## Behavior
 
-Idempotent by `data_id`: passing an existing id replaces that document (upsert).
+The document's full text (with its title and tags) is kept for keyword recall,
+so `recall_ltm` finds words anywhere in it, not just in the summary.
+
+Idempotent by `data_id`: passing an existing id replaces that document (upsert),
+its kept text included.
 The new copy is placed before the old one is removed, so a failure never loses
 the previous version. Find the document again with
 [`recall_ltm`](./recall-ltm.md), or locate it with

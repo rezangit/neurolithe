@@ -54,6 +54,44 @@ best-matching concept (or the inbox), and also stored as a decaying STM fact.
 - An event without `text` is skipped with a warning.
 - An event without `data_id` is dead-lettered.
 
+## Redelivery and offsets
+
+The documents consumer delivers at least once, and ingest is idempotent, so a
+redelivered event does no harm.
+
+- **Upsert by `data_id`.** A document is stored once: one LTM leaf and one STM
+  fact per `data_id`. An event whose `title`, `text` and `tags` match the
+  stored version is ignored, without summarizing or embedding it again. `ts`
+  isn't compared. A changed event replaces the stored version in both stores;
+  the old content is removed, not merged. The new STM fact starts fresh
+  (support count 1, full relevance).
+- **Crash safety.** The two stores are separate SQLite files, so one event
+  can't be written in a single transaction. LTM is written first and STM last.
+  Each step is its own transaction and is safe to repeat. The STM fact carries
+  a fingerprint of the content, and that marks the event as done. If a crash
+  comes before it, the redelivered event redoes the whole write and removes any
+  duplicate leaf.
+- **Offsets.** An offset is committed only after its message is handled:
+  written, skipped, or forwarded to `dlq` or `parking`. Offsets aren't stored
+  automatically, so the commit at shutdown covers handled messages only. A
+  message cut off by a crash, a rebalance or a shutdown is delivered again.
+- **Poison messages don't block the partition.** Un-parseable bytes go to
+  `parking`, and events without a `data_id` go to `dlq`, straight away. An
+  ingest or forget that fails 3 times (0.5 s apart) goes to `dlq`, with the
+  error in the `x-reason` header. Only forwarding to `dlq` or `parking` is
+  retried until it works (backing off to 30 s between tries), because
+  committing first would lose the message. While it keeps failing, the
+  partition waits and each failure is logged as an error.
+- **Hard reset** rewinds the feeder and commits the start position at once,
+  so a restart before the replay commits anything still replays from the
+  beginning. A message that was being handled when the reset arrived isn't
+  committed afterwards.
+- **Tombstones** are idempotent too. Forgetting a `data_id` that is unknown
+  or already forgotten succeeds.
+
+A soft reset clears STM, so a later redelivery or replay of an unchanged
+event writes it again; its LTM leaf is replaced by an identical one.
+
 ## Workspaces and tenants
 
 The daemon serves exactly one workspace (`--workspace`, `NEUROLITHE_WORKSPACE` or
@@ -82,7 +120,8 @@ key is read as a dot. That lets secrets come from the environment:
 `NEUROLITHE__KAFKA__CLIENT__SASL_PASSWORD=…`.
 
 `[kafka.client]` cannot override `bootstrap.servers`, `group.id`,
-`enable.auto.commit` or `auto.offset.reset`.
+`enable.auto.commit`, `enable.auto.offset.store` or `auto.offset.reset`
+(or their aliases), because offset handling depends on them.
 
 ## Security
 

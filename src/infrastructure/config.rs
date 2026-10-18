@@ -41,6 +41,8 @@ pub struct AppConfig {
     pub bus_query: BusQueryConfig,
     #[serde(default)]
     pub decay: DecayConfig,
+    #[serde(default)]
+    pub retrieval: RetrievalConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,8 +116,12 @@ pub enum LlmProvider {
 
 impl LlmProvider {
     /// Whether this provider can serve chat calls (extraction, compression).
+    /// `local` and `vertex` only compute embeddings.
     pub fn is_chat(&self) -> bool {
-        !matches!(self, LlmProvider::Local | LlmProvider::None)
+        !matches!(
+            self,
+            LlmProvider::Local | LlmProvider::Vertex | LlmProvider::None
+        )
     }
 }
 
@@ -138,6 +144,11 @@ pub struct StoreConfig {
     /// embedding model's default (see `domain::thresholds`). `[ltm]` only.
     #[serde(default)]
     pub placement_max_distance: Option<f64>,
+    /// `[ltm] placement_min_margin` — file a document only if its nearest
+    /// concept is at least this much closer than the runner-up (else the
+    /// inbox). `0` = off. Unset → the model default (`0`). `[ltm]` only.
+    #[serde(default)]
+    pub placement_min_margin: Option<f64>,
     /// `[stm] assimilation_threshold` — a new fact this close to an existing
     /// one is the same fact (reinforced). Unset → model default. `[stm]` only.
     #[serde(default)]
@@ -155,6 +166,7 @@ impl AppConfig {
     pub fn threshold_overrides(&self) -> crate::domain::thresholds::ThresholdOverrides {
         crate::domain::thresholds::ThresholdOverrides {
             placement_max_distance: self.ltm.placement_max_distance,
+            placement_min_margin: self.ltm.placement_min_margin,
             assimilation: self.stm.assimilation_threshold,
             accommodation: self.stm.accommodation_threshold,
         }
@@ -455,6 +467,54 @@ impl Default for DecayConfig {
     }
 }
 
+/// `[retrieval]`: how STM search ranks its hits (reciprocal rank fusion of
+/// the vector and keyword legs; see `domain::tuning::Ranking`). Every key is
+/// optional; the defaults are the tuned values.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetrievalConfig {
+    /// RRF damping constant (default 60).
+    pub rrf_k: f64,
+    /// Weight of the vector (semantic) leg (default 1.0).
+    pub vector_weight: f64,
+    /// Weight of the keyword (FTS5) leg (default 1.0).
+    pub keyword_weight: f64,
+    /// Each leg ranks `leg_k_factor × k` candidates (default 4).
+    pub leg_k_factor: usize,
+    /// Drop English stop-words from the keyword query (default true).
+    pub fts_stopwords: bool,
+    /// Add each direct hit's fused `score` to query_memory results (default false).
+    pub include_scores: bool,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        let r = crate::domain::tuning::Ranking::default();
+        Self {
+            rrf_k: r.rrf_k,
+            vector_weight: r.vector_weight,
+            keyword_weight: r.keyword_weight,
+            leg_k_factor: r.leg_k_factor,
+            fts_stopwords: r.fts_stopwords,
+            include_scores: r.include_scores,
+        }
+    }
+}
+
+impl RetrievalConfig {
+    /// The search fusion these settings describe.
+    pub fn ranking(&self) -> crate::domain::tuning::Ranking {
+        crate::domain::tuning::Ranking {
+            rrf_k: self.rrf_k,
+            vector_weight: self.vector_weight,
+            keyword_weight: self.keyword_weight,
+            leg_k_factor: self.leg_k_factor,
+            fts_stopwords: self.fts_stopwords,
+            include_scores: self.include_scores,
+        }
+    }
+}
+
 impl DecayConfig {
     /// The `working` half-life converted to days (the unit the `DecayEngine`
     /// works in). 1440 minutes = 1 day.
@@ -580,8 +640,18 @@ impl AppConfig {
                 "stm.assimilation_threshold ({a}) must be smaller than stm.accommodation_threshold ({c})"
             ));
         }
+        if let Some(m) = self.ltm.placement_min_margin
+            && !(m.is_finite() && m >= 0.0)
+        {
+            problems.push(format!(
+                "ltm.placement_min_margin must be a finite number >= 0 (got {m})"
+            ));
+        }
         if self.stm.placement_max_distance.is_some() {
             problems.push("placement_max_distance belongs under [ltm], not [stm]".into());
+        }
+        if self.stm.placement_min_margin.is_some() {
+            problems.push("placement_min_margin belongs under [ltm], not [stm]".into());
         }
         if self.ltm.assimilation_threshold.is_some() || self.ltm.accommodation_threshold.is_some() {
             problems.push(
@@ -600,7 +670,13 @@ impl AppConfig {
         match self.llm.provider {
             LlmProvider::Local => problems.push(
                 "llm.provider = 'local' only computes embeddings; set llm.provider to \
-                 'none' (no chat LLM) or a chat provider (openai, anthropic, gemini, vertex, custom)"
+                 'none' (no chat LLM) or a chat provider (openai, anthropic, gemini, custom)"
+                    .into(),
+            ),
+            LlmProvider::Vertex => problems.push(
+                "llm.provider = 'vertex' is not a chat provider here (Vertex only computes \
+                 embeddings); set llm.provider to 'none' or a chat provider (openai, anthropic, \
+                 gemini, custom) and use llm.embedding_provider = 'vertex' for embeddings"
                     .into(),
             ),
             LlmProvider::None => {}
@@ -639,6 +715,14 @@ impl AppConfig {
             }
             _ => {}
         }
+
+        problems.extend(
+            self.retrieval
+                .ranking()
+                .problems()
+                .into_iter()
+                .map(|p| format!("retrieval.{p}")),
+        );
 
         if problems.is_empty() {
             Ok(())
@@ -849,6 +933,7 @@ mod tests {
 
         let env: HashMap<String, String> = [
             ("NEUROLITHE__LTM__PLACEMENT_MAX_DISTANCE", "0.9"),
+            ("NEUROLITHE__LTM__PLACEMENT_MIN_MARGIN", "0.03"),
             ("NEUROLITHE__STM__ASSIMILATION_THRESHOLD", "0.2"),
             ("NEUROLITHE__STM__ACCOMMODATION_THRESHOLD", "0.4"),
         ]
@@ -858,6 +943,7 @@ mod tests {
         let cfg = AppConfig::build(None, Some(env)).unwrap();
         let o = cfg.threshold_overrides();
         assert_eq!(o.placement_max_distance, Some(0.9));
+        assert_eq!(o.placement_min_margin, Some(0.03));
         assert_eq!(o.assimilation, Some(0.2));
         assert_eq!(o.accommodation, Some(0.4));
         cfg.validate().expect("valid thresholds");
@@ -882,6 +968,18 @@ mod tests {
             (
                 |c: &mut AppConfig| c.stm.placement_max_distance = Some(1.0),
                 "placement_max_distance belongs under [ltm]",
+            ),
+            (
+                |c: &mut AppConfig| c.ltm.placement_min_margin = Some(-0.01),
+                "ltm.placement_min_margin must be a finite number >= 0",
+            ),
+            (
+                |c: &mut AppConfig| c.ltm.placement_min_margin = Some(f64::NAN),
+                "ltm.placement_min_margin must be a finite number >= 0",
+            ),
+            (
+                |c: &mut AppConfig| c.stm.placement_min_margin = Some(0.03),
+                "placement_min_margin belongs under [ltm]",
             ),
             (
                 |c: &mut AppConfig| c.ltm.accommodation_threshold = Some(0.3),
@@ -913,6 +1011,16 @@ mod tests {
         assert!(err.contains("llm.model must not be empty"), "{err}");
         cfg.llm.model = "gpt-4o-mini".into();
         cfg.validate().expect("openai chat + local embeddings");
+
+        // 3.7b: Vertex only serves embeddings here; as the chat provider it
+        // is a startup error, not a failure on the first extraction.
+        let mut cfg = valid();
+        cfg.llm.provider = LlmProvider::Vertex;
+        cfg.llm.model = "gemini-1.5-pro".into();
+        cfg.llm.embedding_project = Some("p".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("llm.provider = 'vertex'"), "{err}");
+        assert!(err.contains("embedding_provider"), "{err}");
     }
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
@@ -1202,5 +1310,58 @@ description = "Project work"
         let mut cfg = AppConfig::build(None, no_env()).unwrap();
         cfg.kafka = kafka;
         assert!(!format!("{cfg:?}").contains("hunter2-pw"));
+    }
+
+    /// `[retrieval]` defaults to the tuned ranking; set keys override, the
+    /// rest keep their defaults.
+    #[test]
+    fn test_retrieval_section_defaults_and_overrides() {
+        let cfg = AppConfig::build(None, no_env()).unwrap();
+        assert_eq!(
+            cfg.retrieval.ranking(),
+            crate::domain::tuning::Ranking::default()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("neurolithe.toml");
+        std::fs::write(
+            &path,
+            "[retrieval]\nrrf_k = 20\nvector_weight = 2.0\ninclude_scores = true\n",
+        )
+        .unwrap();
+        let cfg = AppConfig::build(Some(&path), no_env()).unwrap();
+        let r = cfg.retrieval.ranking();
+        assert_eq!(r.rrf_k, 20.0);
+        assert_eq!(r.vector_weight, 2.0);
+        assert!(r.include_scores);
+        assert_eq!(r.keyword_weight, 1.0);
+        assert_eq!(r.leg_k_factor, 4);
+        assert!(r.fts_stopwords);
+        cfg.validate().unwrap();
+    }
+
+    /// Unusable `[retrieval]` values are config errors, named by key; a
+    /// misspelled key is rejected rather than silently ignored.
+    #[test]
+    fn test_validate_rejects_bad_retrieval_values() {
+        let mut cfg = valid();
+        cfg.retrieval.rrf_k = -1.0;
+        cfg.retrieval.vector_weight = 0.0;
+        cfg.retrieval.keyword_weight = 0.0;
+        cfg.retrieval.leg_k_factor = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        for needle in [
+            "retrieval.rrf_k",
+            "retrieval.vector_weight and keyword_weight",
+            "retrieval.leg_k_factor",
+        ] {
+            assert!(err.contains(needle), "missing '{needle}' in: {err}");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("neurolithe.toml");
+        std::fs::write(&path, "[retrieval]\nrrf = 20\n").unwrap();
+        let err = AppConfig::build(Some(&path), no_env()).unwrap_err();
+        assert!(format!("{err:#}").contains("rrf"), "{err:#}");
     }
 }

@@ -47,6 +47,7 @@ pub(super) fn recent_in_context(
                         connections: Vec::new(),
                         data_id: row.get(5)?,
                         context_key: row.get(4)?,
+                        score: None,
                     },
                 ))
             },
@@ -64,16 +65,28 @@ pub(super) fn recent_in_context(
     Ok(results)
 }
 
+/// A turn's `about` edges (`?1` turn id) with each subject's label and
+/// dataId. Served by `idx_edges_source (source_id, relation)`.
+pub(super) const ABOUT_SUBJECTS_SQL: &str = "
+    SELECT json_extract(s.payload, '$.fact'), json_extract(s.payload, '$.dataId')
+    FROM edges e JOIN nodes s ON s.id = e.target_id
+    WHERE e.source_id = ?1 AND e.relation = 'about'
+    ORDER BY s.id";
+
+/// The newest active `working` subject anchor for a dataId in one context
+/// (`?1` tenant, `?2` context key, `?3` dataId).
+pub(super) const FIND_WORKING_SUBJECT_SQL: &str = "
+    SELECT id FROM nodes
+    WHERE tenant_id = ?1 AND context_key = ?2 AND ccl = 'working' AND status = 'active'
+      AND json_extract(payload, '$.kind') = 'subject'
+      AND json_extract(payload, '$.dataId') = ?3
+    ORDER BY id DESC LIMIT 1";
+
 /// The `about` subjects of a turn (STM-GRAPH), as connections: one per
 /// `turn —about→ subject` edge, entity = "label (dataId)" so the caller sees
 /// both the human label and the id it needs to act on.
 fn about_subjects(conn: &Connection, turn_id: i64) -> Result<Vec<MemoryConnection>> {
-    let mut stmt = conn.prepare(
-        "SELECT json_extract(s.payload, '$.fact'), json_extract(s.payload, '$.dataId')
-         FROM edges e JOIN nodes s ON s.id = e.target_id
-         WHERE e.source_id = ?1 AND e.relation = 'about'
-         ORDER BY s.id",
-    )?;
+    let mut stmt = conn.prepare(ABOUT_SUBJECTS_SQL)?;
     let rows = stmt.query_map(params![turn_id], |row| {
         let label: Option<String> = row.get(0)?;
         let data_id: Option<String> = row.get(1)?;
@@ -109,11 +122,7 @@ pub(super) fn find_working_subject(
 ) -> Result<Option<i64>> {
     let id = conn
         .query_row(
-            "SELECT id FROM nodes
-             WHERE tenant_id = ?1 AND context_key = ?2 AND ccl = 'working' AND status = 'active'
-               AND json_extract(payload, '$.kind') = 'subject'
-               AND json_extract(payload, '$.dataId') = ?3
-             ORDER BY id DESC LIMIT 1",
+            FIND_WORKING_SUBJECT_SQL,
             params![tenant_id.0, context_key, data_id],
             |r| r.get::<_, i64>(0),
         )

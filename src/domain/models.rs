@@ -98,6 +98,11 @@ pub struct MemoryResult {
     /// bus reply tell the agent which thread a situational note belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_key: Option<String>,
+    /// The fused search score of a direct hit (higher is better), when
+    /// `[retrieval] include_scores` is on. `None` for graph neighbours and
+    /// recency reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 /// A 1-hop connection returned in query results

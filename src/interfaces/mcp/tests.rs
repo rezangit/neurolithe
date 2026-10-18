@@ -1,7 +1,7 @@
 use super::*;
 use crate::daemon::SqliteWorkspaceHost;
 use crate::domain::models::CclDefinition;
-use crate::domain::ports::{ExtractedFact, LlmClient};
+use crate::domain::ports::{ChatModel, Embedder, ExtractedFact, Models};
 use crate::infrastructure::config::{AppConfig, LoadOptions};
 use serde_json::json;
 use std::collections::HashMap;
@@ -14,7 +14,7 @@ const DIM: usize = 4;
 struct StubLlm;
 
 #[async_trait::async_trait]
-impl LlmClient for StubLlm {
+impl ChatModel for StubLlm {
     async fn extract_facts(
         &self,
         _dialogue: &str,
@@ -25,12 +25,16 @@ impl LlmClient for StubLlm {
     async fn generate_ccl_description(&self, _n: &str, _c: &str) -> anyhow::Result<String> {
         Ok("layer".into())
     }
+    async fn compress_context(&self, m: &str) -> anyhow::Result<String> {
+        Ok(m.chars().take(20).collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for StubLlm {
     async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         let l = text.len() as f32;
         Ok(vec![1.0, l.sin(), l.cos(), 0.5])
-    }
-    async fn compress_context(&self, m: &str) -> anyhow::Result<String> {
-        Ok(m.chars().take(20).collect())
     }
 }
 
@@ -65,7 +69,7 @@ struct SlowLlm {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for SlowLlm {
+impl ChatModel for SlowLlm {
     async fn extract_facts(
         &self,
         d: &str,
@@ -76,12 +80,16 @@ impl LlmClient for SlowLlm {
     async fn generate_ccl_description(&self, n: &str, c: &str) -> anyhow::Result<String> {
         StubLlm.generate_ccl_description(n, c).await
     }
+    async fn compress_context(&self, m: &str) -> anyhow::Result<String> {
+        StubLlm.compress_context(m).await
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for SlowLlm {
     async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
         tokio::time::sleep(self.delay).await;
         StubLlm.embed_text(text).await
-    }
-    async fn compress_context(&self, m: &str) -> anyhow::Result<String> {
-        StubLlm.compress_context(m).await
     }
 }
 
@@ -91,10 +99,13 @@ async fn harness_with(allow_switch: bool) -> Harness {
     harness_llm(allow_switch, Arc::new(StubLlm)).await
 }
 
-async fn harness_llm(allow_switch: bool, llm: Arc<dyn LlmClient>) -> Harness {
+async fn harness_llm<L: ChatModel + Embedder + 'static>(
+    allow_switch: bool,
+    llm: Arc<L>,
+) -> Harness {
     let home = tempfile::tempdir().unwrap();
     let config = test_config(home.path(), allow_switch);
-    let host = SqliteWorkspaceHost::new(config.clone(), llm);
+    let host = SqliteWorkspaceHost::new(config.clone(), Models::new(llm.clone(), Some(llm)));
     let workspaces = WorkspaceManager::start(Box::new(host), &config.workspace, allow_switch)
         .await
         .unwrap();
@@ -766,6 +777,26 @@ async fn test_workspace_export() {
     assert!(is_error(&r), "{r}");
 }
 
+/// W3R-5: the export carries each document's full text, not just the
+/// summary excerpt.
+#[tokio::test]
+async fn test_workspace_export_includes_document_bodies() {
+    let h = harness().await;
+    let body = format!("{} the end", "a long document line. ".repeat(100));
+    call(
+        &h,
+        "remember_document",
+        json!({ "title": "Long", "text": body, "data_id": "doc_long" }),
+    )
+    .await;
+    let r = call(&h, "workspace_export", json!({})).await;
+    let dump: Value = serde_json::from_str(&text(&r)).unwrap();
+    let leaf = &dump["ltm_leaves"][0];
+    assert_eq!(leaf["data_id"], "doc_long", "{dump}");
+    assert_eq!(leaf["body"], body.as_str(), "full text, not the excerpt");
+    assert!(leaf["summary"].as_str().unwrap().len() < body.len());
+}
+
 /// 2.5: remember_document files into LTM (upsert by data_id) and needs text.
 #[tokio::test]
 async fn test_remember_document_upserts() {
@@ -784,6 +815,68 @@ async fn test_remember_document_upserts() {
     let r = call(&h, "remember_document", args).await;
     let second: Value = serde_json::from_str(&text(&r)).unwrap();
     assert_eq!(second["updated"], true, "same data_id replaces: {r}");
+}
+
+/// E2: recall_ltm finds a document by words deep in its full text (past the
+/// summary excerpt), ranked first by the fused score.
+#[tokio::test]
+async fn test_recall_ltm_matches_full_text() {
+    let h = harness().await;
+    let filler = "lorem ipsum dolor sit amet ".repeat(80);
+    let body = format!("{filler} the lighthouse keeper retired in spring");
+    let r = call(
+        &h,
+        "remember_document",
+        json!({ "title": "Old letter", "text": body, "data_id": "doc_deep" }),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let r = call(
+        &h,
+        "recall_ltm",
+        json!({ "query": "lighthouse keeper", "k": 1 }),
+    )
+    .await;
+    let hits: Value = serde_json::from_str(&text(&r)).unwrap();
+    assert_eq!(hits[0]["dataId"], "doc_deep", "{hits}");
+    // Scores are off by default.
+    assert!(hits[0].get("score").is_none(), "{hits}");
+}
+
+/// E2: with `[retrieval] include_scores`, each recall_ltm entry carries the
+/// fused score of its hit.
+#[tokio::test]
+async fn test_recall_ltm_scores_when_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let mut config = test_config(home.path(), true);
+    config.retrieval.include_scores = true;
+    let host = SqliteWorkspaceHost::new(
+        config.clone(),
+        Models::new(Arc::new(StubLlm), Some(Arc::new(StubLlm))),
+    );
+    let workspaces = WorkspaceManager::start(Box::new(host), &config.workspace, true)
+        .await
+        .unwrap();
+    let h = Harness {
+        server: McpServer::new(Rc::new(workspaces), true),
+        home,
+    };
+    call(
+        &h,
+        "remember_document",
+        json!({ "title": "t", "text": "the lighthouse keeper", "data_id": "d" }),
+    )
+    .await;
+    let r = call(&h, "recall_ltm", json!({ "query": "lighthouse", "k": 3 })).await;
+    let hits: Value = serde_json::from_str(&text(&r)).unwrap();
+    let scores: Vec<f64> = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["score"].as_f64().expect("score present"))
+        .collect();
+    assert!(!scores.is_empty());
+    assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
 }
 
 /// 2.2 / 3.2: the old tenant tools and the folded-in inspection tools are

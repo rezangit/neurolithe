@@ -106,9 +106,9 @@ pub const TOOLS: &[ToolDef] = &[
         group: Group::Memory,
         description: "Search SHORT-TERM working memory (recent, decaying facts) for relevant \
             context. Hybrid keyword + semantic search; returns facts (best first) with 1-hop \
-            connections and temporal bounds. Reading a fact reinforces it (its relevance is \
-            restored and its decay clock restarts). For the permanent document archive, use \
-            recall_ltm.",
+            connections and temporal bounds, and each direct hit's fused score when the server \
+            enables scores. Reading a fact reinforces it (its relevance is restored and its decay \
+            clock restarts). For the permanent document archive, use recall_ltm.",
         input_schema: query_memory_schema,
         // Not read-only: recall reinforces the facts it returns. That write
         // is harmless and repeating it changes nothing further.
@@ -124,9 +124,11 @@ pub const TOOLS: &[ToolDef] = &[
         title: "Search the long-term archive",
         group: Group::Memory,
         description: "Search the PERMANENT long-term archive (all filed documents and notes) by \
-            meaning. Reference-returning: each hit carries the document's dataId, provenance and \
-            ancestor concepts, so you can fetch the original. The primary tool for finding a \
-            document, receipt, letter, or report.",
+            meaning and by the words of each document's full text, fused into one ranking. \
+            Reference-returning: each hit carries the document's dataId, provenance, ancestor \
+            concepts and vector distance (and its fused score, when the server enables scores), \
+            so you can fetch the original. The primary tool for finding a document, receipt, \
+            letter, or report.",
         input_schema: recall_ltm_schema,
         hints: READ_ONLY,
         needs_switching: false,
@@ -199,8 +201,8 @@ pub const TOOLS: &[ToolDef] = &[
         name: "workspace_export",
         title: "Export a workspace",
         group: Group::Workspace,
-        description: "JSON dump of a workspace's STM facts and LTM document leaves: \
-            {workspace, stm_facts, ltm_leaves}. Defaults to the active workspace.",
+        description: "JSON dump of a workspace's STM facts and LTM document leaves (each with \
+            its full text): {workspace, stm_facts, ltm_leaves}. Defaults to the active workspace.",
         input_schema: name_optional_schema,
         hints: READ_ONLY,
         needs_switching: false,
@@ -283,9 +285,12 @@ pub const INSPECT_VIEWS: &[ViewDef] = &[
     },
     ViewDef {
         name: "placement",
-        description: "{thresholds, probes}: the effective distance thresholds with their source \
-            (config / model_default / fallback), and for a sample of document leaves the distance \
-            to their nearest concept. Used to tune the placement thresholds.",
+        description: "{thresholds, probes}: the effective distance thresholds (including \
+            placement_min_margin) with their source (config / model_default / fallback), and for \
+            a sample of document leaves the nearest and runner-up concepts (never the root) with \
+            their distances, the margin between them, and the placement decision under the \
+            current settings (file / inbox_too_far / inbox_ambiguous). Used to tune the placement \
+            cutoff and margin.",
         params: &["sample"],
     },
 ];

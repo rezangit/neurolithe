@@ -337,6 +337,7 @@ mod tests {
             "unknown:model",
             crate::domain::thresholds::ThresholdOverrides {
                 placement_max_distance: None,
+                placement_min_margin: None,
                 assimilation: Some(assimilation),
                 accommodation: Some(accommodation),
             },

@@ -7,8 +7,8 @@
 //! document again with the same id replaces the previous version.
 
 use crate::application::ltm_placement::{DocumentToPlace, LtmPlacement};
-use crate::domain::ltm::{LtmRepository, Provenance, TreeNodeKind};
-use crate::domain::ports::LlmClient;
+use crate::domain::ltm::{DocumentBody, LtmRepository, Provenance, TreeNodeKind};
+use crate::domain::ports::{ChatModel, Embedder};
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -53,23 +53,26 @@ pub struct RememberedDocument {
 /// Files documents into LTM (see module docs).
 pub struct DocumentService {
     ltm: Arc<dyn LtmRepository>,
-    /// Resolved placement threshold (see `domain::thresholds`).
-    placement_max_distance: f64,
-    /// Embeddings are required; summaries are used only when
-    /// [`LlmClient::chat_available`].
-    llm: Arc<dyn LlmClient>,
+    /// Resolved placement cutoff and margin (see `domain::thresholds`).
+    thresholds: crate::domain::thresholds::Thresholds,
+    /// Embeds the summary (required).
+    embedder: Arc<dyn Embedder>,
+    /// Summarizes the text; `None` (no chat model): an excerpt is used.
+    chat: Option<Arc<dyn ChatModel>>,
 }
 
 impl DocumentService {
     pub fn new(
         ltm: Arc<dyn LtmRepository>,
-        llm: Arc<dyn LlmClient>,
+        embedder: Arc<dyn Embedder>,
+        chat: Option<Arc<dyn ChatModel>>,
         thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
             ltm,
-            placement_max_distance: thresholds.placement_max_distance.value,
-            llm,
+            thresholds: thresholds.clone(),
+            embedder,
+            chat,
         }
     }
 
@@ -96,24 +99,38 @@ impl DocumentService {
             summary = format!("{summary}\nTags: {}", doc.tags.join(", "));
         }
         let embedding = self
-            .llm
+            .embedder
             .embed_text(&format!("{title}\n\n{summary}"))
             .await?;
 
         // Upsert: file the new version, then drop every older copy and re-roll
         // the parents they leave (see `LtmPlacement::replace`).
-        let (placed, replaced) = LtmPlacement::new(self.ltm.clone(), self.placement_max_distance)
-            .replace(&DocumentToPlace {
-            name: title,
-            summary,
-            embedding,
-            data_id: data_id.clone(),
-            provenance: Provenance {
-                source: DOCUMENT_SOURCE.to_string(),
-                ingested_at: None,
-                confidence: 1.0,
+        // The full text (and tags) for recall's keyword leg, stored with the
+        // new leaf in one transaction (W3R-2); a re-filing replaces it.
+        let body = DocumentBody {
+            title: title.clone(),
+            text: if doc.tags.is_empty() {
+                text.to_string()
+            } else {
+                format!("{text}\nTags: {}", doc.tags.join(", "))
             },
-        })?;
+        };
+
+        let (placed, replaced) = LtmPlacement::from_thresholds(self.ltm.clone(), &self.thresholds)
+            .replace_with_body(
+                &DocumentToPlace {
+                    name: title,
+                    summary,
+                    embedding,
+                    data_id: data_id.clone(),
+                    provenance: Provenance {
+                        source: DOCUMENT_SOURCE.to_string(),
+                        ingested_at: None,
+                        confidence: 1.0,
+                    },
+                },
+                Some(&body),
+            )?;
 
         Ok(RememberedDocument {
             data_id,
@@ -127,8 +144,8 @@ impl DocumentService {
     /// Summary via the chat LLM when available; otherwise (or on failure) the
     /// clipped text. Returns (summary, summarized_by_llm).
     async fn summarize(&self, text: &str) -> (String, bool) {
-        if self.llm.chat_available() {
-            match self.llm.compress_context(text).await {
+        if let Some(chat) = &self.chat {
+            match chat.compress_context(text).await {
                 Ok(s) if !s.trim().is_empty() => return (s.trim().to_string(), true),
                 Ok(_) => tracing::warn!("document summary was empty; storing an excerpt"),
                 Err(e) => {
@@ -184,13 +201,12 @@ mod tests {
     /// Embeds texts mentioning "invoice" near the `documents` concept, everything
     /// else far away; summarizes to a fixed marker (or fails).
     struct Stub {
-        chat: bool,
         summarize_fails: bool,
         summaries: AtomicUsize,
     }
 
     #[async_trait]
-    impl LlmClient for Stub {
+    impl ChatModel for Stub {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -201,6 +217,17 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok(String::new())
         }
+        async fn compress_context(&self, m: &str) -> Result<String> {
+            self.summaries.fetch_add(1, Ordering::SeqCst);
+            if self.summarize_fails {
+                bail!("LLM not configured");
+            }
+            Ok(format!("SUMMARY of {} chars", m.len()))
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for Stub {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             Ok(if text.contains("invoice") {
                 vec![1.0, 0.0, 0.0, 0.0]
@@ -210,16 +237,6 @@ mod tests {
             } else {
                 vec![0.0, 0.0, 0.0, 1.0]
             })
-        }
-        async fn compress_context(&self, m: &str) -> Result<String> {
-            self.summaries.fetch_add(1, Ordering::SeqCst);
-            if self.summarize_fails {
-                bail!("LLM not configured");
-            }
-            Ok(format!("SUMMARY of {} chars", m.len()))
-        }
-        fn chat_available(&self) -> bool {
-            self.chat
         }
     }
 
@@ -242,7 +259,6 @@ mod tests {
         repo.set_concept_embedding(documents.id.unwrap(), &[1.0, 0.0, 0.0, 0.0])
             .unwrap();
         let stub = Arc::new(Stub {
-            chat,
             summarize_fails,
             summaries: AtomicUsize::new(0),
         });
@@ -250,6 +266,8 @@ mod tests {
             DocumentService::new(
                 repo.clone(),
                 stub.clone(),
+                // `chat: false` is the no-chat mode: no chat model at all.
+                chat.then(|| stub.clone() as Arc<dyn ChatModel>),
                 &crate::domain::thresholds::Thresholds::text_embedding_004(),
             ),
             repo,
@@ -449,6 +467,46 @@ mod tests {
 
     /// The resolved placement threshold decides filing: a document at distance
     /// 0.5 from `documents` files there under 1.10, but into the inbox under 0.3.
+    /// E3b: `[ltm] placement_min_margin` reaches `remember_document`. With a
+    /// second concept almost as close as `documents`, the margin rule sends
+    /// the document to the inbox; without it, it's filed.
+    #[tokio::test]
+    async fn placement_margin_reaches_remember_document() {
+        let (svc, repo, stub) = setup(false, false);
+        let root = repo.get_roots().unwrap().remove(0).id.unwrap();
+        let rival = repo
+            .get_children(root)
+            .unwrap()
+            .into_iter()
+            .find(|n| n.name != "documents" && n.name != "inbox")
+            .unwrap();
+        // L2 0.02 from the "invoice" vector, like `documents` at 0.
+        repo.set_concept_embedding(rival.id.unwrap(), &[1.0, 0.02, 0.0, 0.0])
+            .unwrap();
+
+        let out = svc
+            .remember(doc("i", "an invoice", Some("i1")))
+            .await
+            .unwrap();
+        assert_eq!(out.concept_path, vec!["root", "documents"]);
+
+        let strict = crate::domain::thresholds::Thresholds::resolve(
+            "unknown:model",
+            crate::domain::thresholds::ThresholdOverrides {
+                placement_min_margin: Some(0.05),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .0;
+        let svc = DocumentService::new(repo.clone(), stub.clone(), None, &strict);
+        let out = svc
+            .remember(doc("i", "an invoice", Some("i2")))
+            .await
+            .unwrap();
+        assert_eq!(out.concept_path, vec!["root", "inbox"]);
+    }
+
     #[tokio::test]
     async fn placement_threshold_reaches_remember_document() {
         let (loose, _, _) = setup(false, false);
@@ -469,12 +527,46 @@ mod tests {
         .unwrap()
         .0;
         drop(svc);
-        let svc = DocumentService::new(repo.clone(), stub.clone(), &strict);
+        let svc = DocumentService::new(repo.clone(), stub.clone(), None, &strict);
         let out = svc
             .remember(doc("r", "a receipt", Some("r2")))
             .await
             .unwrap();
         assert_eq!(out.concept_path, vec!["root", "inbox"]);
+    }
+
+    /// E2: the whole document is keyword-searchable, not just the summary
+    /// excerpt; filing it again with the same data_id replaces the text.
+    #[tokio::test]
+    async fn full_text_is_kept_for_keyword_recall() {
+        let (svc, repo, _stub) = setup(false, false);
+        let filler = "lorem ipsum dolor sit amet ".repeat(80);
+        let out = svc
+            .remember(doc(
+                "Letter",
+                &format!("{filler} the lighthouse keeper"),
+                Some("d1"),
+            ))
+            .await
+            .unwrap();
+        assert!(!out.summarized, "excerpt summary only");
+        let hits = |q: &str| repo.search_document_bodies(q, 10).unwrap();
+        assert_eq!(hits("\"lighthouse\""), [out.leaf_id]);
+        assert_eq!(
+            hits("\"letter\""),
+            [out.leaf_id],
+            "the title is indexed too"
+        );
+
+        let out = svc
+            .remember(doc("Letter", "now about the windmill", Some("d1")))
+            .await
+            .unwrap();
+        assert!(
+            hits("\"lighthouse\"").is_empty(),
+            "the old text is replaced"
+        );
+        assert_eq!(hits("\"windmill\""), [out.leaf_id]);
     }
 
     #[tokio::test]

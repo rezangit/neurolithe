@@ -297,3 +297,182 @@ fn find_similar_nodes_survives_other_tenant_crowding() {
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].0.payload["fact"], "mine");
 }
+
+/// A query with no keyword terms (only punctuation) runs vector-only recall:
+/// the FTS leg is left out of the hybrid query. It must still return the
+/// nearest facts, not fail inside sqlite-vec.
+#[test]
+fn query_without_keyword_terms_runs_vector_only() {
+    let r = repo();
+    r.store_node(&fact("A", "the real fact"), &[1.0, 0.0, 0.0, 0.0])
+        .unwrap();
+    let out = r
+        .query_with_graph(
+            "?! -- ()",
+            &[1.0, 0.0, 0.0, 0.0],
+            &TenantId("A".into()),
+            &TimeFilter::default(),
+            &["reality".to_string()],
+            5,
+        )
+        .expect("vector-only recall must not error");
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].fact, "the real fact");
+    let hits = r
+        .hybrid_search("?!", &[1.0, 0.0, 0.0, 0.0], &TenantId("A".into()), 5)
+        .expect("vector-only hybrid search must not error");
+    assert_eq!(hits.len(), 1);
+}
+
+/// DEV-19: the sweep reads each batch inside its own write transaction. A
+/// boost committed by another connection while the sweep waits for the write
+/// lock must survive: the old sweep read every score up front, then
+/// overwrote the boosted row with the stale, decayed value.
+#[test]
+fn sweep_does_not_overwrite_a_concurrent_boost() {
+    use crate::application::migrations::{StoreKind, migrate_store};
+    use crate::domain::decay::DecayEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stm.sqlite");
+    let conn = init_db(Some(&path)).unwrap();
+    migrate_store(&conn, StoreKind::Stm, None, 4).unwrap();
+    let sweeper = SqliteMemoryRepository::new(conn);
+    let id = sweeper
+        .store_node(&fact("A", "old"), &[1.0, 0.0, 0.0, 0.0])
+        .unwrap();
+    // Aged two days at a 1-day half-life: a sweep alone would decay it to 0.25.
+    sweeper
+        .conn
+        .execute(
+            "UPDATE nodes SET last_decayed_at = datetime('now', '-2 days') WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+    // Another connection takes the write lock and boosts the node, then
+    // commits only after the sweep has started waiting for the lock.
+    let other = init_db(Some(&path)).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    other
+        .execute(
+            "UPDATE nodes SET relevance_score = 1.0, last_decayed_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+    let sweep = std::thread::spawn(move || {
+        sweeper.sweep_decay(&DecayEngine::new(1.0)).unwrap();
+        sweeper
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    other.execute_batch("COMMIT").unwrap();
+    let sweeper = sweep.join().unwrap();
+
+    let score: f64 = sweeper
+        .conn
+        .query_row(
+            "SELECT relevance_score FROM nodes WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(score > 0.99, "the concurrent boost was lost: score {score}");
+}
+
+/// The sweep runs in batches (one transaction each); every active node is
+/// decayed exactly once across batch boundaries, and nodes archived in an
+/// early batch leave the vector index.
+#[test]
+fn sweep_covers_every_node_across_batches() {
+    use super::lifecycle::SWEEP_BATCH;
+    use crate::domain::decay::DecayEngine;
+
+    let r = repo();
+    let total = SWEEP_BATCH * 2 + 7;
+    for i in 0..total {
+        // Every third node starts faint enough to archive after one half-life.
+        let mut n = fact("A", &format!("f{i}"));
+        n.relevance_score = if i % 3 == 0 { 0.15 } else { 1.0 };
+        r.store_node(&n, &[1.0, i as f32, 0.0, 0.0]).unwrap();
+    }
+    r.conn
+        .execute(
+            "UPDATE nodes SET last_decayed_at = datetime('now', '-1 day')",
+            [],
+        )
+        .unwrap();
+
+    r.sweep_decay(&DecayEngine::new(1.0)).unwrap();
+
+    let faint = total.div_ceil(3) as i64;
+    assert_eq!(
+        count(&r, "SELECT COUNT(*) FROM nodes WHERE status = 'archived'"),
+        faint
+    );
+    assert_eq!(
+        count(
+            &r,
+            "SELECT COUNT(*) FROM nodes WHERE status = 'active' AND abs(relevance_score - 0.5) < 0.001"
+        ),
+        total as i64 - faint,
+        "each surviving node decayed exactly once (1.0 -> 0.5)"
+    );
+    assert_eq!(
+        count(&r, "SELECT COUNT(*) FROM vec_nodes"),
+        total as i64 - faint
+    );
+}
+
+/// W2R-4: the sweep opens its batch transactions as IMMEDIATE itself, so
+/// DEV-19 holds even on a connection whose default behaviour is DEFERRED
+/// (e.g. one opened differently by a future store thread). A deferred batch
+/// would read a stale snapshot first and then fail or overwrite on upgrade.
+#[test]
+fn sweep_is_immediate_even_on_a_deferred_connection() {
+    use crate::application::migrations::{StoreKind, migrate_store};
+    use crate::domain::decay::DecayEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stm.sqlite");
+    let mut conn = init_db(Some(&path)).unwrap();
+    migrate_store(&conn, StoreKind::Stm, None, 4).unwrap();
+    conn.set_transaction_behavior(rusqlite::TransactionBehavior::Deferred);
+    let sweeper = SqliteMemoryRepository::new(conn);
+    let id = sweeper
+        .store_node(&fact("A", "old"), &[1.0, 0.0, 0.0, 0.0])
+        .unwrap();
+    sweeper
+        .conn
+        .execute(
+            "UPDATE nodes SET last_decayed_at = datetime('now', '-2 days') WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+
+    let other = init_db(Some(&path)).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    other
+        .execute(
+            "UPDATE nodes SET relevance_score = 1.0, last_decayed_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+    let sweep = std::thread::spawn(move || {
+        let swept = sweeper.sweep_decay(&DecayEngine::new(1.0));
+        (sweeper, swept)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    other.execute_batch("COMMIT").unwrap();
+    let (sweeper, swept) = sweep.join().unwrap();
+    swept.expect("the sweep waits for the lock instead of failing");
+
+    let score: f64 = sweeper
+        .conn
+        .query_row(
+            "SELECT relevance_score FROM nodes WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(score > 0.99, "the concurrent boost was lost: score {score}");
+}

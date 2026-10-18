@@ -24,6 +24,10 @@ mod vector_index;
 mod working;
 
 #[cfg(test)]
+mod index_tests;
+#[cfg(test)]
+mod ranking_tests;
+#[cfg(test)]
 mod regression_tests;
 #[cfg(test)]
 mod tests;
@@ -33,6 +37,7 @@ use crate::domain::models::{
     CclDefinition, Edge, Episode, MemoryNode, MemoryResult, TenantId, TimeFilter,
 };
 use crate::domain::ports::{MemoryRepository, StmNodeSummary, StmStats};
+use crate::domain::tuning::Ranking;
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -42,11 +47,23 @@ pub struct SqliteMemoryRepository {
     /// exactly as long as this connection lives — i.e. as long as anything
     /// still holds the repository.
     _lease: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
+    /// How search fuses its vector and keyword legs (`[retrieval]`).
+    ranking: Ranking,
 }
 
 impl SqliteMemoryRepository {
     pub fn new(conn: Connection) -> Self {
-        Self { conn, _lease: None }
+        Self {
+            conn,
+            _lease: None,
+            ranking: Ranking::default(),
+        }
+    }
+
+    /// Use `ranking` for search instead of the defaults.
+    pub fn with_ranking(mut self, ranking: Ranking) -> Self {
+        self.ranking = ranking;
+        self
     }
 
     /// Tie a workspace lease to this repository's connection lifetime.
@@ -84,7 +101,14 @@ impl MemoryRepository for SqliteMemoryRepository {
         tenant_id: &TenantId,
         limit: usize,
     ) -> Result<Vec<MemoryNode>> {
-        search::hybrid_search(&self.conn, query_text, query_embedding, tenant_id, limit)
+        search::hybrid_search(
+            &self.conn,
+            &self.ranking,
+            query_text,
+            query_embedding,
+            tenant_id,
+            limit,
+        )
     }
 
     fn query_with_graph(
@@ -98,6 +122,7 @@ impl MemoryRepository for SqliteMemoryRepository {
     ) -> Result<Vec<MemoryResult>> {
         search::query_with_graph(
             &self.conn,
+            &self.ranking,
             query_text,
             query_embedding,
             tenant_id,
@@ -158,6 +183,19 @@ impl MemoryRepository for SqliteMemoryRepository {
 
     fn sweep_decay(&self, engine: &DecayEngine) -> Result<()> {
         lifecycle::sweep_decay(&self.conn, engine)
+    }
+
+    fn find_document_nodes(&self, data_id: &str) -> Result<Vec<MemoryNode>> {
+        search::find_document_nodes(&self.conn, data_id)
+    }
+
+    fn replace_document_node(
+        &self,
+        data_id: &str,
+        node: &MemoryNode,
+        embedding: &[f32],
+    ) -> Result<i64> {
+        graph::replace_document_node(&self.conn, data_id, node, embedding)
     }
 
     fn stm_stats(&self) -> Result<StmStats> {

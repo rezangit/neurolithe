@@ -10,6 +10,11 @@
 //!   new fact *refines* the existing one (replace its text); beyond it a new
 //!   fact is created.
 //!
+//! A fourth value refines placement: **`[ltm] placement_min_margin`**. A
+//! document is filed only if its nearest concept is at least this much closer
+//! than the runner-up concept, else it goes to the inbox. `0` turns the rule
+//! off, which is the default for every model until the eval picks a value.
+//!
 //! Resolution, per value: explicit config → the model's entry in
 //! [`MODEL_DEFAULTS`] → the fallback (the default local model's values, with a
 //! startup warning suggesting calibration via
@@ -22,6 +27,8 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ThresholdValues {
     pub placement_max_distance: f64,
+    /// Placement margin rule; `0.0` = off.
+    pub placement_min_margin: f64,
     pub assimilation: f64,
     pub accommodation: f64,
 }
@@ -35,6 +42,7 @@ pub struct ThresholdValues {
 /// to the inbox).
 pub const TEXT_EMBEDDING_004: ThresholdValues = ThresholdValues {
     placement_max_distance: 1.10,
+    placement_min_margin: 0.0,
     assimilation: 0.15,
     accommodation: 0.35,
 };
@@ -54,12 +62,13 @@ pub const TEXT_EMBEDDING_004: ThresholdValues = ThresholdValues {
 ///   12/30 updates refined in place, 0/30 distinct facts overwritten.
 pub const BGE_SMALL_EN_V15: ThresholdValues = ThresholdValues {
     placement_max_distance: 0.96,
+    placement_min_margin: 0.0,
     assimilation: 0.40,
     accommodation: 0.58,
 };
 
 /// Per-model defaults, keyed by canonical embedding model id
-/// ([`crate::domain::ports::LlmClient::embedding_model_id`]). An entry whose
+/// ([`crate::domain::ports::Embedder::embedding_model_id`]). An entry whose
 /// key has no `provider:` prefix matches that model under any provider.
 pub const MODEL_DEFAULTS: &[(&str, ThresholdValues)] = &[
     ("text-embedding-004", TEXT_EMBEDDING_004),
@@ -108,6 +117,7 @@ pub struct Threshold {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ThresholdOverrides {
     pub placement_max_distance: Option<f64>,
+    pub placement_min_margin: Option<f64>,
     pub assimilation: Option<f64>,
     pub accommodation: Option<f64>,
 }
@@ -119,6 +129,9 @@ pub struct Thresholds {
     /// The embedding model they were resolved for.
     pub embedding_model: String,
     pub placement_max_distance: Threshold,
+    /// File only if the best concept beats the runner-up by this much
+    /// (`0` = off).
+    pub placement_min_margin: Threshold,
     pub assimilation: Threshold,
     pub accommodation: Threshold,
 }
@@ -151,6 +164,10 @@ impl Thresholds {
             placement_max_distance: pick(
                 overrides.placement_max_distance,
                 defaults.placement_max_distance,
+            ),
+            placement_min_margin: pick(
+                overrides.placement_min_margin,
+                defaults.placement_min_margin,
             ),
             assimilation: pick(overrides.assimilation, defaults.assimilation),
             accommodation: pick(overrides.accommodation, defaults.accommodation),
@@ -196,6 +213,10 @@ impl Thresholds {
             if !(t.value.is_finite() && t.value > 0.0) {
                 bail!("{name} must be a finite number > 0 (got {})", t.value);
             }
+        }
+        let margin = self.placement_min_margin.value;
+        if !(margin.is_finite() && margin >= 0.0) {
+            bail!("placement_min_margin must be a finite number >= 0 (got {margin})");
         }
         if self.assimilation.value >= self.accommodation.value {
             bail!(
@@ -292,6 +313,7 @@ mod tests {
             "openai:text-embedding-3-small",
             ThresholdOverrides {
                 placement_max_distance: Some(1.0),
+                placement_min_margin: None,
                 assimilation: Some(0.2),
                 accommodation: Some(0.4),
             },
@@ -335,5 +357,39 @@ mod tests {
             Thresholds::resolve(id, none()).unwrap();
         }
         Thresholds::resolve("unknown:model", none()).unwrap();
+    }
+
+    /// The placement margin defaults to 0 (off) for every model, takes a
+    /// configured value (source `config`), rejects negative or non-finite
+    /// values, and alone doesn't trigger the fallback warning.
+    #[test]
+    fn placement_min_margin_resolves_and_validates() {
+        let (t, warning) = Thresholds::resolve("local:bge-small-en-v1.5", none()).unwrap();
+        assert_eq!(t.placement_min_margin.value, 0.0);
+        assert_eq!(t.placement_min_margin.source, ThresholdSource::ModelDefault);
+        assert!(warning.is_none());
+
+        let set = ThresholdOverrides {
+            placement_min_margin: Some(0.03),
+            ..none()
+        };
+        let (t, _) = Thresholds::resolve("local:bge-small-en-v1.5", set).unwrap();
+        assert_eq!(t.placement_min_margin.value, 0.03);
+        assert_eq!(t.placement_min_margin.source, ThresholdSource::Config);
+        // 0 explicitly is allowed: it means off.
+        let zero = ThresholdOverrides {
+            placement_min_margin: Some(0.0),
+            ..none()
+        };
+        assert!(Thresholds::resolve("local:bge-small-en-v1.5", zero).is_ok());
+
+        for bad in [-0.01, f64::NAN, f64::INFINITY] {
+            let o = ThresholdOverrides {
+                placement_min_margin: Some(bad),
+                ..none()
+            };
+            let err = Thresholds::resolve("local:bge-small-en-v1.5", o).unwrap_err();
+            assert!(err.to_string().contains("placement_min_margin"), "{err}");
+        }
     }
 }

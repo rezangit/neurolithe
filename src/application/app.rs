@@ -2,40 +2,37 @@ use crate::application::retrieval::RetrievalService;
 use crate::application::session_manager::{ContextWindow, SessionManager};
 use crate::application::sleep::SleepWorker;
 use crate::domain::models::{Episode, MemoryNode, MemoryResult, SessionId, TenantId, TimeFilter};
-use crate::domain::ports::{LlmClient, MemoryRepository};
+use crate::domain::ports::{Embedder, MemoryRepository, Models};
 use anyhow::Result;
 use std::sync::Arc;
 
 /// `learning_error` reported by `push_dialogue` when no chat LLM is configured.
-pub const LLM_NOT_CONFIGURED: &str = "LLM not configured";
+pub use crate::domain::ports::LLM_NOT_CONFIGURED;
 
 pub struct NeurolitheApp {
     memory_repo: Arc<dyn MemoryRepository>,
-    llm_client: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
     retrieval_service: RetrievalService,
     sleep_worker: SleepWorker,
     session_manager: SessionManager,
 }
 
-// SAFETY: All fields are either Arc (Send+Sync) or use std::sync::Mutex internally.
-unsafe impl Send for NeurolitheApp {}
-unsafe impl Sync for NeurolitheApp {}
-
 impl NeurolitheApp {
     pub fn new(
         memory_repo: Arc<dyn MemoryRepository>,
-        llm_client: Arc<dyn LlmClient>,
+        models: Models,
         default_half_life_days: f64,
         working_half_life_days: f64,
         thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
         Self {
             memory_repo: memory_repo.clone(),
-            llm_client: llm_client.clone(),
-            retrieval_service: RetrievalService::new(llm_client.clone(), memory_repo.clone()),
+            embedder: models.embedder.clone(),
+            retrieval_service: RetrievalService::new(models.embedder.clone(), memory_repo.clone()),
             sleep_worker: SleepWorker::new(
                 memory_repo.clone(),
-                llm_client.clone(),
+                models.embedder.clone(),
+                models.chat.clone(),
                 default_half_life_days,
                 working_half_life_days,
                 crate::domain::cognition::conflict_resolver::ConflictResolver::from_thresholds(
@@ -44,7 +41,8 @@ impl NeurolitheApp {
             ),
             session_manager: SessionManager::new(
                 memory_repo.clone(),
-                llm_client.clone(),
+                models.embedder.clone(),
+                models.chat.clone(),
                 crate::domain::tuning::SESSION_TOKEN_THRESHOLD,
                 crate::domain::tuning::SESSION_KEEP_RECENT,
             ),
@@ -102,7 +100,7 @@ impl NeurolitheApp {
             ccl: ccl.to_string(),
             created_at: None,
         };
-        if !self.llm_client.chat_available() {
+        if !self.sleep_worker.extracts() {
             // No chat LLM configured: nothing can be extracted. Not an error —
             // the dialogue is archived — but reported so the caller knows.
             ctx.learning_error = Some(LLM_NOT_CONFIGURED.to_string());
@@ -150,7 +148,7 @@ impl NeurolitheApp {
         tags: &[String],
         ccl: &str,
     ) -> Result<()> {
-        let embedding = self.llm_client.embed_text(fact_text).await?;
+        let embedding = self.embedder.embed_text(fact_text).await?;
 
         let node = MemoryNode {
             id: None,
@@ -186,6 +184,7 @@ impl NeurolitheApp {
                 query,
                 time_filter,
                 ccl_filter,
+                crate::domain::tuning::STM_RECALL_K,
             )
             .await
     }
@@ -226,7 +225,7 @@ impl NeurolitheApp {
 mod tests {
     use super::*;
     use crate::domain::models::CclDefinition;
-    use crate::domain::ports::ExtractedFact;
+    use crate::domain::ports::{ChatModel, ExtractedFact};
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::repository::SqliteMemoryRepository;
     use crate::infrastructure::schema::init_schema;
@@ -238,7 +237,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for StubLlm {
+    impl ChatModel for StubLlm {
         async fn extract_facts(
             &self,
             dialogue: &str,
@@ -257,11 +256,15 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok("d".into())
         }
-        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
-            Ok(vec![0.5, 0.1, 0.0, 0.0])
-        }
         async fn compress_context(&self, _m: &str) -> Result<String> {
             Ok("summary".into())
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for StubLlm {
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.5, 0.1, 0.0, 0.0])
         }
     }
 
@@ -270,7 +273,7 @@ mod tests {
         init_schema(&conn, 4).unwrap();
         NeurolitheApp::new(
             Arc::new(SqliteMemoryRepository::new(conn)),
-            Arc::new(StubLlm { fail }),
+            Models::new(Arc::new(StubLlm { fail }), Some(Arc::new(StubLlm { fail }))),
             7.0,
             30.0 / 1440.0,
             &crate::domain::thresholds::Thresholds::text_embedding_004(),
@@ -344,7 +347,7 @@ mod tests {
         init_schema(&conn, 4).unwrap();
         let app = NeurolitheApp::new(
             Arc::new(SqliteMemoryRepository::new(conn)),
-            Arc::new(NoLlm),
+            Models::embed_only(Arc::new(NoLlm)),
             7.0,
             30.0 / 1440.0,
             &crate::domain::thresholds::Thresholds::text_embedding_004(),
@@ -363,25 +366,9 @@ mod tests {
     struct NoLlm;
 
     #[async_trait]
-    impl LlmClient for NoLlm {
-        async fn extract_facts(
-            &self,
-            _d: &str,
-            _c: &[CclDefinition],
-        ) -> Result<Vec<ExtractedFact>> {
-            anyhow::bail!("LLM not configured")
-        }
-        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
-            anyhow::bail!("LLM not configured")
-        }
+    impl Embedder for NoLlm {
         async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
             anyhow::bail!("LLM not configured")
-        }
-        async fn compress_context(&self, _m: &str) -> Result<String> {
-            anyhow::bail!("LLM not configured")
-        }
-        fn chat_available(&self) -> bool {
-            false
         }
     }
 
@@ -390,7 +377,7 @@ mod tests {
     struct TwoFacts;
 
     #[async_trait]
-    impl LlmClient for TwoFacts {
+    impl ChatModel for TwoFacts {
         async fn extract_facts(
             &self,
             dialogue: &str,
@@ -406,15 +393,19 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok("d".into())
         }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            Ok("summary".into())
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for TwoFacts {
         async fn embed_text(&self, t: &str) -> Result<Vec<f32>> {
             Ok(if t.starts_with("beta") {
                 vec![1.0, 0.25, 0.0, 0.0]
             } else {
                 vec![1.0, 0.0, 0.0, 0.0]
             })
-        }
-        async fn compress_context(&self, _m: &str) -> Result<String> {
-            Ok("summary".into())
         }
     }
 
@@ -425,6 +416,7 @@ mod tests {
             "unknown:model",
             crate::domain::thresholds::ThresholdOverrides {
                 placement_max_distance: None,
+                placement_min_margin: None,
                 assimilation: Some(0.1),
                 accommodation: Some(accommodation),
             },
@@ -433,7 +425,7 @@ mod tests {
         .0;
         let app = NeurolitheApp::new(
             Arc::new(SqliteMemoryRepository::new(conn)),
-            Arc::new(TwoFacts),
+            Models::new(Arc::new(TwoFacts), Some(Arc::new(TwoFacts))),
             7.0,
             1.0,
             &thresholds,

@@ -88,10 +88,10 @@ pub(super) fn list_node_summaries(
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Nodes carrying a dataId (`?1`). Served by `idx_nodes_data_id`.
+pub(super) const COUNT_BY_DATA_ID_SQL: &str =
+    "SELECT COUNT(*) FROM nodes WHERE json_extract(payload, '$.dataId') = ?1";
+
 pub(super) fn count_by_data_id(conn: &Connection, data_id: &str) -> Result<i64> {
-    Ok(conn.query_row(
-        "SELECT COUNT(*) FROM nodes WHERE json_extract(payload, '$.dataId') = ?1",
-        params![data_id],
-        |r| r.get(0),
-    )?)
+    Ok(conn.query_row(COUNT_BY_DATA_ID_SQL, params![data_id], |r| r.get(0))?)
 }

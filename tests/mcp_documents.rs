@@ -264,3 +264,38 @@ description = "Cooking recipes and meal plans."
         .collect();
     assert!(concepts.iter().any(|c| c == "recipes"), "{concepts:?}");
 }
+
+/// E2: recall_ltm finds a document by words far into its full text, beyond
+/// the excerpt its summary and embedding see (no chat LLM summarizes here),
+/// and the keyword is an exact-match term the vector leg can't know.
+#[test]
+fn recall_ltm_finds_words_deep_in_a_long_document() {
+    let mut h = Harness::start_with(&[], &[]);
+    // Other documents, so a pure vector top-1 would be a coin toss.
+    for (id, text) in [
+        ("doc_a", "weekly groceries and errands"),
+        ("doc_b", "a letter to the bank about the mortgage"),
+        ("doc_c", "notes from the dentist appointment"),
+    ] {
+        h.call(
+            "remember_document",
+            json!({"title": id, "text": text, "data_id": id}),
+        )
+        .assert_ok();
+    }
+    let filler = "the quarterly report covers routine operations. ".repeat(60);
+    let body = format!("{filler} Appendix: the zephyrine valve was replaced in March.");
+    assert!(body.find("zephyrine").unwrap() > 2_000);
+    h.call(
+        "remember_document",
+        json!({"title": "Quarterly report", "text": body, "data_id": "doc_deep"}),
+    )
+    .assert_ok();
+
+    // Fused top 3. (At k = 1 a keyword-only first hit ties with the vector
+    // leg's first hit under equal weights, and ties go to the vector leg.)
+    let res = h.call("recall_ltm", json!({"query": "zephyrine valve", "k": 3}));
+    res.assert_ok();
+    let hits = res.json().as_array().cloned().unwrap();
+    assert!(hit_ids(&hits).contains(&"doc_deep".to_string()), "{hits:?}");
+}

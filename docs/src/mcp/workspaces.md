@@ -56,7 +56,8 @@ Returns a JSON dump of the named workspace (default: the active one):
   "workspace": "default",
   "stm_facts": [ { "payload": {"fact": "…", "tags": []}, "ccl": "reality", "status": "active",
                    "relevance_score": 0.8, "support_count": 1, "created_at": "…" } ],
-  "ltm_leaves": [ { "data_id": "doc_42", "title": "…", "summary": "…", "provenance": {…} } ]
+  "ltm_leaves": [ { "data_id": "doc_42", "title": "…", "summary": "…",
+                   "body": "the document's full text (null if none is kept)", "provenance": {…} } ]
 }
 ```
 

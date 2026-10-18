@@ -5,6 +5,11 @@ All notable changes to NeuroLithe are documented here. Format loosely follows
 
 ## [Unreleased]
 
+**Better search.** `query_memory` and `recall_ltm` rank results by
+reciprocal rank fusion (RRF) of meaning-based and keyword matches, and
+`recall_ltm` searches a document's full text instead of its first ~1,000
+characters. Expect a different result order after upgrading.
+
 **Breaking**: the eight inspection tools are merged into one `inspect` tool.
 
 ### Upgrading from 0.3.x
@@ -25,8 +30,30 @@ Replace calls to the old inspection tools with `inspect` and a `view`:
 The old names now return an "unknown tool" error. Prompts or agent
 instructions that mention them need updating.
 
+`llm.provider = "vertex"` is now rejected at startup, because Vertex only
+computes embeddings here. Set `llm.provider` to `none` or a chat provider,
+and use `llm.embedding_provider = "vertex"` for Vertex embeddings.
+
+Both stores migrate on first start, each with the usual backup first. STM
+moves to schema v3, which adds indexes only. LTM moves to schema v2, which
+adds a full-text index of documents. LTM never stored a document's full text
+before, so existing documents are indexed by their title and summary only.
+To make one searchable by its full text, send it again with
+`remember_document` and the same `data_id` (or re-send its Kafka event).
+Both migrations are one-way: 0.3.x refuses the new stores, so to go back,
+restore both backups made at migration.
+
 ### Changed
 
+- `query_memory` ranks by RRF instead of adding vector distance to the
+  keyword score. Before, any keyword match outranked every meaning-based
+  match. English stop-words are left out of the keyword query, unless the
+  query is nothing but stop-words.
+- `query_memory` honours `k` up to 100; it was silently capped at 10.
+- `recall_ltm` ranks by RRF of meaning-based search and a keyword search over
+  each document's full text. Hits found only by keyword still report their
+  real vector `distance`.
+- `workspace_export` includes each document's full text.
 - The MCP server is built on the official Rust SDK, `rmcp`. It negotiates
   protocol versions up to 2025-11-25. Clients on 2025-06-18 or later also
   receive `structuredContent` alongside the unchanged text result; arrays are
@@ -59,9 +86,31 @@ instructions that mention them need updating.
   rejected.
 - A stored vector whose byte length isn't a multiple of 4 is reported as
   corrupt instead of being silently truncated.
+- The STM decay sweep runs in batches of 500 facts, each in its own
+  transaction, instead of one pass over every fact.
+- Without a chat model, the startup warning says fact extraction and
+  compression "are skipped" (it said "will fail"; they were already skipped).
+
+### Performance
+
+- STM schema v3 adds indexes on graph edges and on `dataId`. Graph expansion
+  in `query_memory`, subject lookups and `dataId` upserts no longer scan
+  whole tables.
 
 ### Added
 
+- A `[retrieval]` config section tunes the ranking of both stores:
+  `rrf_k` (default 60), `vector_weight` and `keyword_weight` (1.0 each),
+  `leg_k_factor` (4), `fts_stopwords` (true) and `include_scores` (false).
+  Invalid values and unknown keys are rejected at startup.
+- With `[retrieval] include_scores = true`, `query_memory` and `recall_ltm`
+  hits carry their fused `score`.
+- `[ltm] placement_min_margin`: file a document only if its nearest concept
+  beats the runner-up by at least this distance, otherwise send it to the
+  inbox. The default is `0` (off) for every model.
+- `inspect` with `view: "placement"` reports, per probe, the runner-up concept
+  and its distance, the margin, and the placement `decision` under the current
+  settings. The thresholds now include `placement_min_margin`.
 - `neurolithe tools [--markdown|--json]` prints the tool reference from the
   same registry the server uses. `docs/src/mcp/tools.md` is generated from it.
 
@@ -69,6 +118,34 @@ instructions that mention them need updating.
 
 - Unused dependencies `thiserror` and `libsqlite3-sys` (direct); the `config`
   crate is built with TOML support only.
+
+### Fixed
+
+- The root of the LTM tree is no longer a placement target. Documents that
+  were filed directly under `root` now go to a real branch or to the inbox,
+  and `inspect`'s placement probes no longer report `root` as the nearest
+  concept.
+- `query_memory` with no searchable words (for example just `?`) returned a
+  SQLite error. It now returns vector-only results.
+- A relevance boost made while the decay sweep was running could be
+  overwritten by the sweep.
+- `forget` removes a document's stored full text too, even when the
+  document was never filed.
+- Kafka ingest is idempotent. Document events upsert by `data_id`: a
+  redelivered event adds nothing (it only fills in the full text of a
+  document stored before the upgrade), and a changed event replaces the stored
+  version in both stores instead of adding a second LTM leaf and STM fact. A
+  crash between the two stores' writes is repaired when the event is
+  redelivered.
+- The Kafka documents feeder commits an offset only once the message is
+  written or forwarded to `dlq`/`parking`. A failed forward is retried instead
+  of skipped, and shutdown no longer commits a message that wasn't handled.
+- A hard reset commits the feeder's rewind straight away, so a restart before
+  the replay's first commit no longer resumes at the old position (leaving the
+  wiped stores unfilled).
+- Removing an old LTM leaf (on update or forget) rewrites its parent's summary
+  in the same transaction, so a crash can't leave the parent listing a
+  document that is gone.
 
 ## [0.3.0] — 2026-09-24
 

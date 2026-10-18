@@ -20,6 +20,7 @@ use crate::infrastructure::config::KafkaConfig;
 use crate::infrastructure::kafka_client::{
     StopSignal, command_group, commit_on_shutdown, consumer_config, recv_or_stop,
 };
+use crate::interfaces::kafka_feeder::FeederConsumer;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
@@ -37,32 +38,61 @@ pub trait FeederRewind: Send + Sync {
     async fn rewind_to_earliest(&self) -> Result<()>;
 }
 
-/// Rewinds a shared feeder consumer to the beginning of its assigned partitions.
+/// Rewinds a shared feeder consumer to the beginning of its assigned
+/// partitions.
+///
+/// The rewind is made durable at once (W2R-5): it advances the feeder's
+/// [`RewindGeneration`] first, so a message the feeder is still handling isn't
+/// committed afterwards, then seeks to the beginning, and finally stores and
+/// commits offset 0 for every assigned partition. A restart before the replay
+/// commits anything therefore resumes from the start instead of from the old
+/// position. Offset 0 below the log start (after retention) is out of range,
+/// and the feeder's `auto.offset.reset = earliest` maps it to the earliest
+/// offset.
 pub struct ConsumerRewind {
-    consumer: Arc<StreamConsumer>,
+    feeder: FeederConsumer,
 }
 
 impl ConsumerRewind {
-    pub fn new(consumer: Arc<StreamConsumer>) -> Self {
-        Self { consumer }
+    pub fn new(feeder: FeederConsumer) -> Self {
+        Self { feeder }
     }
+}
+
+/// `offset` for every partition in `assignment`.
+pub fn rewind_list(assignment: &TopicPartitionList, offset: Offset) -> Result<TopicPartitionList> {
+    let mut tpl = TopicPartitionList::new();
+    for elem in assignment.elements() {
+        tpl.add_partition_offset(elem.topic(), elem.partition(), offset)
+            .context("building rewind offsets")?;
+    }
+    Ok(tpl)
 }
 
 #[async_trait]
 impl FeederRewind for ConsumerRewind {
     async fn rewind_to_earliest(&self) -> Result<()> {
-        let assignment = self
-            .consumer
-            .assignment()
-            .context("reading feeder assignment")?;
-        let mut tpl = TopicPartitionList::new();
-        for elem in assignment.elements() {
-            tpl.add_partition_offset(elem.topic(), elem.partition(), Offset::Beginning)
-                .context("building rewind offsets")?;
+        let consumer = &self.feeder.consumer;
+        let assignment = consumer.assignment().context("reading feeder assignment")?;
+        // Before anything else, so an in-flight message can't commit over the
+        // rewind position (even if a step below fails).
+        self.feeder.generation.advance();
+        if assignment.count() == 0 {
+            return Ok(());
         }
-        self.consumer
-            .seek_partitions(tpl, Timeout::After(Duration::from_secs(5)))
+        consumer
+            .seek_partitions(
+                rewind_list(&assignment, Offset::Beginning)?,
+                Timeout::After(Duration::from_secs(5)),
+            )
             .context("seeking feeder to earliest")?;
+        let start = rewind_list(&assignment, Offset::Offset(0))?;
+        consumer
+            .store_offsets(&start)
+            .context("storing the rewind position")?;
+        consumer
+            .commit(&start, CommitMode::Sync)
+            .context("committing the rewind position")?;
         Ok(())
     }
 }
@@ -202,5 +232,60 @@ impl CommandConsumer {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infrastructure::kafka_client::tests::test_kafka;
+    use crate::interfaces::kafka_feeder::{RewindGeneration, feeder_consumer_config};
+
+    /// The rewind targets every assigned partition, whatever its position.
+    #[test]
+    fn test_rewind_list_covers_every_assigned_partition() {
+        let mut assignment = TopicPartitionList::new();
+        assignment
+            .add_partition_offset("docs", 0, Offset::Offset(41))
+            .unwrap();
+        assignment
+            .add_partition_offset("docs", 3, Offset::Offset(7))
+            .unwrap();
+
+        let start = rewind_list(&assignment, Offset::Offset(0)).unwrap();
+        let got: Vec<(String, i32, Offset)> = start
+            .elements()
+            .iter()
+            .map(|e| (e.topic().to_string(), e.partition(), e.offset()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("docs".to_string(), 0, Offset::Offset(0)),
+                ("docs".to_string(), 3, Offset::Offset(0)),
+            ]
+        );
+        let seek = rewind_list(&assignment, Offset::Beginning).unwrap();
+        assert!(
+            seek.elements()
+                .iter()
+                .all(|e| e.offset() == Offset::Beginning)
+        );
+    }
+
+    /// W2R-5: a rewind always advances the feeder's generation, even before
+    /// the consumer has an assignment (no broker here), so an in-flight
+    /// message's commit is dropped.
+    #[tokio::test]
+    async fn test_rewind_advances_the_generation() {
+        let consumer: StreamConsumer = feeder_consumer_config(&test_kafka(&[])).create().unwrap();
+        let generation = RewindGeneration::default();
+        let rewind = ConsumerRewind::new(FeederConsumer {
+            consumer: Arc::new(consumer),
+            generation: generation.clone(),
+        });
+        let before = generation.current();
+        rewind.rewind_to_earliest().await.unwrap();
+        assert_eq!(generation.current(), before + 1);
     }
 }

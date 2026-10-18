@@ -11,9 +11,8 @@
 //! second). The dimension is known up front from the model table, so stores
 //! can be sized without touching the network — see [`LocalEmbedder::dim`].
 //!
-//! Only the embedding half of [`LlmClient`] is implemented; the chat methods
-//! fail. `create_llm_client` pairs this with a chat provider (or with the
-//! "LLM not configured" stub) via `SplitLlmClient`.
+//! It is an [`Embedder`] only; `create_models` pairs it with a chat model
+//! (or none).
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -21,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
 
-use crate::domain::ports::{ExtractedFact, LlmClient};
+use crate::domain::ports::Embedder;
 
 /// Default local model: small (384-d), fast on CPU, strong English retrieval.
 pub const DEFAULT_LOCAL_MODEL: &str = "bge-small-en-v1.5";
@@ -167,26 +166,8 @@ fn normalize(mut v: Vec<f32>) -> Vec<f32> {
     v
 }
 
-fn chat_unsupported<T>() -> Result<T> {
-    Err(anyhow!(
-        "LLM not configured: the local provider only computes embeddings"
-    ))
-}
-
 #[async_trait::async_trait]
-impl LlmClient for LocalEmbedder {
-    async fn extract_facts(
-        &self,
-        _dialogue: &str,
-        _valid_ccls: &[crate::domain::models::CclDefinition],
-    ) -> Result<Vec<ExtractedFact>> {
-        chat_unsupported()
-    }
-
-    async fn generate_ccl_description(&self, _ccl_name: &str, _context: &str) -> Result<String> {
-        chat_unsupported()
-    }
-
+impl Embedder for LocalEmbedder {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let engine = self.engine().await?;
         let text = text.to_string();
@@ -212,10 +193,6 @@ impl LlmClient for LocalEmbedder {
         Ok(normalize(vector))
     }
 
-    async fn compress_context(&self, _messages: &str) -> Result<String> {
-        chat_unsupported()
-    }
-
     /// Known from the model table — no model load, no network.
     async fn embedding_dim(&self) -> Result<usize> {
         Ok(self.spec.dim)
@@ -223,10 +200,6 @@ impl LlmClient for LocalEmbedder {
 
     fn embedding_model_id(&self) -> String {
         format!("local:{}", self.spec.name)
-    }
-
-    fn chat_available(&self) -> bool {
-        false
     }
 }
 
@@ -290,13 +263,6 @@ mod tests {
         let v = normalize(vec![3.0, 4.0]);
         assert!((v[0] - 0.6).abs() < 1e-6 && (v[1] - 0.8).abs() < 1e-6);
         assert_eq!(normalize(vec![0.0, 0.0]), vec![0.0, 0.0]);
-    }
-
-    #[tokio::test]
-    async fn chat_methods_report_llm_not_configured() {
-        let e = LocalEmbedder::new(DEFAULT_LOCAL_MODEL, std::env::temp_dir()).unwrap();
-        let err = e.compress_context("x").await.unwrap_err().to_string();
-        assert!(err.starts_with("LLM not configured"), "{err}");
     }
 
     /// Downloads the real model (~130 MB) — run manually:

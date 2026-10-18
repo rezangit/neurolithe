@@ -46,6 +46,56 @@ pub(super) fn store_node(conn: &Connection, node: &MemoryNode, embedding: &[f32]
     Ok(node_id)
 }
 
+/// SQL predicate (on `nodes`, `?1` = the dataId) for a document's own facts:
+/// they carry the `dataId` and no graph `kind`, so the `subject` anchors and
+/// turns that merely refer to the document are never matched.
+pub(super) const DOCUMENT_FACT: &str =
+    "json_extract(payload, '$.dataId') = ?1 AND json_extract(payload, '$.kind') IS NULL";
+
+/// Upsert a document fact in one transaction: drop every existing document
+/// fact for `data_id` (edges and vectors first), then insert `node`.
+pub(super) fn replace_document_node(
+    conn: &Connection,
+    data_id: &str,
+    node: &MemoryNode,
+    embedding: &[f32],
+) -> Result<i64> {
+    let payload_json = serde_json::to_string(&node.payload)?;
+    let tx = conn.unchecked_transaction()?;
+    let old = format!("SELECT id FROM nodes WHERE {DOCUMENT_FACT}");
+    tx.execute(
+        &format!("DELETE FROM edges WHERE source_id IN ({old}) OR target_id IN ({old})"),
+        params![data_id],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM vec_nodes WHERE node_id IN ({old})"),
+        params![data_id],
+    )?;
+    tx.execute(
+        &format!("DELETE FROM nodes WHERE {DOCUMENT_FACT}"),
+        params![data_id],
+    )?;
+    tx.execute(
+        "INSERT INTO nodes (tenant_id, source_episode_id, payload, status, ccl, is_explicit, support_count, relevance_score, context_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            node.tenant_id.0,
+            node.source_episode_id,
+            payload_json,
+            node.status,
+            node.ccl,
+            node.is_explicit,
+            node.support_count,
+            node.relevance_score,
+            node.context_key
+        ],
+    )?;
+    let node_id = tx.last_insert_rowid();
+    index_if_eligible(&tx, node_id, &node.status, embedding)?;
+    tx.commit()?;
+    Ok(node_id)
+}
+
 pub(super) fn store_edge(conn: &Connection, edge: &Edge) -> Result<()> {
     conn.execute(
         "INSERT INTO edges (source_id, target_id, relation, ccl, valid_from, valid_until, weight) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",

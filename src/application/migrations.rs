@@ -15,7 +15,8 @@
 use crate::domain::models::WORKSPACE_TENANT;
 use crate::domain::ports::EmbeddingIdentity;
 use crate::infrastructure::schema::{
-    LTM_VEC_TABLES, STM_VEC_TABLES, create_ltm_vec_tables, create_stm_vec_table, drop_vec_tables,
+    LTM_VEC_TABLES, STM_VEC_TABLES, create_ltm_doc_bodies, create_ltm_vec_tables,
+    create_stm_data_id_index, create_stm_edge_indexes, create_stm_vec_table, drop_vec_tables,
     init_ltm_schema, init_schema, vec_table_dim,
 };
 use anyhow::{Context, Result, bail};
@@ -73,10 +74,12 @@ impl StoreKind {
     }
 }
 
-/// STM schema version: 2 (v1 base schema + meta, v2 single tenant).
-pub const STM_SCHEMA_VERSION: i64 = 2;
-/// LTM schema version: 1 (base schema + meta).
-pub const LTM_SCHEMA_VERSION: i64 = 1;
+/// STM schema version: 3 (v1 base schema + meta, v2 single tenant, v3 graph
+/// and dataId indexes).
+pub const STM_SCHEMA_VERSION: i64 = 3;
+/// LTM schema version: 2 (v1 base schema + meta, v2 full-text document
+/// bodies).
+pub const LTM_SCHEMA_VERSION: i64 = 2;
 
 /// State threaded through one migration run.
 pub struct MigrationCtx {
@@ -90,8 +93,8 @@ pub struct MigrationCtx {
 /// transaction; must be idempotent against partially-shaped legacy stores.
 pub type Migration = fn(&Transaction, &mut MigrationCtx) -> Result<()>;
 
-const STM_MIGRATIONS: &[Migration] = &[stm_v1_base, stm_v2_single_tenant];
-const LTM_MIGRATIONS: &[Migration] = &[ltm_v1_base];
+const STM_MIGRATIONS: &[Migration] = &[stm_v1_base, stm_v2_single_tenant, stm_v3_indexes];
+const LTM_MIGRATIONS: &[Migration] = &[ltm_v1_base, ltm_v2_document_bodies];
 
 fn create_meta_table(tx: &Transaction) -> Result<()> {
     tx.execute(
@@ -149,10 +152,105 @@ fn stm_v2_single_tenant(tx: &Transaction, ctx: &mut MigrationCtx) -> Result<()> 
     Ok(())
 }
 
+/// v3: index the graph (`edges` by source and by target) and `dataId`
+/// lookups (an expression index on the node payload; see
+/// [`ensure_stm_data_id_index`]).
+fn stm_v3_indexes(tx: &Transaction, ctx: &mut MigrationCtx) -> Result<()> {
+    create_stm_edge_indexes(tx)?;
+    ensure_stm_data_id_index(tx, &mut ctx.warnings)
+}
+
+/// Create the STM dataId expression index unless a node payload is not
+/// valid JSON. Building the index evaluates every payload, and a malformed
+/// one would fail the build (and with it the migration or open, locking the
+/// user out of the store). Instead it is skipped with a warning; the next
+/// open retries (see [`heal_stm_indexes`]).
+fn ensure_stm_data_id_index(conn: &Connection, warnings: &mut Vec<String>) -> Result<()> {
+    let malformed: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM nodes WHERE NOT json_valid(payload)",
+        [],
+        |r| r.get(0),
+    )?;
+    if malformed == 0 {
+        create_stm_data_id_index(conn)?;
+    } else {
+        warnings.push(format!(
+            "{malformed} node(s) have a payload that is not valid JSON, so the dataId index \
+             was not created. Until those rows are fixed or deleted, every dataId lookup that \
+             reaches them fails with \"malformed JSON\" (inspect trace, forgetting a dataId, \
+             document upserts). Find them with: \
+             SELECT id FROM nodes WHERE NOT json_valid(payload). \
+             The index is created on the next open once they are gone."
+        ));
+    }
+    Ok(())
+}
+
+/// At every open of an up-to-date STM store: re-create the dataId index if
+/// v3 had to skip it and the store has since been repaired.
+fn heal_stm_indexes(conn: &Connection, kind: StoreKind, warnings: &mut Vec<String>) -> Result<()> {
+    if kind != StoreKind::Stm {
+        return Ok(());
+    }
+    let has_index: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_nodes_data_id')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_index {
+        ensure_stm_data_id_index(conn, warnings)?;
+    }
+    Ok(())
+}
+
+/// At every open of an LTM store: bring the document-body objects up to date
+/// (idempotent; adds `backfilled` to a store made before it existed, W3R-8),
+/// then drop bodies no leaf carries (W3R-1). Forgetting a document must not
+/// leave its full text on disk, and a body can outlive its leaves if it was
+/// written by an older build or a crash came between the two.
+fn drop_orphan_document_bodies(conn: &Connection, kind: StoreKind) -> Result<()> {
+    if kind != StoreKind::Ltm || !table_exists(conn, "doc_bodies")? {
+        return Ok(());
+    }
+    create_ltm_doc_bodies(conn)?;
+    let dropped = conn.execute(
+        "DELETE FROM doc_bodies WHERE data_id NOT IN (SELECT data_id FROM leaves)",
+        [],
+    )?;
+    if dropped > 0 {
+        tracing::debug!("dropped {dropped} orphan document bod(ies)");
+    }
+    Ok(())
+}
+
 /// v1: the base LTM schema plus the `meta` table.
 fn ltm_v1_base(tx: &Transaction, ctx: &mut MigrationCtx) -> Result<()> {
     init_ltm_schema(tx, ctx.dim)?;
     create_meta_table(tx)
+}
+
+/// v2: each document's full text, for recall's keyword leg (see
+/// [`create_ltm_doc_bodies`]). A v1 store never kept the full text, so each
+/// existing document is backfilled with the best it has, its title and
+/// summary, and the user is told how to index the whole text.
+fn ltm_v2_document_bodies(tx: &Transaction, ctx: &mut MigrationCtx) -> Result<()> {
+    create_ltm_doc_bodies(tx)?;
+    let backfilled = tx.execute(
+        "INSERT OR IGNORE INTO doc_bodies (data_id, title, body, backfilled)
+         SELECT l.data_id, n.name, n.summary, 1
+         FROM leaves l JOIN tree_nodes n ON n.id = l.tree_node_id
+         ORDER BY l.tree_node_id",
+        [],
+    )?;
+    if backfilled > 0 {
+        ctx.warnings.push(format!(
+            "{backfilled} document(s) filed before full-text recall are keyword-searchable by \
+             their title and summary only (the full text was never stored). To make a \
+             document's whole text searchable, file it again: remember_document with the same \
+             data_id (or, in Kafka mode, re-send its document event)."
+        ));
+    }
+    Ok(())
 }
 
 /// What [`prepare_store`] did, for the caller to log.
@@ -209,6 +307,8 @@ pub fn migrate_store(
         warnings: Vec::new(),
     };
     if from_version == latest {
+        heal_stm_indexes(conn, kind, &mut report.warnings)?;
+        drop_orphan_document_bodies(conn, kind)?;
         return Ok(report);
     }
 
@@ -243,6 +343,7 @@ pub fn migrate_store(
     )?;
     tx.pragma_update(None, "user_version", latest)?;
     tx.commit()?;
+    drop_orphan_document_bodies(conn, kind)?;
 
     report.to_version = latest;
     report.warnings = ctx.warnings;
@@ -516,8 +617,8 @@ mod tests {
             Some("stm")
         );
         assert_eq!(
-            get_meta(&conn, "schema_version").unwrap().as_deref(),
-            Some("2")
+            get_meta(&conn, "schema_version").unwrap(),
+            Some(STM_SCHEMA_VERSION.to_string())
         );
         assert_eq!(
             get_meta(&conn, "embedding_model").unwrap().as_deref(),
@@ -537,7 +638,10 @@ mod tests {
 
         // Re-opening is a no-op.
         let again = prepare_store(&conn, StoreKind::Stm, Some(&path), &ident("m", 4)).unwrap();
-        assert_eq!((again.from_version, again.to_version), (2, 2));
+        assert_eq!(
+            (again.from_version, again.to_version),
+            (STM_SCHEMA_VERSION, STM_SCHEMA_VERSION)
+        );
     }
 
     /// A legacy (v0) STM store with several tenants is backed up, migrated to
@@ -565,7 +669,10 @@ mod tests {
 
         let report = prepare_store(&conn, StoreKind::Stm, Some(&path), &ident("m", 4)).unwrap();
 
-        assert_eq!((report.from_version, report.to_version), (0, 2));
+        assert_eq!(
+            (report.from_version, report.to_version),
+            (0, STM_SCHEMA_VERSION)
+        );
         let backup = report.backup.expect("existing store is backed up");
         assert!(backup.exists());
         // The backup is the pre-migration store: still two tenants, no meta.
@@ -618,6 +725,137 @@ mod tests {
             .query_row("SELECT tenant_id FROM nodes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(t, WORKSPACE_TENANT);
+    }
+
+    /// E2: an existing v1 LTM store (no document bodies) is backed up and
+    /// brought to v2: the full-text body index exists, each document is
+    /// backfilled with the best text v1 kept (its title + summary), and the
+    /// user is told how to get full-text recall for those older documents.
+    #[test]
+    fn ltm_v1_store_gets_document_bodies_backfilled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = file_store(&dir, "ltm.sqlite");
+        // A v1 store: today's schema minus the v2 objects, with two leaves
+        // (one document filed twice keeps a single body).
+        crate::infrastructure::schema::init_ltm_schema(&conn, 4).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER leaves_ad_doc_body; DROP TABLE fts_doc_bodies; DROP TABLE doc_bodies;
+             CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO meta VALUES ('store_kind', 'ltm'), ('schema_version', '1');
+             INSERT INTO tree_nodes (id, name, summary, kind) VALUES
+                 (10, 'Lease', 'the flat lease, runs to 2027', 'leaf'),
+                 (11, 'Lease', 'the flat lease, runs to 2027', 'leaf'),
+                 (12, 'Recipe', 'grandmother''s plum cake', 'leaf');
+             INSERT INTO leaves (tree_node_id, data_id) VALUES
+                 (10, 'doc_lease'), (11, 'doc_lease'), (12, 'doc_cake');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+
+        let report = migrate_store(&conn, StoreKind::Ltm, Some(&path), 4).unwrap();
+        assert_eq!((report.from_version, report.to_version), (1, 2));
+        assert_eq!(LTM_SCHEMA_VERSION, 2);
+        assert!(report.backup.is_some(), "backed up before migrating");
+        assert_eq!(backups(&dir).len(), 1);
+
+        let found = |q: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT b.data_id FROM fts_doc_bodies f JOIN doc_bodies b ON b.id = f.rowid
+                     WHERE fts_doc_bodies MATCH ?1 ORDER BY 1",
+                )
+                .unwrap();
+            stmt.query_map([q], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            found("lease"),
+            ["doc_lease"],
+            "title and summary indexed once"
+        );
+        assert_eq!(found("plum"), ["doc_cake"]);
+        let flagged: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM doc_bodies WHERE backfilled = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 2, "backfilled stand-ins are marked (W3R-7)");
+        let note = report.warnings.join("\n");
+        assert!(
+            note.contains("2 document") && note.contains("remember_document"),
+            "{note}"
+        );
+
+        // Idempotent: opening again changes nothing.
+        let again = migrate_store(&conn, StoreKind::Ltm, Some(&path), 4).unwrap();
+        assert_eq!(again.from_version, 2);
+        assert!(again.warnings.is_empty());
+    }
+
+    /// W3R-1: every open of an LTM store drops orphan document bodies (text
+    /// no leaf carries any more), so no full text lingers on disk.
+    #[test]
+    fn ltm_open_drops_orphan_bodies() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        migrate_store(&conn, StoreKind::Ltm, None, 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tree_nodes (id, name, kind) VALUES (1, 'kept', 'leaf');
+             INSERT INTO leaves (tree_node_id, data_id) VALUES (1, 'kept');
+             INSERT INTO doc_bodies (data_id, body) VALUES ('kept', 'k'), ('orphan', 'o');",
+        )
+        .unwrap();
+        migrate_store(&conn, StoreKind::Ltm, None, 4).unwrap();
+        let ids: Vec<String> = conn
+            .prepare("SELECT data_id FROM doc_bodies ORDER BY 1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids, ["kept"]);
+    }
+
+    /// W3R-8: a v2 store made before `doc_bodies.backfilled` existed gets the
+    /// column on open (old rows read 0, real text), so filing still works.
+    #[test]
+    fn ltm_open_adds_missing_backfilled_column() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        migrate_store(&conn, StoreKind::Ltm, None, 4).unwrap();
+        conn.execute_batch(
+            "INSERT INTO tree_nodes (id, name, kind) VALUES (1, 'n', 'leaf');
+             INSERT INTO leaves (tree_node_id, data_id) VALUES (1, 'old');
+             INSERT INTO doc_bodies (data_id, body) VALUES ('old', 'old text');
+             ALTER TABLE doc_bodies DROP COLUMN backfilled;",
+        )
+        .unwrap();
+        migrate_store(&conn, StoreKind::Ltm, None, 4).unwrap();
+        let repo = crate::infrastructure::ltm_repository::SqliteLtmRepository::new(conn);
+        use crate::domain::ltm::LtmRepository;
+        repo.put_document_body("new", "t", "new text").unwrap();
+        let old: i64 = repo
+            .conn_for_tests()
+            .query_row(
+                "SELECT backfilled FROM doc_bodies WHERE data_id = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(old, 0, "existing rows count as real text");
+    }
+
+    /// A fresh LTM store starts at v2 with the body index and no note.
+    #[test]
+    fn fresh_ltm_store_has_document_bodies() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        let report = migrate_store(&conn, StoreKind::Ltm, None, 4).unwrap();
+        assert_eq!(report.to_version, 2);
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert!(table_exists(&conn, "doc_bodies").unwrap());
+        assert!(table_exists(&conn, "fts_doc_bodies").unwrap());
     }
 
     /// P2R-9: the backup destination exists as an empty 0600 file *before*
@@ -712,5 +950,143 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("legacy 'ltm'"), "{err}");
+    }
+
+    /// The STM indexes (v3) present in `conn`.
+    fn stm_indexes(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'index'
+                 AND name IN ('idx_edges_source', 'idx_edges_target', 'idx_nodes_data_id')
+                 ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Turn a latest-version STM store back into a v2 one (no v3 indexes).
+    fn downgrade_to_v2(conn: &Connection) {
+        conn.execute_batch(
+            "DROP INDEX idx_edges_source; DROP INDEX idx_edges_target;
+             DROP INDEX idx_nodes_data_id;
+             UPDATE meta SET value = '2' WHERE key = 'schema_version';
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    }
+
+    const ALL_STM_INDEXES: [&str; 3] =
+        ["idx_edges_source", "idx_edges_target", "idx_nodes_data_id"];
+
+    /// A fresh STM store carries the graph and dataId indexes (v3).
+    #[test]
+    fn fresh_stm_store_has_graph_and_data_id_indexes() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+        assert_eq!(STM_SCHEMA_VERSION, 3);
+        assert_eq!(stm_indexes(&conn), ALL_STM_INDEXES);
+    }
+
+    /// A v2 store is backed up, then gains the v3 indexes; its data survives.
+    #[test]
+    fn v2_store_migrates_to_v3_with_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, path) = file_store(&dir, "stm.sqlite");
+        prepare_store(&conn, StoreKind::Stm, Some(&path), &ident("m", 4)).unwrap();
+        downgrade_to_v2(&conn);
+        conn.execute(
+            "INSERT INTO nodes (tenant_id, payload) VALUES ('default', '{\"fact\":\"f\",\"dataId\":\"doc_1\"}')",
+            [],
+        )
+        .unwrap();
+        assert!(stm_indexes(&conn).is_empty());
+
+        let report = prepare_store(&conn, StoreKind::Stm, Some(&path), &ident("m", 4)).unwrap();
+
+        assert_eq!((report.from_version, report.to_version), (2, 3));
+        assert!(report.backup.is_some(), "an existing store is backed up");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(stm_indexes(&conn), ALL_STM_INDEXES);
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM nodes WHERE json_extract(payload, '$.dataId') = 'doc_1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// Building the dataId expression index evaluates every payload; a row
+    /// that is not valid JSON would fail the migration and lock the user out
+    /// of the store. Instead the index is skipped with a warning that says
+    /// what breaks (dataId lookups touching the row fail) and how to find the
+    /// rows, and the edge indexes still land.
+    #[test]
+    fn malformed_payload_skips_only_the_data_id_index() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+        downgrade_to_v2(&conn);
+        conn.execute(
+            "INSERT INTO nodes (tenant_id, payload) VALUES ('default', 'not json')",
+            [],
+        )
+        .unwrap();
+
+        let report = prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+
+        assert_eq!(report.to_version, 3);
+        assert_eq!(stm_indexes(&conn), ["idx_edges_source", "idx_edges_target"]);
+        let warning = report
+            .warnings
+            .iter()
+            .find(|w| w.contains("1 node") && w.contains("dataId"))
+            .unwrap_or_else(|| panic!("{:?}", report.warnings));
+        assert!(warning.contains("fail"), "{warning}");
+        assert!(
+            warning.contains("SELECT id FROM nodes WHERE NOT json_valid(payload)"),
+            "{warning}"
+        );
+        assert!(!warning.contains("still correct"), "{warning}");
+    }
+
+    /// W2R-1: a store that skipped the dataId index heals on a later open
+    /// once its malformed rows are fixed; while they remain, every open
+    /// repeats the warning.
+    #[test]
+    fn data_id_index_is_recreated_once_payloads_are_fixed() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+        downgrade_to_v2(&conn);
+        conn.execute(
+            "INSERT INTO nodes (tenant_id, payload) VALUES ('default', 'not json')",
+            [],
+        )
+        .unwrap();
+        prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+        assert_eq!(stm_indexes(&conn), ["idx_edges_source", "idx_edges_target"]);
+
+        // Still malformed: the next open warns again and doesn't fail.
+        let again = prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+        assert_eq!((again.from_version, again.to_version), (3, 3));
+        assert!(
+            again.warnings.iter().any(|w| w.contains("dataId")),
+            "{:?}",
+            again.warnings
+        );
+        assert_eq!(stm_indexes(&conn), ["idx_edges_source", "idx_edges_target"]);
+
+        // Fixed: the next open re-creates the index, without a warning.
+        conn.execute(
+            "UPDATE nodes SET payload = '{\"fact\":\"repaired\"}' WHERE NOT json_valid(payload)",
+            [],
+        )
+        .unwrap();
+        let healed = prepare_store(&conn, StoreKind::Stm, None, &ident("m", 4)).unwrap();
+        assert!(healed.warnings.is_empty(), "{:?}", healed.warnings);
+        assert_eq!(stm_indexes(&conn), ALL_STM_INDEXES);
     }
 }

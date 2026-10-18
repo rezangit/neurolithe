@@ -49,7 +49,7 @@ Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: f
 
 ### query_memory
 
-**Search short-term memory** — Search SHORT-TERM working memory (recent, decaying facts) for relevant context. Hybrid keyword + semantic search; returns facts (best first) with 1-hop connections and temporal bounds. Reading a fact reinforces it (its relevance is restored and its decay clock restarts). For the permanent document archive, use recall_ltm.
+**Search short-term memory** — Search SHORT-TERM working memory (recent, decaying facts) for relevant context. Hybrid keyword + semantic search; returns facts (best first) with 1-hop connections and temporal bounds, and each direct hit's fused score when the server enables scores. Reading a fact reinforces it (its relevance is restored and its decay clock restarts). For the permanent document archive, use recall_ltm.
 
 Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`.
 
@@ -62,7 +62,7 @@ Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: t
 
 ### recall_ltm
 
-**Search the long-term archive** — Search the PERMANENT long-term archive (all filed documents and notes) by meaning. Reference-returning: each hit carries the document's dataId, provenance and ancestor concepts, so you can fetch the original. The primary tool for finding a document, receipt, letter, or report.
+**Search the long-term archive** — Search the PERMANENT long-term archive (all filed documents and notes) by meaning and by the words of each document's full text, fused into one ranking. Reference-returning: each hit carries the document's dataId, provenance, ancestor concepts and vector distance (and its fused score, when the server enables scores), so you can fetch the original. The primary tool for finding a document, receipt, letter, or report.
 
 Annotations: `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false`.
 
@@ -124,7 +124,7 @@ Annotations: `readOnlyHint: false`, `destructiveHint: false`, `idempotentHint: t
 
 ### workspace_export
 
-**Export a workspace** — JSON dump of a workspace's STM facts and LTM document leaves: {workspace, stm_facts, ltm_leaves}. Defaults to the active workspace.
+**Export a workspace** — JSON dump of a workspace's STM facts and LTM document leaves (each with its full text): {workspace, stm_facts, ltm_leaves}. Defaults to the active workspace.
 
 Annotations: `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false`.
 
@@ -175,4 +175,4 @@ Annotations: `readOnlyHint: true`, `idempotentHint: true`, `openWorldHint: false
 | `node` | `id`, `child_limit`, `child_offset`, `summary_max_chars` | One LTM node: summary, parents, children and document leaves (paged), plus child_count / leaf_count totals. |
 | `subtree` | `id`, `depth` | A branch of concepts below an LTM node. |
 | `trace` | `data_id` | Where a document lives: its LTM leaf and ancestor branch, and how many STM facts carry its data_id. |
-| `placement` | `sample` | {thresholds, probes}: the effective distance thresholds with their source (config / model_default / fallback), and for a sample of document leaves the distance to their nearest concept. Used to tune the placement thresholds. |
+| `placement` | `sample` | {thresholds, probes}: the effective distance thresholds (including placement_min_margin) with their source (config / model_default / fallback), and for a sample of document leaves the nearest and runner-up concepts (never the root) with their distances, the margin between them, and the placement decision under the current settings (file / inbox_too_far / inbox_ambiguous). Used to tune the placement cutoff and margin. |

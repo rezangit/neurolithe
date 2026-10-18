@@ -101,6 +101,13 @@ pub struct Provenance {
     pub confidence: f64,
 }
 
+/// A document's full text, kept for recall's keyword leg (one per `dataId`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentBody {
+    pub title: String,
+    pub text: String,
+}
+
 /// A document attached to a leaf tree node by `dataId` reference. The bytes
 /// live in the source system; LTM stores only the pointer + provenance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -166,6 +173,23 @@ pub trait LtmRepository {
     /// Attach a document leaf (`tree_node_id` → `data_id` + provenance).
     fn create_leaf(&self, leaf: &Leaf) -> Result<()>;
 
+    /// File a document leaf in **one transaction**: the leaf tree node (its
+    /// embedding in the leaf vector index), its `data_id` link and provenance,
+    /// and the `parent_id` → leaf edge, plus (when given) the document's full
+    /// `body`, upserted by `data_id`. A crash can't leave a half-filed,
+    /// unlinked leaf behind, nor a newer text beside an older leaf (W3R-2).
+    /// When `provenance.ingested_at` is `None` it is stamped with the node's
+    /// `created_at`. Returns the new node id.
+    fn create_leaf_node(
+        &self,
+        node: &TreeNode,
+        embedding: &[f32],
+        data_id: &str,
+        provenance: &Provenance,
+        parent_id: i64,
+        body: Option<&DocumentBody>,
+    ) -> Result<i64>;
+
     /// Fetch a node by id.
     fn get_node(&self, id: i64) -> Result<Option<TreeNode>>;
 
@@ -226,15 +250,22 @@ pub trait LtmRepository {
     /// inbox" bug: an un-embedded spine can never match).
     fn concepts_missing_embedding(&self) -> Result<Vec<TreeNode>>;
 
-    /// Placement calibration: for up to `sample` already-embedded document
-    /// leaves, the distance to their **nearest concept** (ignoring any placement
-    /// threshold). Reveals the real distance scale so the placement threshold can
-    /// be tuned to actual data instead of guessed. Read-only; no LLM calls.
-    fn placement_calibration(&self, sample: usize) -> Result<Vec<PlacementProbe>>;
+    /// Up to `sample` document leaves with their **stored** embedding:
+    /// `(leaf node id, leaf title, embedding)`. The `inspect` placement view
+    /// re-runs placement on them (read-only, no LLM) to show the real distance
+    /// scale and the runner-up concept, so the placement cutoff and margin can
+    /// be tuned to actual data.
+    fn sample_leaf_embeddings(&self, sample: usize) -> Result<Vec<(i64, String, Vec<f32>)>>;
 
     /// Delete a node and everything attached to it: its edges (either
     /// direction), its vector, and its leaf rows. Used by tombstone/forget.
     fn delete_node(&self, node_id: i64) -> Result<()>;
+
+    /// Delete a node like [`Self::delete_node`] and, in the **same
+    /// transaction**, set each `(node_id, summary)` in `summaries` (the
+    /// node's parents' recomputed summaries). A crash can't leave a parent
+    /// summary that still lists the deleted node.
+    fn delete_node_with_summaries(&self, node_id: i64, summaries: &[(i64, String)]) -> Result<()>;
 
     /// Remove a single parent → child edge (no-op if absent). Used by the inbox
     /// gardener to re-home a leaf from the inbox to a concept.
@@ -269,15 +300,46 @@ pub trait LtmRepository {
 
     /// CT-scan statistics for the LTM tree (slice 9).
     fn ltm_stats(&self) -> Result<LtmStats>;
-}
 
-/// One placement-calibration reading: a document leaf, the nearest concept, and
-/// the raw vector distance between them (the number placement's threshold gates).
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct PlacementProbe {
-    pub leaf_title: String,
-    pub nearest_concept: String,
-    pub distance: f64,
+    // Full-text document bodies (recall's keyword leg). The SQLite
+    // repository implements them; the defaults refuse, so a wrapper that
+    // doesn't forward them fails loudly instead of silently finding nothing.
+
+    /// Store (or replace) a document's full text, keyed by `data_id`, for
+    /// recall's keyword leg. Callers write it before filing the leaf; it is
+    /// dropped with the document's last leaf.
+    fn put_document_body(&self, _data_id: &str, _title: &str, _body: &str) -> Result<()> {
+        anyhow::bail!("this LTM repository does not store document bodies")
+    }
+
+    /// Store a document's full text only if it has none yet, or only the
+    /// stand-in (title + summary) the v2 migration backfilled; never
+    /// overwrite a real text (W3R-7). For redeliveries of unchanged content,
+    /// whose leaf may since have been replaced by another writer.
+    fn fill_document_body(&self, _data_id: &str, _title: &str, _body: &str) -> Result<()> {
+        anyhow::bail!("this LTM repository does not store document bodies")
+    }
+
+    /// Drop a document's full text (forget, W3R-1). A no-op when it has none.
+    fn delete_document_body(&self, _data_id: &str) -> Result<()> {
+        anyhow::bail!("this LTM repository does not store document bodies")
+    }
+
+    /// Leaf node ids whose document text matches the FTS5 `match_query`,
+    /// best first, at most `limit`.
+    fn search_document_bodies(&self, _match_query: &str, _limit: usize) -> Result<Vec<i64>> {
+        anyhow::bail!("this LTM repository does not search document bodies")
+    }
+
+    /// The vector distance from `embedding` to each of `leaf_ids` (ids
+    /// without a leaf vector are absent).
+    fn leaf_distances(
+        &self,
+        _leaf_ids: &[i64],
+        _embedding: &[f32],
+    ) -> Result<std::collections::HashMap<i64, f64>> {
+        anyhow::bail!("this LTM repository does not compute leaf distances")
+    }
 }
 
 /// A snapshot of LTM tree health for the metrics CT scan.

@@ -85,7 +85,7 @@ pub async fn call(manager: &WorkspaceManager, tool: &str, args: &Args<'_>) -> Ar
                 svc.query
                     .execute(&req)
                     .await
-                    .map(|o| o.ltm.iter().flat_map(flatten_recall).collect::<Vec<_>>()),
+                    .map(|o| recall_entries(&o.ltm)),
                 "LTM recall failed",
             )
         }
@@ -132,6 +132,23 @@ pub async fn call(manager: &WorkspaceManager, tool: &str, args: &Args<'_>) -> Ar
         "inspect" => inspect(svc, args)?,
         other => return Err(format!("Unknown tool: {other}")),
     })
+}
+
+/// recall_ltm's entries: the bus door's wire entries (one per document
+/// leaf), plus each hit's fused `score` when `[retrieval] include_scores` is
+/// on. (The bus door itself keeps its fixed wire format.)
+fn recall_entries(hits: &[crate::application::ltm_retrieval::RecallResult]) -> Vec<Value> {
+    hits.iter()
+        .flat_map(|hit| {
+            flatten_recall(hit).into_iter().map(move |entry| {
+                let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
+                if let (Some(score), Value::Object(map)) = (hit.score, &mut value) {
+                    map.insert("score".into(), score.into());
+                }
+                value
+            })
+        })
+        .collect()
 }
 
 /// A [`QueryRequest`] from tool arguments, with the shared defaults

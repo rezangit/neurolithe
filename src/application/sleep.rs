@@ -1,6 +1,8 @@
 use crate::domain::cognition::conflict_resolver::{AdaptationResult, ConflictResolver};
 use crate::domain::decay::DecayEngine;
-use crate::domain::ports::{ExtractedFact, LlmClient, MemoryRepository};
+use crate::domain::ports::{
+    ChatModel, Embedder, ExtractedFact, LLM_NOT_CONFIGURED, MemoryRepository,
+};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -36,7 +38,9 @@ fn cap_extraction(facts: &mut Vec<ExtractedFact>, episode_id: Option<i64>) {
 
 pub struct SleepWorker {
     memory_repo: Arc<dyn MemoryRepository>,
-    llm_client: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
+    /// Extracts facts; `None` = no chat model (episodes can't be processed).
+    chat: Option<Arc<dyn ChatModel>>,
     decay_engine: DecayEngine,
     conflict_resolver: ConflictResolver,
 }
@@ -44,20 +48,27 @@ pub struct SleepWorker {
 impl SleepWorker {
     pub fn new(
         memory_repo: Arc<dyn MemoryRepository>,
-        llm_client: Arc<dyn LlmClient>,
+        embedder: Arc<dyn Embedder>,
+        chat: Option<Arc<dyn ChatModel>>,
         default_half_life_days: f64,
         working_half_life_days: f64,
         conflict_resolver: ConflictResolver,
     ) -> Self {
         Self {
             memory_repo,
-            llm_client,
+            embedder,
+            chat,
             decay_engine: DecayEngine::with_half_lives(
                 default_half_life_days,
                 working_half_life_days,
             ),
             conflict_resolver,
         }
+    }
+
+    /// Whether episodes can be processed (a chat model extracts the facts).
+    pub fn extracts(&self) -> bool {
+        self.chat.is_some()
     }
 
     /// Triggers the background decay process across the database
@@ -70,10 +81,14 @@ impl SleepWorker {
     /// 1. Extract facts (with relationships + temporal bounds)
     /// 2. For each fact, run Tri-Modal Conflict Resolution
     /// 3. Create edges for any extracted relationships
+    ///
+    /// Fails with [`LLM_NOT_CONFIGURED`] without a chat model.
     pub async fn process_episode(&self, episode: &crate::domain::models::Episode) -> Result<()> {
+        let Some(chat) = self.chat.as_ref() else {
+            anyhow::bail!(LLM_NOT_CONFIGURED);
+        };
         let valid_ccls = self.memory_repo.get_ccl_definitions(&episode.tenant_id)?;
-        let mut extracted_facts = self
-            .llm_client
+        let mut extracted_facts = chat
             .extract_facts(&episode.raw_dialogue, &valid_ccls)
             .await?;
 
@@ -87,8 +102,7 @@ impl SleepWorker {
         for fact in extracted_facts {
             if !known_ccl_names.contains(&fact.ccl) {
                 let context = format!("Fact: {}", fact.fact);
-                let desc = self
-                    .llm_client
+                let desc = chat
                     .generate_ccl_description(&fact.ccl, &context)
                     .await
                     .unwrap_or_else(|_| "Auto-generated cognitive layer".to_string());
@@ -101,7 +115,7 @@ impl SleepWorker {
                 self.memory_repo.store_ccl_definition(&new_def)?;
                 known_ccl_names.insert(fact.ccl.clone());
             }
-            let embedding = self.llm_client.embed_text(&fact.fact).await?;
+            let embedding = self.embedder.embed_text(&fact.fact).await?;
             let payload = serde_json::json!({
                 "fact": fact.fact,
                 "tags": fact.tags
@@ -142,7 +156,7 @@ impl SleepWorker {
 
             // Create edges for any extracted relationships
             for rel in &fact.relationships {
-                let target_embedding = self.llm_client.embed_text(&rel.target_entity).await?;
+                let target_embedding = self.embedder.embed_text(&rel.target_entity).await?;
                 let target_payload = serde_json::json!({
                     "fact": rel.target_entity,
                     "tags": ["entity"]
@@ -208,7 +222,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LlmClient for FloodLlm {
+    impl ChatModel for FloodLlm {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -234,13 +248,17 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok("d".into())
         }
+        async fn compress_context(&self, _m: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for FloodLlm {
         async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
             let n = self.embeds.fetch_add(1, Ordering::SeqCst);
             // Distinct, well-separated vectors so nothing merges.
             Ok(vec![n as f32, 1.0, 0.0, 0.0])
-        }
-        async fn compress_context(&self, _m: &str) -> Result<String> {
-            Ok(String::new())
         }
     }
 
@@ -254,7 +272,14 @@ mod tests {
         let llm = Arc::new(FloodLlm {
             embeds: AtomicUsize::new(0),
         });
-        let worker = SleepWorker::new(repo.clone(), llm.clone(), 7.0, 1.0, ConflictResolver::new());
+        let worker = SleepWorker::new(
+            repo.clone(),
+            llm.clone(),
+            Some(llm.clone()),
+            7.0,
+            1.0,
+            ConflictResolver::new(),
+        );
         let tenant = TenantId("t".into());
         let ep = repo
             .store_episode(&Episode {

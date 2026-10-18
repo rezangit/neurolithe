@@ -19,14 +19,16 @@ use crate::application::workspace::{
     WorkspaceHost, WorkspaceInfo, WorkspaceManager, WorkspaceServices, validate_name,
 };
 use crate::domain::ltm::LtmRepository;
-use crate::domain::ports::{EmbeddingIdentity, LlmClient, MemoryRepository, embedding_identity};
+use crate::domain::ports::{
+    Embedder, EmbeddingIdentity, MemoryRepository, Models, embedding_identity,
+};
 use crate::domain::thresholds::Thresholds;
 use crate::infrastructure::config::AppConfig;
 use crate::infrastructure::database::{
     LTM_FILE, MemoryStores, STM_FILE, delete_workspace_dir, export_workspace, list_workspace_dirs,
     open_workspace_stores, store_bytes,
 };
-use crate::infrastructure::llm::create_llm_client;
+use crate::infrastructure::llm::create_models;
 use crate::infrastructure::ltm_repository::SqliteLtmRepository;
 use crate::infrastructure::repository::SqliteMemoryRepository;
 use crate::interfaces::mcp::McpServer;
@@ -35,16 +37,18 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// Build the LLM client from config + the process environment, logging any
-/// startup warnings (e.g. a missing API key). A missing key does not abort
-/// startup: LLM-backed tools then fail with "LLM not configured: set …" while
-/// introspection keeps working (no `dummy_key` is ever sent — QA-10).
-pub fn build_llm(config: &AppConfig) -> Arc<dyn LlmClient> {
-    let setup = create_llm_client(&config.llm, &|name| std::env::var(name).ok());
+/// Build the models (embedder + optional chat model) from config + the
+/// process environment, logging any startup warnings (e.g. a missing API key).
+/// A missing key does not abort startup: without a chat key there is no chat
+/// model (the no-chat mode); without an embedding key, embedding fails with
+/// "LLM not configured: set …" while introspection keeps working (no
+/// `dummy_key` is ever sent — QA-10).
+pub fn build_models(config: &AppConfig) -> Models {
+    let setup = create_models(&config.llm, &|name| std::env::var(name).ok());
     for warning in &setup.warnings {
         tracing::warn!("{warning}");
     }
-    setup.client
+    setup.models
 }
 
 /// Opened repositories for one workspace. Each repository carries the
@@ -68,8 +72,8 @@ fn log_open_notes(notes: &[String]) {
 
 /// The embedder's identity (model id + output dimension), which every store is
 /// checked against. Probing may load a local model or call a remote embedder.
-pub async fn resolve_identity(llm: &dyn LlmClient) -> Result<EmbeddingIdentity> {
-    embedding_identity(llm)
+pub async fn resolve_identity(embedder: &dyn Embedder) -> Result<EmbeddingIdentity> {
+    embedding_identity(embedder)
         .await
         .context("determining the embedder's model and dimension (needed to open the stores)")
 }
@@ -78,10 +82,10 @@ pub async fn resolve_identity(llm: &dyn LlmClient) -> Result<EmbeddingIdentity> 
 async fn embed_spine_now(
     name: &str,
     ltm: &Arc<dyn LtmRepository>,
-    llm: &Arc<dyn LlmClient>,
+    embedder: &Arc<dyn Embedder>,
     dim: usize,
 ) {
-    match crate::application::ltm_placement::embed_spine_concepts(ltm, llm, dim).await {
+    match crate::application::ltm_placement::embed_spine_concepts(ltm, embedder, dim).await {
         Ok(0) => {}
         Ok(n) => tracing::info!("embedded {n} spine concept(s) in workspace {name:?}"),
         Err(e) => {
@@ -95,7 +99,7 @@ async fn embed_spine_now(
 /// the [`WorkspaceHost`] port.
 pub struct SqliteWorkspaceHost {
     config: AppConfig,
-    llm: Arc<dyn LlmClient>,
+    models: Models,
     /// Resolved once, on first open.
     identity: tokio::sync::OnceCell<EmbeddingIdentity>,
     /// Resolved once from the identity + config (logged when resolved).
@@ -103,10 +107,10 @@ pub struct SqliteWorkspaceHost {
 }
 
 impl SqliteWorkspaceHost {
-    pub fn new(config: AppConfig, llm: Arc<dyn LlmClient>) -> Self {
+    pub fn new(config: AppConfig, models: Models) -> Self {
         Self {
             config,
-            llm,
+            models,
             identity: tokio::sync::OnceCell::new(),
             thresholds: tokio::sync::OnceCell::new(),
         }
@@ -119,7 +123,7 @@ impl SqliteWorkspaceHost {
     /// The embedder identity (cached after the first probe).
     pub async fn identity(&self) -> Result<EmbeddingIdentity> {
         self.identity
-            .get_or_try_init(|| resolve_identity(self.llm.as_ref()))
+            .get_or_try_init(|| resolve_identity(self.models.embedder.as_ref()))
             .await
             .cloned()
     }
@@ -137,10 +141,12 @@ impl SqliteWorkspaceHost {
                     tracing::warn!("{warning}");
                 }
                 tracing::info!(
-                    "distance thresholds for {}: placement {} ({:?}), assimilation {} ({:?}), accommodation {} ({:?})",
+                    "distance thresholds for {}: placement {} ({:?}), placement margin {} ({:?}), assimilation {} ({:?}), accommodation {} ({:?})",
                     thresholds.embedding_model,
                     thresholds.placement_max_distance.value,
                     thresholds.placement_max_distance.source,
+                    thresholds.placement_min_margin.value,
+                    thresholds.placement_min_margin.source,
                     thresholds.assimilation.value,
                     thresholds.assimilation.source,
                     thresholds.accommodation.value,
@@ -162,8 +168,11 @@ impl SqliteWorkspaceHost {
             open_workspace_stores(&self.dir(name), &identity)?;
         log_open_notes(&notes);
         let lease: Arc<dyn std::any::Any + Send + Sync> = Arc::new(lease);
-        let stm: Arc<dyn MemoryRepository> =
-            Arc::new(SqliteMemoryRepository::new(stm).with_lease(lease.clone()));
+        let stm: Arc<dyn MemoryRepository> = Arc::new(
+            SqliteMemoryRepository::new(stm)
+                .with_lease(lease.clone())
+                .with_ranking(self.config.retrieval.ranking()),
+        );
         let ltm: Arc<dyn LtmRepository> = Arc::new(SqliteLtmRepository::new(ltm).with_lease(lease));
         ltm.seed_spine_from(&self.config.ltm.spine_or_default())?;
         Ok(WorkspaceRepos {
@@ -178,7 +187,9 @@ impl SqliteWorkspaceHost {
     /// an embedder outage must not block opening (it's retried next open).
     pub async fn embed_spine(&self, name: &str, repos: &WorkspaceRepos) {
         match self.identity().await {
-            Ok(identity) => embed_spine_now(name, &repos.ltm, &self.llm, identity.dim).await,
+            Ok(identity) => {
+                embed_spine_now(name, &repos.ltm, &self.models.embedder, identity.dim).await
+            }
             Err(e) => tracing::warn!("spine embedding skipped: {e:#}"),
         }
     }
@@ -187,7 +198,7 @@ impl SqliteWorkspaceHost {
     pub fn services(&self, repos: &WorkspaceRepos) -> WorkspaceServices {
         let app = Arc::new(NeurolitheApp::new(
             repos.stm.clone(),
-            self.llm.clone(),
+            self.models.clone(),
             self.config.decay.default_half_life_days,
             self.config.decay.working_half_life_days(),
             &repos.thresholds,
@@ -212,11 +223,16 @@ impl SqliteWorkspaceHost {
             // Same recall service as the bus door: STM hybrid search +
             // reference-returning LTM recall.
             query: QueryService::new(
-                RetrievalService::new(self.llm.clone(), repos.stm.clone()),
-                LtmRetrieval::new(repos.ltm.clone()),
-                self.llm.clone(),
+                RetrievalService::new(self.models.embedder.clone(), repos.stm.clone()),
+                LtmRetrieval::new(repos.ltm.clone()).with_ranking(self.config.retrieval.ranking()),
+                self.models.embedder.clone(),
             ),
-            documents: DocumentService::new(repos.ltm.clone(), self.llm.clone(), &repos.thresholds),
+            documents: DocumentService::new(
+                repos.ltm.clone(),
+                self.models.embedder.clone(),
+                self.models.chat.clone(),
+                &repos.thresholds,
+            ),
         }
     }
 }
@@ -281,10 +297,10 @@ impl WorkspaceHost for SqliteWorkspaceHost {
 /// (created on demand) until stdin closes (the normal shutdown) or SIGINT/
 /// SIGTERM arrives; either way the stores' WAL is then checkpointed.
 pub async fn run_mcp(config: AppConfig) -> Result<()> {
-    let llm = build_llm(&config);
+    let models = build_models(&config);
     serve_mcp(
         config,
-        llm,
+        models,
         tokio::io::BufReader::new(tokio::io::stdin()),
         tokio::io::stdout(),
     )
@@ -299,12 +315,7 @@ pub async fn run_mcp(config: AppConfig) -> Result<()> {
 /// calls wait for it. If startup fails (e.g. the stores were embedded by a
 /// different model), the error is returned and the process exits non-zero.
 /// Once started, the decay sweep runs alongside.
-pub async fn serve_mcp<R, W>(
-    config: AppConfig,
-    llm: Arc<dyn LlmClient>,
-    reader: R,
-    writer: W,
-) -> Result<()>
+pub async fn serve_mcp<R, W>(config: AppConfig, models: Models, reader: R, writer: W) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -313,7 +324,7 @@ where
     // even if the client disconnects immediately).
     validate_name(&config.workspace)?;
     let server = McpServer::pending(config.mcp.allow_workspace_switch);
-    let host = SqliteWorkspaceHost::new(config.clone(), llm);
+    let host = SqliteWorkspaceHost::new(config.clone(), models);
     let startup = async {
         let manager = WorkspaceManager::start(
             Box::new(host),
@@ -492,7 +503,7 @@ mod full {
     /// `SpineEmbedder` port to the application + infra it needs).
     struct DaemonSpineEmbedder {
         ltm: Arc<dyn LtmRepository>,
-        llm: Arc<dyn LlmClient>,
+        embedder: Arc<dyn Embedder>,
         dim: usize,
     }
 
@@ -500,7 +511,9 @@ mod full {
     impl SpineEmbedder for DaemonSpineEmbedder {
         async fn embed_spine(&self) -> Result<()> {
             let n = crate::application::ltm_placement::embed_spine_concepts(
-                &self.ltm, &self.llm, self.dim,
+                &self.ltm,
+                &self.embedder,
+                self.dim,
             )
             .await?;
             if n > 0 {
@@ -521,11 +534,12 @@ mod full {
     /// producers, and checkpoint the stores' WAL.
     pub async fn run(config: AppConfig) -> Result<()> {
         // --- external adapters ---
-        let llm = build_llm(&config);
+        let models = build_models(&config);
+        let embedder = models.embedder.clone();
 
         // --- stores: the selected workspace (created on demand). Both stores
         // use the embedder's dimension, so the feeder's one embedding fits both.
-        let host = SqliteWorkspaceHost::new(config.clone(), llm.clone());
+        let host = SqliteWorkspaceHost::new(config.clone(), models.clone());
         let dim = host.identity().await?.dim;
         let repos = host.open_repos(&config.workspace).await?;
         let stm_repo = repos.stm.clone();
@@ -535,7 +549,7 @@ mod full {
         // --- services ---
         let app = Arc::new(NeurolitheApp::new(
             stm_repo.clone(),
-            llm.clone(),
+            models.clone(),
             config.decay.default_half_life_days,
             config.decay.working_half_life_days(),
             &repos.thresholds,
@@ -543,7 +557,7 @@ mod full {
         let ingestion = Arc::new(IngestionService::new(
             stm_repo.clone(),
             ltm_repo.clone(),
-            llm.clone(),
+            models.clone(),
             dim,
             FEEDER_TENANT,
             &repos.thresholds,
@@ -568,7 +582,7 @@ mod full {
             stm_repo.clone(),
             ltm_repo.clone(),
             ingestion.clone(),
-            llm.clone(),
+            embedder.clone(),
             dim,
             &repos.thresholds,
         ));
@@ -594,7 +608,7 @@ mod full {
         let spine_embedder: Arc<dyn SpineEmbedder> = if config.feeder.enabled {
             Arc::new(DaemonSpineEmbedder {
                 ltm: ltm_repo.clone(),
-                llm: llm.clone(),
+                embedder: embedder.clone(),
                 dim,
             })
         } else {
@@ -613,9 +627,9 @@ mod full {
         // --- query consumer (memory.query -> memory.result), distinct group id ---
         let query = if config.bus_query.enabled {
             let query_service = Arc::new(QueryService::new(
-                RetrievalService::new(llm.clone(), stm_repo.clone()),
-                LtmRetrieval::new(ltm_repo.clone()),
-                llm.clone(),
+                RetrievalService::new(embedder.clone(), stm_repo.clone()),
+                LtmRetrieval::new(ltm_repo.clone()).with_ranking(config.retrieval.ranking()),
+                embedder.clone(),
             ));
             Some(Arc::new(QueryConsumer::new(&config.kafka, query_service)?))
         } else {
@@ -732,7 +746,12 @@ mod full {
 mod tests {
     use super::*;
     use crate::domain::models::CclDefinition;
-    use crate::domain::ports::ExtractedFact;
+    use crate::domain::ports::{ChatModel, ExtractedFact};
+
+    /// [`StubLlm`] as both models.
+    fn stub_models() -> Models {
+        Models::new(Arc::new(StubLlm), Some(Arc::new(StubLlm)))
+    }
     use crate::infrastructure::config::LoadOptions;
     use crate::infrastructure::database::init_db;
 
@@ -740,7 +759,7 @@ mod tests {
     struct StubLlm;
 
     #[async_trait::async_trait]
-    impl LlmClient for StubLlm {
+    impl ChatModel for StubLlm {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -751,12 +770,16 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok(String::new())
         }
+        async fn compress_context(&self, m: &str) -> Result<String> {
+            Ok(m.to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for StubLlm {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             let l = text.len() as f32;
             Ok(vec![1.0, l.sin(), l.cos(), 0.5])
-        }
-        async fn compress_context(&self, m: &str) -> Result<String> {
-            Ok(m.to_string())
         }
     }
 
@@ -770,7 +793,7 @@ mod tests {
 
     async fn start(home: &Path) -> (Rc<WorkspaceManager>, AppConfig) {
         let config = config_in(home);
-        let host = SqliteWorkspaceHost::new(config.clone(), Arc::new(StubLlm));
+        let host = SqliteWorkspaceHost::new(config.clone(), stub_models());
         let manager = WorkspaceManager::start(Box::new(host), &config.workspace, true)
             .await
             .unwrap();
@@ -787,7 +810,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut config = config_in(home.path());
         config.ltm.placement_max_distance = Some(0.42);
-        let host = SqliteWorkspaceHost::new(config.clone(), Arc::new(StubLlm));
+        let host = SqliteWorkspaceHost::new(config.clone(), stub_models());
 
         let repos = host.open_repos("default").await.unwrap();
         let t = &repos.thresholds;
@@ -809,6 +832,52 @@ mod tests {
         assert!(json["probes"].is_array());
     }
 
+    /// `[retrieval]` reaches the STM repository a workspace opens with:
+    /// with `include_scores`, recall hits carry their fused score.
+    #[tokio::test]
+    async fn test_retrieval_config_reaches_the_stm_repository() {
+        use crate::domain::models::{MemoryNode, TenantId, TimeFilter, WORKSPACE_TENANT};
+        let home = tempfile::tempdir().unwrap();
+        let mut config = config_in(home.path());
+        config.retrieval.include_scores = true;
+        let host = SqliteWorkspaceHost::new(config, stub_models());
+        let repos = host.open_repos("default").await.unwrap();
+        repos
+            .stm
+            .store_node(
+                &MemoryNode {
+                    id: None,
+                    tenant_id: TenantId(WORKSPACE_TENANT.into()),
+                    source_episode_id: None,
+                    payload: serde_json::json!({ "fact": "alpha" }),
+                    status: "active".into(),
+                    ccl: "reality".into(),
+                    is_explicit: true,
+                    support_count: 1,
+                    relevance_score: 1.0,
+                    context_key: None,
+                },
+                &[1.0, 0.0, 0.0, 0.0],
+            )
+            .unwrap();
+        let hits = repos
+            .stm
+            .query_with_graph(
+                "alpha",
+                &[1.0, 0.0, 0.0, 0.0],
+                &TenantId(WORKSPACE_TENANT.into()),
+                &TimeFilter::default(),
+                &["reality".to_string()],
+                5,
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(
+            hits[0].score.is_some(),
+            "include_scores from config applies"
+        );
+    }
+
     /// An invalid combination (config assimilation above the model/fallback
     /// accommodation) fails at startup with a clear message.
     #[tokio::test]
@@ -816,7 +885,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let mut config = config_in(home.path());
         config.stm.assimilation_threshold = Some(5.0);
-        let host = SqliteWorkspaceHost::new(config, Arc::new(StubLlm));
+        let host = SqliteWorkspaceHost::new(config, stub_models());
         let err = match host.open_repos("default").await {
             Ok(_) => panic!("must fail"),
             Err(e) => e.to_string(),
@@ -911,7 +980,7 @@ mod tests {
         let empty: &[u8] = b"";
         let err = serve_mcp(
             config,
-            Arc::new(StubLlm),
+            stub_models(),
             tokio::io::BufReader::new(empty),
             tokio::io::sink(),
         )
@@ -927,7 +996,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl LlmClient for SlowLlm {
+    impl ChatModel for SlowLlm {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -938,12 +1007,16 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok(String::new())
         }
+        async fn compress_context(&self, m: &str) -> Result<String> {
+            Ok(m.to_string())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for SlowLlm {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             tokio::time::sleep(self.delay).await;
             StubLlm.embed_text(text).await
-        }
-        async fn compress_context(&self, m: &str) -> Result<String> {
-            Ok(m.to_string())
         }
     }
 
@@ -957,9 +1030,10 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let config = config_in(home.path());
-        let llm: Arc<dyn LlmClient> = Arc::new(SlowLlm {
+        let slow = Arc::new(SlowLlm {
             delay: Duration::from_secs(2),
         });
+        let llm = Models::new(slow.clone(), Some(slow));
         let (client, server_io) = tokio::io::duplex(1 << 16);
         let (srv_r, srv_w) = tokio::io::split(server_io);
         let (cli_r, mut cli_w) = tokio::io::split(client);
@@ -1022,7 +1096,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let config = config_in(home.path());
         // The daemon's own open of "default" (kept for the whole run).
-        let daemon_host = SqliteWorkspaceHost::new(config.clone(), Arc::new(StubLlm));
+        let daemon_host = SqliteWorkspaceHost::new(config.clone(), stub_models());
         let daemon_repos = daemon_host.open_repos("default").await.unwrap();
 
         // Its MCP session starts on "default", then switches away.
