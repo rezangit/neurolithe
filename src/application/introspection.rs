@@ -2,6 +2,7 @@
 //! tools (slice 10). Reuses the monitoring snapshot and the LTM retrieval
 //! navigation; reference-returning where relevant (`dataId` + provenance).
 
+use crate::application::ltm_placement::{LtmPlacement, PlacementDecision};
 use crate::application::ltm_retrieval::{LeafRef, LtmRetrieval, MapNode, NodeView};
 use crate::application::monitoring::{MemoryMetrics, MonitoringService, RuntimeStats};
 use crate::domain::ltm::LtmRepository;
@@ -38,9 +39,9 @@ pub struct LeafPage {
     pub summary_max_chars: Option<usize>,
 }
 
-/// Default page size for `inspect_node` children/leaves when unspecified.
+/// Default page size for the `node` view's children/leaves when unspecified.
 const DEFAULT_CHILD_LIMIT: usize = 50;
-/// Default summary cap for `inspect_node` — headlines by default; opt into more.
+/// Default summary cap for the `node` view — headlines by default; opt into more.
 const DEFAULT_SUMMARY_MAX_CHARS: usize = 200;
 
 /// Truncate a summary to `max` chars on a char boundary (0 = unbounded).
@@ -91,17 +92,37 @@ pub struct IntrospectionService {
     ltm: Arc<dyn LtmRepository>,
     monitoring: MonitoringService,
     retrieval: LtmRetrieval,
-    /// The effective distance thresholds, reported by `placement_debug`.
+    /// The effective distance thresholds, reported by the `placement` view.
     thresholds: Thresholds,
 }
 
-/// `placement_debug` output: the thresholds in effect (with their source:
-/// config / model default / fallback) and nearest-concept distances for a
-/// sample of document leaves — compare the two to tune placement.
+/// `placement` view output: the thresholds in effect (with their source:
+/// config / model default / fallback) and, for a sample of document leaves,
+/// the nearest and runner-up concepts — compare them to tune the placement
+/// cutoff and margin.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PlacementDebug {
     pub thresholds: Thresholds,
-    pub probes: Vec<crate::domain::ltm::PlacementProbe>,
+    pub probes: Vec<PlacementProbe>,
+}
+
+/// One placement reading for a stored document leaf, re-run with the current
+/// settings (roots are never candidates).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlacementProbe {
+    pub leaf_title: String,
+    /// The nearest concept and its vector distance (the cutoff gates this).
+    pub nearest_concept: String,
+    pub distance: f64,
+    /// The second-nearest concept and its distance, at any distance; `null`
+    /// when there is only one concept.
+    pub runner_up_concept: Option<String>,
+    pub runner_up_distance: Option<f64>,
+    /// `runner_up_distance - distance` (the margin rule gates this).
+    pub margin: Option<f64>,
+    /// What placement would decide now: `file`, `inbox_too_far` or
+    /// `inbox_ambiguous`.
+    pub decision: PlacementDecision,
 }
 
 impl IntrospectionService {
@@ -218,13 +239,31 @@ impl IntrospectionService {
         })
     }
 
-    /// Placement calibration: nearest-concept distance for a sample of document
-    /// leaves (read-only, no LLM). Used to tune the placement threshold to real
-    /// embedding distances rather than a guessed value.
+    /// Placement calibration: for a sample of document leaves, the nearest and
+    /// runner-up concepts with their distances and what placement would decide
+    /// (read-only, no LLM). Used to tune the placement cutoff and margin to
+    /// real embedding distances rather than guessed values.
     pub fn placement_debug(&self, sample: usize) -> Result<PlacementDebug> {
+        let placement = LtmPlacement::from_thresholds(self.ltm.clone(), &self.thresholds);
+        let mut probes = Vec::new();
+        for (_leaf_id, leaf_title, embedding) in self.ltm.sample_leaf_embeddings(sample)? {
+            let candidates = placement.candidates(&embedding)?;
+            let Some(best) = &candidates.best else {
+                continue; // no embedded concept at all
+            };
+            probes.push(PlacementProbe {
+                leaf_title,
+                nearest_concept: best.name.clone(),
+                distance: best.distance,
+                runner_up_concept: candidates.runner_up.as_ref().map(|r| r.name.clone()),
+                runner_up_distance: candidates.runner_up.as_ref().map(|r| r.distance),
+                margin: candidates.margin(),
+                decision: placement.decide(&candidates),
+            });
+        }
         Ok(PlacementDebug {
             thresholds: self.thresholds.clone(),
-            probes: self.ltm.placement_calibration(sample)?,
+            probes,
         })
     }
 
@@ -387,7 +426,7 @@ mod tests {
         assert!(f.svc.inspect_node(99999, full).unwrap().is_none());
     }
 
-    /// trace_dataId finds the document in BOTH LTM (leaf + branch) and STM.
+    /// The `trace` view finds the document in BOTH LTM (leaf + branch) and STM.
     #[test]
     fn test_trace_data_id_spans_both_stores() {
         let f = fixture();
@@ -404,5 +443,103 @@ mod tests {
         let missing = f.svc.trace_data_id("doc_x").unwrap();
         assert!(missing.ltm_leaf.is_none());
         assert_eq!(missing.stm_node_count, 0);
+    }
+
+    /// E3: the placement view reports, per probe, the nearest and runner-up
+    /// concepts (never the root), their distances, the margin, and what
+    /// placement would decide under the current cutoff and margin.
+    #[test]
+    fn test_placement_view_reports_runner_up_and_margin() {
+        use crate::application::ltm_placement::{DocumentToPlace, LtmPlacement};
+        use crate::domain::thresholds::{ThresholdOverrides, Thresholds};
+
+        let stm_conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&stm_conn, DIM).unwrap();
+        let stm = Arc::new(SqliteMemoryRepository::new(stm_conn));
+        let ltm_conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&ltm_conn, DIM).unwrap();
+        let ltm = Arc::new(SqliteLtmRepository::new(ltm_conn));
+        ltm.seed_spine().unwrap();
+        let root = ltm.get_roots().unwrap().remove(0);
+        let mut branches = ltm
+            .get_children(root.id.unwrap())
+            .unwrap()
+            .into_iter()
+            .filter(|n| n.kind != TreeNodeKind::Inbox);
+        let (a, b) = (branches.next().unwrap(), branches.next().unwrap());
+        // The root sits right on the document; `a` is 0.1 away, `b` 0.3.
+        ltm.set_concept_embedding(root.id.unwrap(), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        ltm.set_concept_embedding(a.id.unwrap(), &[1.0, 0.1, 0.0, 0.0])
+            .unwrap();
+        ltm.set_concept_embedding(b.id.unwrap(), &[1.0, 0.3, 0.0, 0.0])
+            .unwrap();
+        LtmPlacement::new(ltm.clone() as Arc<dyn LtmRepository>, 1.0)
+            .place(&DocumentToPlace {
+                name: "Lease".into(),
+                summary: "Lease".into(),
+                embedding: vec![1.0, 0.0, 0.0, 0.0],
+                data_id: "doc_l".into(),
+                provenance: Provenance {
+                    source: "test".into(),
+                    ingested_at: None,
+                    confidence: 1.0,
+                },
+            })
+            .unwrap();
+
+        let view = |margin: f64| {
+            let (t, _) = Thresholds::resolve(
+                "local:bge-small-en-v1.5",
+                ThresholdOverrides {
+                    placement_min_margin: Some(margin),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            IntrospectionService::new(
+                stm.clone() as Arc<dyn MemoryRepository>,
+                ltm.clone() as Arc<dyn LtmRepository>,
+                t,
+            )
+            .placement_debug(10)
+            .unwrap()
+        };
+
+        let off = view(0.0);
+        assert_eq!(off.probes.len(), 1);
+        let p = &off.probes[0];
+        assert_eq!(p.leaf_title, "Lease");
+        assert_eq!(p.nearest_concept, a.name, "the root is not a candidate");
+        assert!((p.distance - 0.1).abs() < 1e-6, "{p:?}");
+        assert_eq!(p.runner_up_concept.as_deref(), Some(b.name.as_str()));
+        assert!((p.runner_up_distance.unwrap() - 0.3).abs() < 1e-6, "{p:?}");
+        assert!((p.margin.unwrap() - 0.2).abs() < 1e-6, "{p:?}");
+        assert_eq!(p.decision, PlacementDecision::File);
+        assert_eq!(off.thresholds.placement_min_margin.value, 0.0);
+
+        let on = view(0.25);
+        assert_eq!(on.probes[0].decision, PlacementDecision::InboxAmbiguous);
+        assert_eq!(on.thresholds.placement_min_margin.value, 0.25);
+
+        // The JSON shape the eval harness reads.
+        let json = serde_json::to_value(&on).unwrap();
+        let probe = &json["probes"][0];
+        for key in [
+            "leaf_title",
+            "nearest_concept",
+            "distance",
+            "runner_up_concept",
+            "runner_up_distance",
+            "margin",
+        ] {
+            assert!(!probe[key].is_null(), "{key}: {probe}");
+        }
+        assert_eq!(probe["decision"], "inbox_ambiguous");
+        assert_eq!(json["thresholds"]["placement_min_margin"]["value"], 0.25);
+        assert_eq!(
+            json["thresholds"]["placement_min_margin"]["source"],
+            "config"
+        );
     }
 }

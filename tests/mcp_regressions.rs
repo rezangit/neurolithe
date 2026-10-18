@@ -32,7 +32,7 @@ fn qa1_push_dialogue_persists_extracted_facts() {
         "QA-1: extracted fact not persisted; stm_list = {:?}",
         h.stm_facts()
     );
-    let stats = h.call("memory_stats", json!({})).json();
+    let stats = h.call("inspect", json!({"view": "stats"})).json();
     assert!(
         stats["stm_active_nodes"].as_i64().unwrap_or(0) >= 1,
         "QA-1: {stats}"
@@ -330,7 +330,7 @@ fn qa7_round(round: usize) {
 
     let mut check = home.spawn_mcp(&[], &[]);
     check.initialize();
-    let stats = check.call_tool("memory_stats", json!({})).json();
+    let stats = check.call_tool("inspect", json!({"view": "stats"})).json();
     assert_eq!(
         stats["stm_active_nodes"],
         json!(PROCS * WRITES),

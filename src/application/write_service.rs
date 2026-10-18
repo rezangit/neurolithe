@@ -15,9 +15,9 @@ use crate::application::ltm_placement::{DocumentToPlace, LtmPlacement};
 use crate::application::reset_service::{
     ForgetCommand, MemoryCommand, RememberCommand, WriteScope,
 };
-use crate::domain::ltm::{LtmRepository, Provenance};
-use crate::domain::models::{Edge, MemoryNode, TenantId};
-use crate::domain::ports::{LlmClient, MemoryRepository};
+use crate::domain::ltm::{DocumentBody, LtmRepository, Provenance};
+use crate::domain::models::{Edge, MemoryNode, REALITY_CCL, TenantId};
+use crate::domain::ports::{Embedder, MemoryRepository};
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -26,7 +26,7 @@ use uuid::Uuid;
 /// field on the command is ignored).
 const AGENT_TENANT: &str = crate::domain::models::WORKSPACE_TENANT;
 /// Default cognitive-context layer for agent-remembered facts (design §7).
-const DEFAULT_CCL: &str = "reality";
+const DEFAULT_CCL: &str = REALITY_CCL;
 /// Provenance source stamped on agent-authored LTM notes.
 const NOTE_SOURCE: &str = "agent";
 /// Max characters of note text used as the LTM leaf's display name.
@@ -52,11 +52,12 @@ pub struct WriteService {
     stm: Arc<dyn MemoryRepository>,
     ltm: Arc<dyn LtmRepository>,
     ingestion: Arc<IngestionService>,
-    llm: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
     /// STM embedding dimension, for zero-vector graph-anchor (subject) nodes.
     stm_vector_dim: usize,
-    /// Resolved placement threshold for LTM notes (see `domain::thresholds`).
-    placement_max_distance: f64,
+    /// Resolved placement cutoff and margin for LTM notes (see
+    /// `domain::thresholds`).
+    thresholds: crate::domain::thresholds::Thresholds,
 }
 
 impl WriteService {
@@ -64,7 +65,7 @@ impl WriteService {
         stm: Arc<dyn MemoryRepository>,
         ltm: Arc<dyn LtmRepository>,
         ingestion: Arc<IngestionService>,
-        llm: Arc<dyn LlmClient>,
+        embedder: Arc<dyn Embedder>,
         stm_vector_dim: usize,
         thresholds: &crate::domain::thresholds::Thresholds,
     ) -> Self {
@@ -72,9 +73,9 @@ impl WriteService {
             stm,
             ltm,
             ingestion,
-            llm,
+            embedder,
             stm_vector_dim,
-            placement_max_distance: thresholds.placement_max_distance.value,
+            thresholds: thresholds.clone(),
         }
     }
 
@@ -118,7 +119,7 @@ impl WriteService {
         let tenant_id = TenantId(tenant.to_string());
 
         // The turn node — the action/task. `kind:"turn"` marks it in the graph.
-        let embedding = self.llm.embed_text(fact).await?;
+        let embedding = self.embedder.embed_text(fact).await?;
         let turn = MemoryNode {
             id: None,
             tenant_id: tenant_id.clone(),
@@ -209,9 +210,9 @@ impl WriteService {
             bail!("remember ltm requires a 'text'");
         };
         let data_id = format!("note_{}", Uuid::now_v7());
-        let embedding = self.llm.embed_text(text).await?;
+        let embedding = self.embedder.embed_text(text).await?;
 
-        let placement = LtmPlacement::new(self.ltm.clone(), self.placement_max_distance);
+        let placement = LtmPlacement::from_thresholds(self.ltm.clone(), &self.thresholds);
         let doc = DocumentToPlace {
             name: leaf_name(text),
             summary: text.to_string(),
@@ -223,7 +224,12 @@ impl WriteService {
                 confidence: 1.0,
             },
         };
-        let placed = placement.place(&doc)?;
+        // The note's text for recall's keyword leg, with the leaf (W3R-2).
+        let body = DocumentBody {
+            title: leaf_name(text),
+            text: text.to_string(),
+        };
+        let placed = placement.place_with_body(&doc, Some(&body))?;
         Ok(WriteOutcome::RememberedLtm {
             data_id,
             matched: placed.matched,
@@ -253,7 +259,7 @@ mod tests {
     use super::*;
     use crate::application::ingestion::tests::text_event;
     use crate::domain::models::CclDefinition;
-    use crate::domain::ports::ExtractedFact;
+    use crate::domain::ports::{ChatModel, ExtractedFact, Models};
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::repository::SqliteMemoryRepository;
@@ -264,7 +270,7 @@ mod tests {
 
     struct StubLlm;
     #[async_trait]
-    impl LlmClient for StubLlm {
+    impl ChatModel for StubLlm {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -275,11 +281,15 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok(String::new())
         }
-        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
-            Ok(vec![0.2; DIM])
-        }
         async fn compress_context(&self, _m: &str) -> Result<String> {
             Ok(String::new())
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for StubLlm {
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.2; DIM])
         }
     }
 
@@ -304,7 +314,7 @@ mod tests {
         let ingest = Arc::new(IngestionService::new(
             stm.clone() as Arc<dyn MemoryRepository>,
             ltm.clone() as Arc<dyn LtmRepository>,
-            Arc::new(StubLlm),
+            Models::new(Arc::new(StubLlm), Some(Arc::new(StubLlm))),
             DIM,
             AGENT_TENANT,
             &crate::domain::thresholds::Thresholds::text_embedding_004(),
@@ -506,6 +516,11 @@ mod tests {
         // The leaf is discoverable by its dataId with agent provenance.
         let leaf = h.ltm.get_node_by_data_id(&data_id).unwrap();
         assert!(leaf.is_some(), "note placed as an LTM leaf");
+        // E2: and by keyword, through its stored full text.
+        assert_eq!(
+            h.ltm.search_document_bodies("\"claim\"", 5).unwrap(),
+            [leaf.unwrap().id.unwrap()]
+        );
     }
 
     #[tokio::test]

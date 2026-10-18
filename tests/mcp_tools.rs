@@ -146,13 +146,13 @@ fn stm_list_pages_and_filters() {
     }
     assert_eq!(h.stm_facts().len(), 3);
 
-    let page = h.call("stm_list", json!({"limit": 2, "offset": 0}));
+    let page = h.call("inspect", json!({"view": "stm", "limit": 2, "offset": 0}));
     page.assert_ok();
     assert_eq!(page.json().as_array().unwrap().len(), 2);
-    let rest = h.call("stm_list", json!({"limit": 2, "offset": 2}));
+    let rest = h.call("inspect", json!({"view": "stm", "limit": 2, "offset": 2}));
     assert_eq!(rest.json().as_array().unwrap().len(), 1);
 
-    let filtered = h.call("stm_list", json!({"contains": "BANANA"}));
+    let filtered = h.call("inspect", json!({"view": "stm", "contains": "BANANA"}));
     filtered.assert_ok();
     assert_eq!(facts_in(&filtered.json()), vec!["banana bread".to_string()]);
 
@@ -160,7 +160,7 @@ fn stm_list_pages_and_filters() {
     for key in ["fact", "status", "relevance_score"] {
         assert!(
             entry.get(key).is_some(),
-            "stm_list entry lacks {key}: {entry}"
+            "inspect stm entry lacks {key}: {entry}"
         );
     }
 }
@@ -168,18 +168,18 @@ fn stm_list_pages_and_filters() {
 #[test]
 fn memory_stats_and_health_reflect_stored_facts() {
     let mut h = Harness::start();
-    let before = h.call("memory_stats", json!({}));
+    let before = h.call("inspect", json!({"view": "stats"}));
     before.assert_ok();
     assert_eq!(before.json()["stm_active_nodes"], 0);
 
     h.call("store_memory", json!({"fact_text": "Gina"}))
         .assert_ok();
 
-    let stats = h.call("memory_stats", json!({})).json();
+    let stats = h.call("inspect", json!({"view": "stats"})).json();
     assert_eq!(stats["stm_active_nodes"], 1, "{stats}");
     assert!(stats["ltm_tree_nodes"].is_number(), "{stats}");
 
-    let health = h.call("health", json!({}));
+    let health = h.call("inspect", json!({"view": "health"}));
     health.assert_ok();
     assert_eq!(health.json()["stm_active_nodes"], 1);
 }
@@ -187,22 +187,25 @@ fn memory_stats_and_health_reflect_stored_facts() {
 #[test]
 fn ltm_introspection_tools_walk_the_tree() {
     let mut h = Harness::start();
-    let map = h.call("ltm_map", json!({"depth": 2}));
+    let map = h.call("inspect", json!({"view": "ltm_map", "depth": 2}));
     map.assert_ok();
     let roots = map.json();
     assert!(roots.is_array(), "{roots}");
 
     if let Some(root_id) = roots.get(0).and_then(|r| r["id"].as_i64()) {
-        let node = h.call("inspect_node", json!({"id": root_id}));
+        let node = h.call("inspect", json!({"view": "node", "id": root_id}));
         node.assert_ok();
         assert!(node.json().is_object(), "{}", node.text);
 
-        let sub = h.call("subtree", json!({"node": root_id, "depth": 1}));
+        let sub = h.call(
+            "inspect",
+            json!({"view": "subtree", "id": root_id, "depth": 1}),
+        );
         sub.assert_ok();
         assert_eq!(sub.json()["id"], root_id, "{}", sub.text);
     }
 
-    let dbg = h.call("placement_debug", json!({"sample": 5}));
+    let dbg = h.call("inspect", json!({"view": "placement", "sample": 5}));
     dbg.assert_ok();
     let dbg = dbg.json();
     // The effective thresholds and where each came from, next to the probes.
@@ -220,19 +223,28 @@ fn ltm_introspection_tools_walk_the_tree() {
 #[test]
 fn inspect_node_and_subtree_validate_ids() {
     let mut h = Harness::start();
-    assert!(h.call("inspect_node", json!({})).is_error);
-    assert!(h.call("inspect_node", json!({"id": "1"})).is_error);
-    assert!(h.call("subtree", json!({})).is_error);
+    assert!(h.call("inspect", json!({"view": "node"})).is_error);
+    assert!(
+        h.call("inspect", json!({"view": "node", "id": "1"}))
+            .is_error
+    );
+    assert!(h.call("inspect", json!({"view": "subtree"})).is_error);
 
-    // A well-formed but unknown id must not crash the server.
-    let _ = h.call("inspect_node", json!({"id": 999_999}));
-    h.call("health", json!({})).assert_ok();
+    // A well-formed but unknown id is a clear tool error (it used to be a
+    // bare `null` success), and the server keeps serving.
+    let missing = h.call("inspect", json!({"view": "node", "id": 999_999}));
+    assert!(missing.is_error, "{}", missing.raw);
+    assert!(missing.text.contains("999999"), "{}", missing.text);
+    h.call("inspect", json!({"view": "health"})).assert_ok();
 }
 
 #[test]
 fn trace_data_id_reports_unknown_document() {
     let mut h = Harness::start();
-    let res = h.call("trace_dataId", json!({"dataId": "doc_does_not_exist"}));
+    let res = h.call(
+        "inspect",
+        json!({"view": "trace", "data_id": "doc_does_not_exist"}),
+    );
     res.assert_ok();
     let trace = res.json();
     assert!(trace.is_object(), "{trace}");

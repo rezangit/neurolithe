@@ -5,8 +5,9 @@
 //! `vec_ltm` sqlite-vec index; summaries are kept in `fts_ltm` via triggers.
 
 use crate::domain::ltm::{
-    Leaf, LtmRepository, Provenance, SpineSeed, TreeEdge, TreeNode, TreeNodeKind,
+    DocumentBody, Leaf, LtmRepository, Provenance, SpineSeed, TreeEdge, TreeNode, TreeNodeKind,
 };
+use crate::infrastructure::embedding_codec::{as_blob, from_blob};
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -17,6 +18,22 @@ pub struct SqliteLtmRepository {
     /// still holds the repository.
     _lease: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
 }
+
+/// Upsert one document body in place (`?1` data_id, `?2` title, `?3` text).
+/// `ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE`, whose implicit delete
+/// would skip the FTS triggers.
+const UPSERT_DOCUMENT_BODY_SQL: &str = "INSERT INTO doc_bodies (data_id, title, body, backfilled)
+     VALUES (?1, ?2, ?3, 0)
+     ON CONFLICT(data_id) DO UPDATE
+     SET title = excluded.title, body = excluded.body, backfilled = 0";
+
+/// Like [`UPSERT_DOCUMENT_BODY_SQL`], but an existing body is only replaced
+/// while it is still the v2 migration's stand-in (W3R-7).
+const FILL_DOCUMENT_BODY_SQL: &str = "INSERT INTO doc_bodies (data_id, title, body, backfilled)
+     VALUES (?1, ?2, ?3, 0)
+     ON CONFLICT(data_id) DO UPDATE
+     SET title = excluded.title, body = excluded.body, backfilled = 0
+     WHERE doc_bodies.backfilled = 1";
 
 impl SqliteLtmRepository {
     pub fn new(conn: Connection) -> Self {
@@ -58,6 +75,60 @@ impl SqliteLtmRepository {
 
     /// Map a `tree_nodes` row (id, name, summary, kind, permanent, created_at,
     /// updated_at) to a [`TreeNode`].
+    /// The raw connection, for tests that need to shape a store directly.
+    #[cfg(test)]
+    pub(crate) fn conn_for_tests(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// Store (or replace) a document's full text for keyword recall. An
+    /// upsert in place (`ON CONFLICT DO UPDATE`, never `INSERT OR REPLACE`,
+    /// whose implicit delete would skip the FTS triggers).
+    fn put_document_body_sql(&self, data_id: &str, title: &str, body: &str) -> Result<()> {
+        self.conn
+            .execute(UPSERT_DOCUMENT_BODY_SQL, params![data_id, title, body])?;
+        Ok(())
+    }
+
+    /// Leaf node ids whose document body matches the FTS5 `match_query`,
+    /// best (BM25) first, at most `limit`. Bodies without a leaf never match.
+    fn search_document_bodies_sql(&self, match_query: &str, limit: usize) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT l.tree_node_id
+             FROM fts_doc_bodies f
+             JOIN doc_bodies b ON b.id = f.rowid
+             JOIN leaves l ON l.data_id = b.data_id
+             WHERE fts_doc_bodies MATCH ?1
+             ORDER BY f.rank, l.tree_node_id
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![match_query, limit as i64], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<i64>>>()?)
+    }
+
+    /// The L2 distance from `embedding` to each of `leaf_ids`' vectors (ids
+    /// without a leaf vector are absent from the map).
+    fn leaf_distances_sql(
+        &self,
+        leaf_ids: &[i64],
+        embedding: &[f32],
+    ) -> Result<std::collections::HashMap<i64, f64>> {
+        let query = as_blob(embedding);
+        let mut stmt = self.conn.prepare(
+            "SELECT node_id, vec_distance_l2(embedding, ?1) FROM vec_leaves WHERE node_id = ?2",
+        )?;
+        let mut out = std::collections::HashMap::new();
+        for id in leaf_ids {
+            if let Some(d) = stmt
+                .query_row(params![query, id], |r| r.get::<_, f64>(1))
+                .optional()?
+            {
+                out.insert(*id, d);
+            }
+        }
+        Ok(out)
+    }
+
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<TreeNode> {
         let kind_str: String = row.get(3)?;
         let kind = TreeNodeKind::from_db_str(&kind_str).map_err(|e| {
@@ -138,6 +209,7 @@ impl LtmRepository for SqliteLtmRepository {
         tx.execute("DELETE FROM vec_ltm", [])?;
         tx.execute("DELETE FROM vec_leaves", [])?;
         tx.execute("DELETE FROM leaves", [])?;
+        tx.execute("DELETE FROM doc_bodies", [])?;
         tx.execute("DELETE FROM tree_nodes", [])?;
         tx.commit()?;
         Ok(())
@@ -152,12 +224,7 @@ impl LtmRepository for SqliteLtmRepository {
         let node_id = tx.last_insert_rowid();
 
         if let Some(embedding) = embedding {
-            let embedding_bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(
-                    embedding.as_ptr() as *const u8,
-                    std::mem::size_of_val(embedding),
-                )
-            };
+            let embedding_bytes = as_blob(embedding);
             // Concepts and document leaves live in separate vector indexes (see
             // schema): placement searches concepts only, recall searches both.
             let table = if node.kind == TreeNodeKind::Leaf {
@@ -191,6 +258,56 @@ impl LtmRepository for SqliteLtmRepository {
             params![leaf.tree_node_id, leaf.data_id, provenance_json],
         )?;
         Ok(())
+    }
+
+    fn create_leaf_node(
+        &self,
+        node: &TreeNode,
+        embedding: &[f32],
+        data_id: &str,
+        provenance: &Provenance,
+        parent_id: i64,
+        body: Option<&DocumentBody>,
+    ) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(body) = body {
+            tx.execute(
+                UPSERT_DOCUMENT_BODY_SQL,
+                params![data_id, body.title, body.text],
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO tree_nodes (name, summary, kind, permanent) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                node.name,
+                node.summary,
+                TreeNodeKind::Leaf.as_str(),
+                node.permanent
+            ],
+        )?;
+        let node_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO vec_leaves(node_id, embedding) VALUES (?1, ?2)",
+            params![node_id, as_blob(embedding)],
+        )?;
+        let mut provenance = provenance.clone();
+        if provenance.ingested_at.is_none() {
+            provenance.ingested_at = tx.query_row(
+                "SELECT created_at FROM tree_nodes WHERE id = ?1",
+                params![node_id],
+                |r| r.get(0),
+            )?;
+        }
+        tx.execute(
+            "INSERT INTO leaves (tree_node_id, data_id, provenance) VALUES (?1, ?2, ?3)",
+            params![node_id, data_id, serde_json::to_string(&provenance)?],
+        )?;
+        tx.execute(
+            "INSERT INTO tree_edges (parent_id, child_id, weight) VALUES (?1, ?2, ?3)",
+            params![parent_id, node_id, TreeEdge::new(parent_id, node_id).weight],
+        )?;
+        tx.commit()?;
+        Ok(node_id)
     }
 
     fn get_node(&self, id: i64) -> Result<Option<TreeNode>> {
@@ -274,12 +391,7 @@ impl LtmRepository for SqliteLtmRepository {
         max_distance: f64,
         limit: usize,
     ) -> Result<Vec<(TreeNode, f64)>> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
+        let embedding_bytes = as_blob(embedding);
 
         // Node columns first (mapped by row_to_node), then the vector distance.
         let mut stmt = self.conn.prepare(
@@ -310,12 +422,7 @@ impl LtmRepository for SqliteLtmRepository {
         max_distance: f64,
         limit: usize,
     ) -> Result<Vec<(TreeNode, f64)>> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
+        let embedding_bytes = as_blob(embedding);
 
         // Search the concept index and the leaf index independently (they are
         // separate vec0 tables), then merge by distance. Each is queried for the
@@ -395,12 +502,7 @@ impl LtmRepository for SqliteLtmRepository {
     }
 
     fn set_concept_embedding(&self, node_id: i64, embedding: &[f32]) -> Result<()> {
-        let embedding_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding),
-            )
-        };
+        let embedding_bytes = as_blob(embedding);
         // vec0 rows are replaced by delete-then-insert on the primary key.
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM vec_ltm WHERE node_id = ?1", params![node_id])?;
@@ -434,62 +536,30 @@ impl LtmRepository for SqliteLtmRepository {
         let mut out = Vec::new();
         for row in rows {
             let (id, blob) = row?;
-            // vec0 stores float32 little-endian; decode back to Vec<f32>.
-            let emb: Vec<f32> = blob
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
-            out.push((id, emb));
+            out.push((id, from_blob(&blob)?));
         }
         Ok(out)
     }
 
-    fn placement_calibration(
-        &self,
-        sample: usize,
-    ) -> Result<Vec<crate::domain::ltm::PlacementProbe>> {
-        // Sample embedded leaves (node_id + raw embedding blob).
-        let leaves: Vec<(i64, Vec<u8>)> = {
-            let mut stmt = self
-                .conn
-                .prepare("SELECT node_id, embedding FROM vec_leaves LIMIT ?1")?;
-            stmt.query_map(params![sample as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-
-        let mut probes = Vec::new();
-        for (leaf_id, embedding) in leaves {
-            let leaf_title: String = self
-                .conn
-                .query_row(
-                    "SELECT name FROM tree_nodes WHERE id = ?1",
-                    params![leaf_id],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .unwrap_or_default();
-            // Nearest concept to this leaf's embedding, threshold-free.
-            let nearest = self
-                .conn
-                .query_row(
-                    "SELECT n.name, v.distance
-                     FROM vec_ltm v JOIN tree_nodes n ON n.id = v.node_id
-                     WHERE v.embedding MATCH ?1 AND k = 1",
-                    params![embedding],
-                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
-                )
-                .optional()?;
-            if let Some((nearest_concept, distance)) = nearest {
-                probes.push(crate::domain::ltm::PlacementProbe {
-                    leaf_title,
-                    nearest_concept,
-                    distance,
-                });
-            }
+    fn sample_leaf_embeddings(&self, sample: usize) -> Result<Vec<(i64, String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT vl.node_id, n.name, vl.embedding
+             FROM vec_leaves vl JOIN tree_nodes n ON n.id = vl.node_id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![sample as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, title, blob) = row?;
+            out.push((id, title, from_blob(&blob)?));
         }
-        Ok(probes)
+        Ok(out)
     }
 
     fn concepts_missing_embedding(&self) -> Result<Vec<TreeNode>> {
@@ -505,6 +575,10 @@ impl LtmRepository for SqliteLtmRepository {
     }
 
     fn delete_node(&self, node_id: i64) -> Result<()> {
+        self.delete_node_with_summaries(node_id, &[])
+    }
+
+    fn delete_node_with_summaries(&self, node_id: i64, summaries: &[(i64, String)]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         // Edges first (FK to tree_nodes), then vector + leaves, then the node
         // itself (fires the fts_ltm delete trigger).
@@ -522,6 +596,12 @@ impl LtmRepository for SqliteLtmRepository {
             params![node_id],
         )?;
         tx.execute("DELETE FROM tree_nodes WHERE id = ?1", params![node_id])?;
+        for (id, summary) in summaries {
+            tx.execute(
+                "UPDATE tree_nodes SET summary = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                params![summary, id],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -563,6 +643,36 @@ impl LtmRepository for SqliteLtmRepository {
             });
         }
         Ok(leaves)
+    }
+
+    fn put_document_body(&self, data_id: &str, title: &str, body: &str) -> Result<()> {
+        self.put_document_body_sql(data_id, title, body)
+    }
+
+    fn fill_document_body(&self, data_id: &str, title: &str, body: &str) -> Result<()> {
+        self.conn
+            .execute(FILL_DOCUMENT_BODY_SQL, params![data_id, title, body])?;
+        Ok(())
+    }
+
+    fn delete_document_body(&self, data_id: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM doc_bodies WHERE data_id = ?1",
+            params![data_id],
+        )?;
+        Ok(())
+    }
+
+    fn search_document_bodies(&self, match_query: &str, limit: usize) -> Result<Vec<i64>> {
+        self.search_document_bodies_sql(match_query, limit)
+    }
+
+    fn leaf_distances(
+        &self,
+        leaf_ids: &[i64],
+        embedding: &[f32],
+    ) -> Result<std::collections::HashMap<i64, f64>> {
+        self.leaf_distances_sql(leaf_ids, embedding)
     }
 
     fn ltm_stats(&self) -> Result<crate::domain::ltm::LtmStats> {
@@ -622,6 +732,74 @@ mod tests {
         let conn = init_db(None as Option<&String>).unwrap();
         init_ltm_schema(&conn, DIM).unwrap();
         SqliteLtmRepository::new(conn)
+    }
+
+    /// A filed leaf (the way placement files one), for the body tests.
+    fn file_leaf(repo: &SqliteLtmRepository, data_id: &str, emb: [f32; DIM]) -> i64 {
+        let parent = repo
+            .create_node(&TreeNode::new("p", "", TreeNodeKind::Spine), None)
+            .unwrap();
+        repo.create_leaf_node(
+            &TreeNode::new(data_id, "short summary", TreeNodeKind::Leaf),
+            &emb,
+            data_id,
+            &Provenance {
+                source: "test".into(),
+                ingested_at: None,
+                confidence: 1.0,
+            },
+            parent,
+            None,
+        )
+        .unwrap()
+    }
+
+    /// E2: a document's full body is searchable by keyword and maps back to
+    /// its leaf node(s), best match first; a store reset forgets the bodies.
+    #[test]
+    fn test_document_bodies_search_to_leaves() {
+        let repo = setup();
+        let a = file_leaf(&repo, "doc_a", [1.0, 0.0, 0.0, 0.0]);
+        let b = file_leaf(&repo, "doc_b", [0.0, 1.0, 0.0, 0.0]);
+        let filler = "lorem ipsum dolor sit amet ".repeat(80);
+        repo.put_document_body("doc_a", "Lease", &format!("{filler} the lighthouse keeper"))
+            .unwrap();
+        repo.put_document_body(
+            "doc_b",
+            "Notes",
+            "lighthouse lighthouse lighthouse and the keeper",
+        )
+        .unwrap();
+        // An orphan body (no leaf) never surfaces.
+        repo.put_document_body("doc_orphan", "", "lighthouse")
+            .unwrap();
+
+        let hits = repo.search_document_bodies("\"lighthouse\"", 10).unwrap();
+        assert_eq!(hits, vec![b, a], "denser match first, orphan excluded");
+        assert!(
+            repo.search_document_bodies("\"windmill\"", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            repo.search_document_bodies("\"lighthouse\"", 1).unwrap(),
+            vec![b]
+        );
+
+        // Exact L2 distances for chosen leaves (and none for unknown ids).
+        let d = repo
+            .leaf_distances(&[a, b, 9999], &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        assert_eq!(d.len(), 2);
+        assert!(d[&a].abs() < 1e-6);
+        assert!((d[&b] - std::f64::consts::SQRT_2).abs() < 1e-5);
+
+        repo.reset_store().unwrap();
+        let left: i64 = repo
+            .conn
+            .query_row("SELECT COUNT(*) FROM doc_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0, "reset forgets bodies, orphans too");
     }
 
     /// A node can sit under several parents (DAG), and children/parents read

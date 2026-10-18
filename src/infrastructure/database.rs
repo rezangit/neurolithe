@@ -385,27 +385,35 @@ pub fn export_workspace(dir: &Path, name: &str) -> anyhow::Result<serde_json::Va
     if ltm_path.is_file() && std::fs::metadata(&ltm_path)?.len() > 0 {
         let conn = open_read_only(&ltm_path)?;
         if has_table(&conn, "leaves")? && has_table(&conn, "tree_nodes")? {
-            let mut stmt = conn.prepare(
-                "SELECT l.data_id, n.name, n.summary, l.provenance
+            // Each document's full text (LTM v2+); null where none is kept.
+            let body_sql = if has_table(&conn, "doc_bodies")? {
+                "(SELECT b.body FROM doc_bodies b WHERE b.data_id = l.data_id)"
+            } else {
+                "NULL"
+            };
+            let mut stmt = conn.prepare(&format!(
+                "SELECT l.data_id, n.name, n.summary, l.provenance, {body_sql}
                  FROM leaves l JOIN tree_nodes n ON n.id = l.tree_node_id
-                 ORDER BY n.id",
-            )?;
+                 ORDER BY n.id"
+            ))?;
             let rows = stmt.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             })?;
             for row in rows {
-                let (data_id, title, summary, provenance) = row?;
+                let (data_id, title, summary, provenance, body) = row?;
                 let provenance: serde_json::Value = serde_json::from_str(&provenance)
                     .unwrap_or(serde_json::Value::String(provenance));
                 leaves.push(serde_json::json!({
                     "data_id": data_id,
                     "title": title,
                     "summary": summary,
+                    "body": body,
                     "provenance": provenance,
                 }));
             }
@@ -736,12 +744,7 @@ mod tests {
         // The STM vec table accepts a vector of the STM dimension — proof the
         // dimension applied to STM and was not crossed with LTM's.
         let embedding = vec![0.0_f32; DIM];
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                embedding.as_ptr() as *const u8,
-                std::mem::size_of_val(embedding.as_slice()),
-            )
-        };
+        let bytes = crate::infrastructure::embedding_codec::as_blob(&embedding);
         stores
             .stm
             .execute(

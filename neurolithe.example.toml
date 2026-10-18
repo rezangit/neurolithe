@@ -60,8 +60,22 @@ provider = "none"
 # embedding_location = "us-central1"
 
 # [mcp]
-# Whether the MCP `workspace_switch` tool may change workspace mid-session.
+# Whether an MCP session may leave its startup workspace. false pins the
+# server: workspace_switch, workspace_create and workspace_delete are not
+# listed, and no other workspace can be reached (one fixed memory per entry).
 # allow_workspace_switch = true
+
+# [retrieval] — how search ranks hits. query_memory and recall_ltm each rank
+# a vector (meaning) list and a keyword (full-text) list, then merge them by
+# reciprocal rank fusion: a hit scores Σ weight / (rrf_k + rank) over the lists
+# it appears in. Every key is optional; these are the defaults.
+# [retrieval]
+# rrf_k = 60             # larger flattens the gap between top ranks (0–10000)
+# vector_weight = 1.0    # weight of the meaning (vector) list (>= 0)
+# keyword_weight = 1.0   # weight of the keyword list (>= 0; not both 0)
+# leg_k_factor = 4       # each list ranks leg_k_factor × k candidates (1–50)
+# fts_stopwords = true   # drop English stop-words from the keyword query
+# include_scores = false # add each direct hit's fused `score` to results
 
 # [log]
 # Diagnostics go to stderr only (stdout is the MCP transport). RUST_LOG, when
@@ -75,9 +89,10 @@ provider = "none"
 
 # Distance thresholds (optional). Defaults are picked per embedding model; see
 # docs/src/configuration.md ("Distance thresholds"). Calibrate placement with
-# the `placement_debug` MCP tool, which reports the values in effect.
+# the MCP `inspect` tool (view "placement"), which reports the values in effect.
 # [ltm]
 # placement_max_distance = 0.96   # file under the nearest concept within this L2 distance
+# placement_min_margin = 0.0      # ...and only if it beats the runner-up by this much (0 = off)
 # [stm]
 # assimilation_threshold = 0.40   # a new fact this close IS the existing fact
 # accommodation_threshold = 0.58  # this close: the new fact refines the existing one

@@ -219,10 +219,36 @@ pub fn init_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::Resu
     Ok(())
 }
 
+/// Indexes for the STM graph: `edges` is read by endpoint on every recall
+/// (1-hop expansion, a hit's connections, a turn's `about` subjects) and on
+/// every node delete (foreign-key checks). Idempotent; STM schema v3.
+pub fn create_stm_edge_indexes(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, relation);
+         CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id);",
+    )
+}
+
+/// The STM node expression index for `dataId` lookups (trace, forget by
+/// dataId, working subjects, ingest upserts). Partial, so facts without a
+/// `dataId` cost nothing. A query uses it when it compares exactly
+/// `json_extract(payload, '$.dataId') = ?`. Building it evaluates
+/// `json_extract` on every row, so it fails if any payload is not valid JSON.
+/// Idempotent; STM schema v3.
+pub fn create_stm_data_id_index(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_nodes_data_id ON nodes(json_extract(payload, '$.dataId'))
+             WHERE json_extract(payload, '$.dataId') IS NOT NULL",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Initialize the Long-Term Memory schema (the permanent knowledge tree) in the
 /// LTM database. Creates `tree_nodes`, `tree_edges` (multi-parent DAG),
 /// `leaves` (`dataId` references), the `vec_ltm` sqlite-vec index at the LTM
-/// dimension, and `fts_ltm` over node summaries with sync triggers. Idempotent.
+/// dimension, `fts_ltm` over node summaries with sync triggers, and the
+/// full-text document bodies ([`create_ltm_doc_bodies`]). Idempotent.
 pub fn init_ltm_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::Result<()> {
     // 0. Concept / leaf nodes. `permanent` is always true — LTM never decays.
     conn.execute(
@@ -309,13 +335,190 @@ pub fn init_ltm_schema(conn: &Connection, vector_dimension: usize) -> rusqlite::
         ",
     )?;
 
+    create_ltm_doc_bodies(conn)?;
     Ok(())
+}
+
+/// LTM v2: each document's **full** text, keyed by `data_id`, with a
+/// full-text index over it. A leaf's summary and embedding only see the
+/// start of a long document (without a chat model, its first ~1,000
+/// characters); recall's keyword leg searches this instead, so evidence deep
+/// in a document is still found.
+///
+/// - `doc_bodies(id, data_id, title, body, backfilled)`: one row per document
+///   (an upsert on re-filing, keyed by the unique `data_id`). Written in the
+///   same transaction as the leaf, so a filed leaf always has the matching
+///   text. `backfilled = 1` marks the stand-in text (title + summary) the v2
+///   migration gave a document filed before bodies were kept; any real
+///   write clears it.
+/// - `fts_doc_bodies(title, body)`: FTS5 over it (external content keyed by
+///   the declared `id`, which a VACUUM never renumbers), kept in sync by
+///   triggers.
+/// - Deleting the **last** leaf that carries a `data_id` drops its body. A
+///   replacement is filed before the old copy goes, so an upsert keeps it.
+///
+/// Idempotent.
+pub fn create_ltm_doc_bodies(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS doc_bodies (
+            id INTEGER PRIMARY KEY,
+            data_id TEXT NOT NULL UNIQUE,
+            title TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL,
+            backfilled INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_doc_bodies USING fts5(
+            title,
+            body,
+            content='doc_bodies',
+            content_rowid='id'
+        );
+        CREATE TRIGGER IF NOT EXISTS doc_bodies_ai AFTER INSERT ON doc_bodies BEGIN
+            INSERT INTO fts_doc_bodies(rowid, title, body)
+            VALUES (new.id, new.title, new.body);
+        END;
+        CREATE TRIGGER IF NOT EXISTS doc_bodies_ad AFTER DELETE ON doc_bodies BEGIN
+            INSERT INTO fts_doc_bodies(fts_doc_bodies, rowid, title, body)
+            VALUES ('delete', old.id, old.title, old.body);
+        END;
+        CREATE TRIGGER IF NOT EXISTS doc_bodies_au AFTER UPDATE ON doc_bodies BEGIN
+            INSERT INTO fts_doc_bodies(fts_doc_bodies, rowid, title, body)
+            VALUES ('delete', old.id, old.title, old.body);
+            INSERT INTO fts_doc_bodies(rowid, title, body)
+            VALUES (new.id, new.title, new.body);
+        END;
+        CREATE TRIGGER IF NOT EXISTS leaves_ad_doc_body AFTER DELETE ON leaves
+        WHEN NOT EXISTS (SELECT 1 FROM leaves WHERE data_id = old.data_id) BEGIN
+            DELETE FROM doc_bodies WHERE data_id = old.data_id;
+        END;
+        ",
+    )?;
+    // A store made before the flag existed: its rows are real text (0).
+    add_column_if_missing(
+        conn,
+        "doc_bodies",
+        "backfilled",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::infrastructure::database::init_db;
+
+    /// W3R-6: `doc_bodies` rows have a declared `INTEGER PRIMARY KEY`, so
+    /// the FTS index's rowids survive a VACUUM (an implicit rowid may be
+    /// renumbered, which would point the index at the wrong documents).
+    #[test]
+    fn test_doc_bodies_index_survives_vacuum() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = init_db(Some(&dir.path().join("ltm.sqlite"))).unwrap();
+        init_ltm_schema(&conn, 4).unwrap();
+        for (i, (id, body)) in [
+            ("a", "alpha apple"),
+            ("b", "bravo banana"),
+            ("c", "charlie cherry"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO tree_nodes (id, name, kind) VALUES (?1, 'n', 'leaf')",
+                rusqlite::params![i as i64 + 1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leaves (tree_node_id, data_id) VALUES (?1, ?2)",
+                rusqlite::params![i as i64 + 1, id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO doc_bodies (data_id, title, body) VALUES (?1, '', ?2)",
+                rusqlite::params![id, body],
+            )
+            .unwrap();
+        }
+        conn.execute("DELETE FROM leaves WHERE data_id = 'b'", [])
+            .unwrap();
+        conn.execute_batch("VACUUM").unwrap();
+        let found: Vec<String> = conn
+            .prepare(
+                "SELECT b.data_id FROM fts_doc_bodies f JOIN doc_bodies b ON b.id = f.rowid
+                 WHERE fts_doc_bodies MATCH 'cherry'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(found, ["c"]);
+    }
+
+    /// E2: LTM keeps each document's full body in `doc_bodies`, full-text
+    /// indexed by `fts_doc_bodies`. An upsert re-indexes it; the body goes
+    /// once the last leaf carrying its `data_id` is deleted (not before, so
+    /// a replacement filed before the old copy is dropped keeps it).
+    #[test]
+    fn test_doc_bodies_fts_sync_and_cleanup() {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&conn, 4).unwrap();
+        let hits = |q: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT b.data_id FROM fts_doc_bodies f JOIN doc_bodies b ON b.id = f.rowid
+                     WHERE fts_doc_bodies MATCH ?1 ORDER BY b.data_id",
+                )
+                .unwrap();
+            stmt.query_map([q], |r| r.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        let leaf = |id: i64, data_id: &str| {
+            conn.execute(
+                "INSERT INTO tree_nodes (id, name, kind) VALUES (?1, 'n', 'leaf')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO leaves (tree_node_id, data_id) VALUES (?1, ?2)",
+                rusqlite::params![id, data_id],
+            )
+            .unwrap();
+        };
+        let put = |data_id: &str, body: &str| {
+            conn.execute(
+                "INSERT INTO doc_bodies (data_id, title, body) VALUES (?1, 't', ?2)
+                 ON CONFLICT(data_id) DO UPDATE SET title = excluded.title, body = excluded.body",
+                rusqlite::params![data_id, body],
+            )
+            .unwrap();
+        };
+
+        leaf(1, "doc_a");
+        put("doc_a", "a long letter about the harbour lighthouse");
+        assert_eq!(hits("lighthouse"), ["doc_a"]);
+
+        put("doc_a", "rewritten: now about the old windmill");
+        assert!(hits("lighthouse").is_empty(), "upsert re-indexes");
+        assert_eq!(hits("windmill"), ["doc_a"]);
+
+        // A replacement leaf for the same document, then the old one goes:
+        // the body stays while any leaf still carries the data_id.
+        leaf(2, "doc_a");
+        conn.execute("DELETE FROM leaves WHERE tree_node_id = 1", [])
+            .unwrap();
+        assert_eq!(hits("windmill"), ["doc_a"]);
+        conn.execute("DELETE FROM leaves WHERE tree_node_id = 2", [])
+            .unwrap();
+        assert!(hits("windmill").is_empty(), "last leaf gone, body gone");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM doc_bodies", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 0);
+    }
 
     #[test]
     fn test_init_schema() {

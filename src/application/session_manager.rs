@@ -1,5 +1,6 @@
 use crate::domain::models::{Episode, MemoryResult, SessionId, TenantId, TimeFilter};
-use crate::domain::ports::{LlmClient, MemoryRepository};
+use crate::domain::ports::{ChatModel, Embedder, MemoryRepository};
+use crate::domain::tuning::{CHARS_PER_TOKEN, SESSION_CONTEXT_K};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -91,7 +92,9 @@ fn evict_sessions(
 /// Implements blueprint section 2.2 (Short-Term Memory / Context Compressor).
 pub struct SessionManager {
     memory_repo: Arc<dyn MemoryRepository>,
-    llm_client: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
+    /// Compresses old messages; `None` = no chat model (rolling window).
+    chat: Option<Arc<dyn ChatModel>>,
     /// Per-session buffers, keyed by [`session_key`], bounded by
     /// [`MAX_SESSIONS`] and [`SESSION_IDLE_TTL`].
     sessions: Mutex<HashMap<String, SessionBuffer>>,
@@ -104,22 +107,24 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new(
         memory_repo: Arc<dyn MemoryRepository>,
-        llm_client: Arc<dyn LlmClient>,
+        embedder: Arc<dyn Embedder>,
+        chat: Option<Arc<dyn ChatModel>>,
         token_threshold: usize,
         keep_recent: usize,
     ) -> Self {
         Self {
             memory_repo,
-            llm_client,
+            embedder,
+            chat,
             sessions: Mutex::new(HashMap::new()),
             token_threshold,
             keep_recent,
         }
     }
 
-    /// Rough token estimation: ~4 characters per token (GPT tokenizer heuristic)
+    /// Rough token estimation: [`CHARS_PER_TOKEN`] characters per token.
     fn estimate_tokens(text: &str) -> usize {
-        text.len() / 4
+        text.len() / CHARS_PER_TOKEN
     }
 
     /// Number of session buffers currently held in memory.
@@ -186,12 +191,15 @@ impl SessionManager {
         // episodes, so nothing is lost, and memory stays bounded. Not
         // configuring a chat LLM is a normal mode, so it is not a warning.
         if needs_compression {
-            if !self.llm_client.chat_available() {
-                self.trim_to_recent(&key);
-            } else if let Err(e) = self.compress_buffer(&key).await {
-                tracing::warn!("context compression failed (episode {episode_id}): {e:#}");
-                warnings.push(format!("context compression failed: {e:#}"));
-                self.trim_to_recent(&key);
+            match &self.chat {
+                None => self.trim_to_recent(&key),
+                Some(chat) => {
+                    if let Err(e) = self.compress_buffer(&key, chat.as_ref()).await {
+                        tracing::warn!("context compression failed (episode {episode_id}): {e:#}");
+                        warnings.push(format!("context compression failed: {e:#}"));
+                        self.trim_to_recent(&key);
+                    }
+                }
             }
         }
 
@@ -232,14 +240,14 @@ impl SessionManager {
         message: &str,
         ccl: &str,
     ) -> Result<Vec<MemoryResult>> {
-        let embedding = self.llm_client.embed_text(message).await?;
+        let embedding = self.embedder.embed_text(message).await?;
         self.memory_repo.query_with_graph(
             message,
             &embedding,
             tenant_id,
             &TimeFilter::default(),
             &[ccl.to_string()],
-            5,
+            SESSION_CONTEXT_K,
         )
     }
 
@@ -267,7 +275,7 @@ impl SessionManager {
 
     /// Compress the oldest messages in a session buffer into a dense summary.
     /// A no-op if the session was evicted meanwhile.
-    async fn compress_buffer(&self, key: &str) -> Result<()> {
+    async fn compress_buffer(&self, key: &str, chat: &dyn ChatModel) -> Result<()> {
         let (messages_to_compress, existing_summary) = {
             let sessions = self.lock_sessions();
             let Some(buffer) = sessions.get(key) else {
@@ -293,7 +301,7 @@ impl SessionManager {
         };
 
         // Call LLM to compress
-        let new_summary = self.llm_client.compress_context(&text_to_compress).await?;
+        let new_summary = chat.compress_context(&text_to_compress).await?;
 
         // Update the buffer: remove exactly the compressed messages, update summary
         let mut sessions = self.lock_sessions();
@@ -395,7 +403,7 @@ mod tests {
     /// Embeds fine, but compression is unavailable.
     struct NoCompress;
     #[async_trait::async_trait]
-    impl LlmClient for NoCompress {
+    impl ChatModel for NoCompress {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -406,11 +414,15 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok(String::new())
         }
-        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
-            Ok(vec![0.5, 0.1, 0.0, 0.0])
-        }
         async fn compress_context(&self, _m: &str) -> Result<String> {
             anyhow::bail!("compressor down")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Embedder for NoCompress {
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.5, 0.1, 0.0, 0.0])
         }
     }
 
@@ -420,6 +432,7 @@ mod tests {
         SessionManager::new(
             Arc::new(SqliteMemoryRepository::new(conn)),
             Arc::new(NoCompress),
+            Some(Arc::new(NoCompress)),
             token_threshold,
             keep_recent,
         )
@@ -447,32 +460,13 @@ mod tests {
         assert!(ctx.warnings.iter().any(|w| w.contains("compressor down")));
     }
 
-    /// Compression is unavailable *by configuration* (no chat LLM).
-    struct NoChat {
-        compress_calls: std::sync::atomic::AtomicUsize,
-    }
+    /// An embedder only: compression is unavailable *by configuration* (no
+    /// chat model), so no compression call can even be made.
+    struct NoChat;
     #[async_trait::async_trait]
-    impl LlmClient for NoChat {
-        async fn extract_facts(
-            &self,
-            _d: &str,
-            _c: &[CclDefinition],
-        ) -> Result<Vec<ExtractedFact>> {
-            anyhow::bail!("LLM not configured")
-        }
-        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
-            anyhow::bail!("LLM not configured")
-        }
+    impl Embedder for NoChat {
         async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
             Ok(vec![0.5, 0.1, 0.0, 0.0])
-        }
-        async fn compress_context(&self, _m: &str) -> Result<String> {
-            self.compress_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            anyhow::bail!("LLM not configured")
-        }
-        fn chat_available(&self) -> bool {
-            false
         }
     }
 
@@ -482,13 +476,12 @@ mod tests {
     async fn without_chat_llm_buffer_is_a_rolling_window() {
         let conn = init_db(None as Option<&String>).unwrap();
         init_schema(&conn, 4).unwrap();
-        let llm = Arc::new(NoChat {
-            compress_calls: std::sync::atomic::AtomicUsize::new(0),
-        });
+        let llm = Arc::new(NoChat);
         let sm = SessionManager::new(
             Arc::new(SqliteMemoryRepository::new(conn)),
             llm.clone(),
-            5, // tiny token threshold: every push overflows
+            None, // no chat model
+            5,    // tiny token threshold: every push overflows
             2,
         );
         let (t, s) = (TenantId("t".into()), SessionId("s".into()));
@@ -505,10 +498,6 @@ mod tests {
         assert_eq!(ctx.recent_messages, vec!["message three", "message four"]);
         assert!(ctx.summary.is_none());
         assert!(ctx.warnings.is_empty(), "{:?}", ctx.warnings);
-        assert_eq!(
-            llm.compress_calls.load(std::sync::atomic::Ordering::SeqCst),
-            0
-        );
     }
 
     /// Two tenants using the same session id get separate buffers.

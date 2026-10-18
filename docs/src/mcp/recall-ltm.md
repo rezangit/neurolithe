@@ -6,34 +6,48 @@ and its ancestor concepts, so the caller can fetch the original.
 
 ## Input
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `query` | string | yes | What to look for (≤ 4 KiB) |
-| `k` | integer | no | Max concept/document hits, 1–100 (capped at 50), default 10 |
+See [`recall_ltm` in the tool reference](./tools.md#recall_ltm) for the arguments,
+their limits and the tool's annotations.
 
 ## Output
 
-A JSON array with one entry per document leaf. A concept hit with no leaves
-appears once, with a null `data_id`.
+A JSON array with one entry per document leaf, best first. A concept hit with
+no leaves appears once, with a null `dataId`.
 
 ```json
 [
   {
     "concept": "documents",
     "summary": "Lease agreement for the flat, runs to 2027 …",
-    "data_id": "doc_42",
+    "dataId": "doc_42",
     "provenance": { "source": "remember_document", "ingested_at": "2026-09-01T10:00:00", "confidence": 1.0 },
     "distance": 0.41,
-    "ancestors": ["root"]
+    "ancestors": ["root"],
+    "score": 0.0325
   }
 ]
 ```
 
+`score` (the fused rank score, higher is better) is present only when the
+server sets `[retrieval] include_scores = true`.
+
 ## Behavior
 
-- Searches concept and document vectors together, nearest first.
-- No distance cutoff is applied: the nearest `k` hits are always returned, each
-  with its `distance`. Judge relevance from that value. An unrelated archive
-  still returns its nearest nodes.
+- Two searches are fused into one ranking by reciprocal rank fusion, with the
+  same `[retrieval]` settings as `query_memory` (`rrf_k`, `vector_weight`,
+  `keyword_weight`, `leg_k_factor`, `fts_stopwords`):
+  - **by meaning:** concept and document vectors, nearest first;
+  - **by words:** each document's **full text**, not just its summary. Without
+    a chat LLM a document's summary and vector only see its first ~1,000
+    characters; the keyword search still finds words anywhere in it.
+  - A weight of 0 switches that search off entirely (pure meaning, or pure
+    keyword; keyword-only hits still report their vector `distance`).
+- No distance cutoff is applied: the best `k` hits are always returned, each
+  with its vector `distance` (also for hits found only by their words). An
+  unrelated archive still returns its nearest nodes.
+- At most 50 hits are returned, whatever `k` asks for.
 - A concept hit lists at most 20 child documents. Use
-  [`inspect_node`](./introspection.md) to page further.
+  [`inspect`](./tools.md#inspect) with `view: "node"` to page further.
+- Documents filed before full-text recall existed are keyword-searchable by
+  their title and summary only. To index a document's whole text, file it
+  again with `remember_document` and the same `data_id`.

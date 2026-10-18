@@ -6,11 +6,8 @@ context window is returned.
 
 ## Input
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `session_id` | string | yes | Conversation id (≤ 256 bytes) |
-| `new_message` | string | yes | The new turn (≤ 64 KiB) |
-| `ccl` | string | no | Cognitive context layer, default `reality` |
+See [`push_dialogue` in the tool reference](./tools.md#push_dialogue) for the arguments,
+their limits and the tool's annotations.
 
 ## Output
 

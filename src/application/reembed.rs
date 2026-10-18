@@ -23,8 +23,9 @@
 //! full); the pre-reembed backups cover that case.
 
 use crate::application::migrations::{StoreKind, backup_store, migrate_store, record_embedding};
-use crate::domain::ports::{EmbeddingIdentity, LlmClient};
+use crate::domain::ports::{Embedder, EmbeddingIdentity};
 use crate::infrastructure::database::init_db;
+use crate::infrastructure::embedding_codec::{as_blob, check_dim};
 use crate::infrastructure::schema::drop_vec_tables;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
@@ -47,7 +48,7 @@ pub struct ReembedReport {
 pub async fn reembed_workspace(
     stm_path: &Path,
     ltm_path: &Path,
-    embedder: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
     identity: &EmbeddingIdentity,
 ) -> Result<ReembedReport> {
     let mut report = ReembedReport::default();
@@ -83,7 +84,7 @@ pub async fn reembed_workspace(
 /// dimension) is recorded in the stores' meta.
 pub async fn reembed_workspace_dir(
     workspace_dir: &Path,
-    embedder: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
 ) -> Result<ReembedReport> {
     let identity = crate::domain::ports::embedding_identity(embedder.as_ref())
         .await
@@ -122,28 +123,21 @@ fn open_for_reembed(
 
 /// Embed `texts` in order, checking each vector's dimension.
 async fn embed_all(
-    embedder: &dyn LlmClient,
+    embedder: &dyn Embedder,
     identity: &EmbeddingIdentity,
     items: Vec<(i64, String)>,
 ) -> Result<Vec<(i64, Vec<f32>)>> {
     let mut out = Vec::with_capacity(items.len());
     for (id, text) in items {
         let embedding = embedder.embed_text(&text).await?;
-        if embedding.len() != identity.dim {
-            bail!(
-                "embedder returned {} dimensions, expected {} ({})",
-                embedding.len(),
-                identity.dim,
-                identity.model
-            );
-        }
+        check_dim(
+            &embedding,
+            identity.dim,
+            &format!("embedder ({})", identity.model),
+        )?;
         out.push((id, embedding));
     }
     Ok(out)
-}
-
-fn to_bytes(embedding: &[f32]) -> Vec<u8> {
-    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
 }
 
 fn insert_vectors(conn: &Connection, table: &str, rows: &[(i64, Vec<f32>)]) -> Result<()> {
@@ -151,7 +145,7 @@ fn insert_vectors(conn: &Connection, table: &str, rows: &[(i64, Vec<f32>)]) -> R
         "INSERT INTO {table} (node_id, embedding) VALUES (?1, ?2)"
     ))?;
     for (id, embedding) in rows {
-        stmt.execute(params![id, to_bytes(embedding)])?;
+        stmt.execute(params![id, as_blob(embedding)])?;
     }
     Ok(())
 }
@@ -171,7 +165,7 @@ fn query_texts(conn: &Connection, sql: &str) -> Result<Vec<(i64, String)>> {
 /// graph anchors. Reads only.
 async fn embed_stm(
     conn: &Connection,
-    embedder: &dyn LlmClient,
+    embedder: &dyn Embedder,
     identity: &EmbeddingIdentity,
 ) -> Result<Vec<(i64, Vec<f32>)>> {
     let texts = query_texts(
@@ -208,7 +202,7 @@ struct LtmVectors {
 
 async fn embed_ltm(
     conn: &Connection,
-    embedder: &dyn LlmClient,
+    embedder: &dyn Embedder,
     identity: &EmbeddingIdentity,
 ) -> Result<LtmVectors> {
     let concepts = query_texts(
@@ -244,33 +238,11 @@ fn write_ltm(
     Ok((vectors.concepts.len(), vectors.leaves.len()))
 }
 
-/// Re-embed a single (already migrated) STM store: embed, then rewrite.
-pub async fn reembed_stm(
-    conn: &Connection,
-    embedder: &dyn LlmClient,
-    identity: &EmbeddingIdentity,
-) -> Result<usize> {
-    let vectors = embed_stm(conn, embedder, identity).await?;
-    write_stm(conn, identity, &vectors)
-}
-
-/// Re-embed a single (already migrated) LTM store: embed, then rewrite.
-pub async fn reembed_ltm(
-    conn: &Connection,
-    embedder: &dyn LlmClient,
-    identity: &EmbeddingIdentity,
-) -> Result<(usize, usize)> {
-    let vectors = embed_ltm(conn, embedder, identity).await?;
-    write_ltm(conn, identity, &vectors)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::application::migrations::{get_meta, prepare_store};
     use crate::domain::ltm::{LtmRepository, Provenance, TreeNode, TreeNodeKind};
-    use crate::domain::models::CclDefinition;
-    use crate::domain::ports::ExtractedFact;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::schema::{init_ltm_schema, init_schema, vec_table_dim};
     use async_trait::async_trait;
@@ -282,17 +254,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for DimEmbedder {
-        async fn extract_facts(
-            &self,
-            _d: &str,
-            _c: &[CclDefinition],
-        ) -> Result<Vec<ExtractedFact>> {
-            Ok(vec![])
-        }
-        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
-            Ok(String::new())
-        }
+    impl Embedder for DimEmbedder {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             if self.fail {
                 bail!("embedder down");
@@ -301,9 +263,16 @@ mod tests {
             v[text.len() % self.dim] = 1.0;
             Ok(v)
         }
-        async fn compress_context(&self, _m: &str) -> Result<String> {
-            Ok(String::new())
-        }
+    }
+
+    /// Re-embed one (already migrated) STM store: embed, then rewrite.
+    async fn reembed_stm(
+        conn: &Connection,
+        embedder: &dyn Embedder,
+        identity: &EmbeddingIdentity,
+    ) -> Result<usize> {
+        let vectors = embed_stm(conn, embedder, identity).await?;
+        write_stm(conn, identity, &vectors)
     }
 
     fn ident(model: &str, dim: usize) -> EmbeddingIdentity {
@@ -378,7 +347,7 @@ mod tests {
             let stm = init_db(Some(&stm_path)).unwrap();
             stm.execute(
                 "INSERT INTO vec_nodes (node_id, embedding) VALUES (1, ?1)",
-                [to_bytes(&[1.0; 8])],
+                [as_blob(&[1.0; 8])],
             )
             .unwrap();
             let err = prepare_store(&stm, StoreKind::Stm, Some(&stm_path), &new)
@@ -439,7 +408,7 @@ mod tests {
             prepare_store(&stm, StoreKind::Stm, Some(&stm_path), &old).unwrap();
             stm.execute(
                 "INSERT INTO vec_nodes (node_id, embedding) VALUES (1, ?1)",
-                [to_bytes(&[1.0; 8])],
+                [as_blob(&[1.0; 8])],
             )
             .unwrap();
             let ltm = init_db(Some(&ltm_path)).unwrap();
@@ -489,25 +458,12 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for FailOnLtm {
-        async fn extract_facts(
-            &self,
-            _d: &str,
-            _c: &[CclDefinition],
-        ) -> Result<Vec<ExtractedFact>> {
-            Ok(vec![])
-        }
-        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
-            Ok(String::new())
-        }
+    impl Embedder for FailOnLtm {
         async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
             if text.contains(": ") || text.contains("summary") {
                 bail!("embedder failed on an LTM text");
             }
             Ok(vec![1.0; self.dim])
-        }
-        async fn compress_context(&self, _m: &str) -> Result<String> {
-            Ok(String::new())
         }
     }
 
@@ -523,7 +479,7 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO vec_nodes (node_id, embedding) VALUES (1, ?1)",
-            [to_bytes(&[1.0; 8])],
+            [as_blob(&[1.0; 8])],
         )
         .unwrap();
 

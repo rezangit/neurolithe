@@ -1,4 +1,4 @@
-use crate::domain::ports::{ExtractedFact, LlmClient};
+use crate::domain::ports::{ChatModel, Embedder, ExtractedFact, Models};
 use crate::infrastructure::config::{LlmConfig, LlmProvider};
 use anyhow::{Result, anyhow};
 use reqwest::{Client, RequestBuilder};
@@ -118,75 +118,64 @@ pub fn resolve_api_key(
         .find(|v| !v.is_empty())
 }
 
-/// Stand-in for a provider half whose API key is missing. Every call fails with
-/// a short, actionable message instead of sending a fake key upstream (the old
-/// `dummy_key` fallback, QA-10 / DEV-13). Introspection never calls the LLM, so
-/// it keeps working.
+/// Stand-in for an embedder that can't run (its API key is missing, or it
+/// failed to build). Every call fails with a short, actionable message
+/// instead of sending a fake key upstream (the old `dummy_key` fallback,
+/// QA-10 / DEV-13). Introspection never embeds, so it keeps working.
 ///
-/// Also stands in for the chat half when no chat provider is configured
-/// (`llm.provider = "none"`, the default) — then [`LlmClient::chat_available`]
-/// is `false` and services take their no-LLM fallbacks.
-struct UnconfiguredLlm {
+/// A missing *chat* model needs no stand-in: it is simply `None` (see
+/// [`Models`]).
+struct UnconfiguredEmbedder {
     message: String,
 }
 
 /// Prefix of every "no chat model" error, so callers/tests can recognise it.
-pub const LLM_NOT_CONFIGURED: &str = "LLM not configured";
+pub use crate::domain::ports::LLM_NOT_CONFIGURED;
 
-impl UnconfiguredLlm {
-    fn for_provider(role: &str, provider: &LlmProvider) -> Self {
-        let vars = api_key_env_vars(provider).join(" or ");
+impl UnconfiguredEmbedder {
+    fn for_provider(provider: &LlmProvider) -> Self {
         Self {
-            message: format!("{LLM_NOT_CONFIGURED}: set {vars} ({role} provider)"),
+            message: missing_key_message("embedding", provider),
         }
-    }
-
-    fn no_chat_provider() -> Self {
-        Self {
-            message: format!(
-                "{LLM_NOT_CONFIGURED}: no chat provider (llm.provider = \"none\"); \
-                 set llm.provider/llm.model to enable fact extraction and summaries"
-            ),
-        }
-    }
-
-    fn with_message(message: String) -> Self {
-        Self { message }
-    }
-
-    fn fail<T>(&self) -> Result<T> {
-        Err(anyhow!("{}", self.message))
     }
 }
 
 #[async_trait::async_trait]
-impl LlmClient for UnconfiguredLlm {
-    async fn extract_facts(
-        &self,
-        _dialogue: &str,
-        _valid_ccls: &[crate::domain::models::CclDefinition],
-    ) -> Result<Vec<ExtractedFact>> {
-        self.fail()
-    }
-
-    async fn generate_ccl_description(&self, _ccl_name: &str, _context: &str) -> Result<String> {
-        self.fail()
-    }
-
+impl Embedder for UnconfiguredEmbedder {
     async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
-        self.fail()
-    }
-
-    async fn compress_context(&self, _messages: &str) -> Result<String> {
-        self.fail()
+        Err(anyhow!("{}", self.message))
     }
 
     async fn embedding_dim(&self) -> Result<usize> {
-        self.fail()
+        Err(anyhow!("{}", self.message))
+    }
+}
+
+/// `LLM not configured: set <VARS> (<role> provider)`.
+fn missing_key_message(role: &str, provider: &LlmProvider) -> String {
+    let vars = api_key_env_vars(provider).join(" or ");
+    format!("{LLM_NOT_CONFIGURED}: set {vars} ({role} provider)")
+}
+
+/// An embedder labelled with the configured `"<provider>:<model>"`, the
+/// identity recorded in store metadata.
+struct IdentifiedEmbedder {
+    inner: Arc<dyn Embedder>,
+    id: String,
+}
+
+#[async_trait::async_trait]
+impl Embedder for IdentifiedEmbedder {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        self.inner.embed_text(text).await
     }
 
-    fn chat_available(&self) -> bool {
-        false
+    async fn embedding_dim(&self) -> Result<usize> {
+        self.inner.embedding_dim().await
+    }
+
+    fn embedding_model_id(&self) -> String {
+        self.id.clone()
     }
 }
 
@@ -194,47 +183,45 @@ impl LlmClient for UnconfiguredLlm {
 // Factory
 // ==========================================
 
-/// The assembled client plus any startup warnings (missing keys, keys sent in
+/// The assembled models plus any startup warnings (missing keys, keys sent in
 /// clear text) for the caller to log.
-pub struct LlmSetup {
-    pub client: Arc<dyn LlmClient>,
+pub struct ModelSetup {
+    pub models: Models,
     pub warnings: Vec<String>,
 }
 
-/// Build the LLM client, delegating chat and embeddings to (possibly) different
-/// providers. Chat uses `config.provider`/`config.model`/`config.base_url`;
-/// embeddings use `config.effective_embedding_provider()` /
+/// Build the models: a chat model (optional) and an embedder, possibly from
+/// different providers. Chat uses `config.provider`/`config.model`/
+/// `config.base_url`; embeddings use `config.effective_embedding_provider()` /
 /// `config.embedding_model` / `config.embedding_base_url` (falling back to
-/// `base_url`). This lets chat run on Claude (which has no embeddings endpoint)
-/// while embeddings run on Vertex/Google/OpenAI/local — see `SplitLlmClient`.
+/// `base_url`). This lets chat run on Claude (which has no embeddings
+/// endpoint) while embeddings run on Vertex/Google/OpenAI/local.
 ///
 /// Keys are resolved through `lookup` (pass `|k| std::env::var(k).ok()`). A
-/// missing required key does **not** abort startup: that half becomes an
-/// [`UnconfiguredLlm`] and a warning is returned. Both halves share one HTTP
-/// client with timeouts.
-pub fn create_llm_client(config: &LlmConfig, lookup: &dyn Fn(&str) -> Option<String>) -> LlmSetup {
+/// missing key does **not** abort startup: the chat model is then `None`
+/// (the no-chat mode), or the embedder an [`UnconfiguredEmbedder`], and a
+/// warning is returned. Both share one HTTP client with timeouts.
+pub fn create_models(config: &LlmConfig, lookup: &dyn Fn(&str) -> Option<String>) -> ModelSetup {
     let http = build_http_client(Duration::from_secs(config.request_timeout_secs));
     let mut warnings = Vec::new();
 
     let chat_provider = &config.provider;
     let chat_key = resolve_api_key(chat_provider, lookup);
-    let chat: Arc<dyn LlmClient> = if !chat_provider.is_chat() {
+    let chat: Option<Arc<dyn ChatModel>> = if !chat_provider.is_chat() {
         // `none` (the default) or a misplaced `local`: store-and-search mode.
-        let stub = UnconfiguredLlm::no_chat_provider();
         warnings.push(format!(
             "{LLM_NOT_CONFIGURED} (llm.provider = \"none\") — memory is stored and searched, \
              but fact extraction, compression and summaries are skipped"
         ));
-        Arc::new(stub)
+        None
     } else if key_required(chat_provider) && chat_key.is_none() {
-        let stub = UnconfiguredLlm::for_provider("chat", chat_provider);
         warnings.push(format!(
-            "{} — fact extraction and compression will fail",
-            stub.message
+            "{} — fact extraction and compression are skipped",
+            missing_key_message("chat", chat_provider)
         ));
-        Arc::new(stub)
+        None
     } else {
-        build_chat_client(config, http.clone(), chat_key.clone())
+        build_chat_model(config, http.clone(), chat_key.clone())
     };
 
     let embed_provider = config.effective_embedding_provider();
@@ -243,26 +230,29 @@ pub fn create_llm_client(config: &LlmConfig, lookup: &dyn Fn(&str) -> Option<Str
         .embedding_base_url
         .clone()
         .or_else(|| config.base_url.clone());
-    let embed: Arc<dyn LlmClient> = if key_required(embed_provider) && embed_key.is_none() {
-        let stub = UnconfiguredLlm::for_provider("embedding", embed_provider);
+    let embedder: Arc<dyn Embedder> = if key_required(embed_provider) && embed_key.is_none() {
+        let stub = UnconfiguredEmbedder::for_provider(embed_provider);
         warnings.push(format!(
             "{} — storing and searching memory will fail",
             stub.message
         ));
         Arc::new(stub)
     } else {
-        match build_embed_client(config, http, embed_key.clone(), embed_base_url.clone()) {
+        match build_embedder(config, http, embed_key.clone(), embed_base_url.clone()) {
             Ok(client) => client,
             Err(e) => {
                 let message = format!("embedder unavailable: {e:#}");
                 warnings.push(format!(
                     "{message} — storing and searching memory will fail"
                 ));
-                Arc::new(UnconfiguredLlm::with_message(message))
+                Arc::new(UnconfiguredEmbedder { message })
             }
         }
     };
-    let embed_id = embedding_model_id(config);
+    let embedder: Arc<dyn Embedder> = Arc::new(IdentifiedEmbedder {
+        inner: embedder,
+        id: embedding_model_id(config),
+    });
 
     // SEC-09: a key sent to a non-TLS, non-loopback endpoint travels in clear.
     // Only openai/custom honour a base URL; anthropic/gemini/vertex ignore it,
@@ -283,12 +273,8 @@ pub fn create_llm_client(config: &LlmConfig, lookup: &dyn Fn(&str) -> Option<Str
         }
     }
 
-    LlmSetup {
-        client: Arc::new(SplitLlmClient {
-            chat,
-            embed,
-            embed_id,
-        }),
+    ModelSetup {
+        models: Models::new(embedder, chat),
         warnings,
     }
 }
@@ -353,12 +339,14 @@ fn is_plaintext_remote(url: &str) -> bool {
 /// serves `text-embedding-004`; the `global` endpoint does not host it.
 const DEFAULT_VERTEX_LOCATION: &str = "us-central1";
 
-fn build_chat_client(
+/// The chat model for `config.provider` (a chat provider; see
+/// [`LlmProvider::is_chat`]).
+fn build_chat_model(
     config: &LlmConfig,
     http: Client,
     api_key: Option<String>,
-) -> Arc<dyn LlmClient> {
-    match config.provider {
+) -> Option<Arc<dyn ChatModel>> {
+    Some(match config.provider {
         LlmProvider::Openai | LlmProvider::Custom => Arc::new(OpenAiClient::new(
             http,
             api_key,
@@ -377,18 +365,21 @@ fn build_chat_client(
             api_key.unwrap_or_default(),
             config.model.clone(),
         )),
-        LlmProvider::Vertex => Arc::new(vertex_client(config, http, config.model.clone())),
-        // Not chat providers — `create_llm_client` never gets here with them.
-        LlmProvider::Local | LlmProvider::None => Arc::new(UnconfiguredLlm::no_chat_provider()),
-    }
+        // Not chat providers (config validation rejects `vertex` and `local`
+        // here at startup): no chat model.
+        LlmProvider::Vertex | LlmProvider::Local | LlmProvider::None => return None,
+    })
 }
 
-fn build_embed_client(
+/// The embedder for `config.effective_embedding_provider()`. Anthropic has no
+/// embeddings API and `none` is no embedder: config validation rejects both
+/// at startup; here they are an error too, never a client that fails later.
+fn build_embedder(
     config: &LlmConfig,
     http: Client,
     api_key: Option<String>,
     base_url: Option<String>,
-) -> Result<Arc<dyn LlmClient>> {
+) -> Result<Arc<dyn Embedder>> {
     Ok(match config.effective_embedding_provider() {
         LlmProvider::Openai | LlmProvider::Custom => Arc::new(OpenAiClient::new(
             http,
@@ -403,15 +394,15 @@ fn build_embed_client(
             config.model.clone(),
             config.embedding_model.clone(),
         )),
-        LlmProvider::Anthropic => Arc::new(AnthropicClient::new(
-            http,
-            api_key.unwrap_or_default(),
-            config.model.clone(),
-        )),
         LlmProvider::Vertex => {
             Arc::new(vertex_client(config, http, config.embedding_model.clone()))
         }
         LlmProvider::Local => build_local_embedder(config)?,
+        LlmProvider::Anthropic => {
+            return Err(anyhow!(
+                "llm.embedding_provider resolves to \"anthropic\", which has no embeddings API"
+            ));
+        }
         LlmProvider::None => {
             return Err(anyhow!(
                 "llm.embedding_provider = \"none\": memory needs an embedder (use \"local\")"
@@ -421,7 +412,7 @@ fn build_embed_client(
 }
 
 #[cfg(feature = "local-embeddings")]
-fn build_local_embedder(config: &LlmConfig) -> Result<Arc<dyn LlmClient>> {
+fn build_local_embedder(config: &LlmConfig) -> Result<Arc<dyn Embedder>> {
     let dir = config
         .models_dir
         .clone()
@@ -432,7 +423,7 @@ fn build_local_embedder(config: &LlmConfig) -> Result<Arc<dyn LlmClient>> {
 }
 
 #[cfg(not(feature = "local-embeddings"))]
-fn build_local_embedder(_config: &LlmConfig) -> Result<Arc<dyn LlmClient>> {
+fn build_local_embedder(_config: &LlmConfig) -> Result<Arc<dyn Embedder>> {
     Err(anyhow!(
         "llm.embedding_provider = \"local\" needs a build with the `local-embeddings` feature"
     ))
@@ -450,54 +441,6 @@ fn vertex_client(config: &LlmConfig, http: Client, model: String) -> VertexClien
             .clone()
             .unwrap_or_else(|| DEFAULT_VERTEX_LOCATION.to_string()),
     )
-}
-
-/// Routes chat/reasoning calls to one provider and embeddings to another.
-///
-/// Required because Claude has no embeddings endpoint: the reasoning half runs
-/// on Anthropic while `embed_text` is served by Google/OpenAI/a local model.
-/// When both halves resolve to the same provider the two inner clients are
-/// simply equivalent, so single-provider setups behave exactly as before.
-struct SplitLlmClient {
-    chat: Arc<dyn LlmClient>,
-    embed: Arc<dyn LlmClient>,
-    /// `"<provider>:<model>"` of the embed half, for store meta.
-    embed_id: String,
-}
-
-#[async_trait::async_trait]
-impl LlmClient for SplitLlmClient {
-    async fn extract_facts(
-        &self,
-        dialogue: &str,
-        valid_ccls: &[crate::domain::models::CclDefinition],
-    ) -> Result<Vec<ExtractedFact>> {
-        self.chat.extract_facts(dialogue, valid_ccls).await
-    }
-
-    async fn generate_ccl_description(&self, ccl_name: &str, context: &str) -> Result<String> {
-        self.chat.generate_ccl_description(ccl_name, context).await
-    }
-
-    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        self.embed.embed_text(text).await
-    }
-
-    async fn compress_context(&self, messages: &str) -> Result<String> {
-        self.chat.compress_context(messages).await
-    }
-
-    async fn embedding_dim(&self) -> Result<usize> {
-        self.embed.embedding_dim().await
-    }
-
-    fn embedding_model_id(&self) -> String {
-        self.embed_id.clone()
-    }
-
-    fn chat_available(&self) -> bool {
-        self.chat.chat_available()
-    }
 }
 
 // ==========================================
@@ -594,7 +537,7 @@ impl OpenAiClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for OpenAiClient {
+impl ChatModel for OpenAiClient {
     async fn extract_facts(
         &self,
         dialogue: &str,
@@ -631,17 +574,6 @@ impl LlmClient for OpenAiClient {
         Ok(content.trim().to_string())
     }
 
-    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        let payload = json!({
-            "model": self.embedding_model,
-            "input": text
-        });
-        let resp_json = send_json("OpenAI", self.post("embeddings").json(&payload)).await?;
-        let embedding: Vec<f32> = serde_json::from_value(resp_json["data"][0]["embedding"].clone())
-            .map_err(|e| anyhow!("OpenAI embeddings: unexpected response shape: {e}"))?;
-        Ok(embedding)
-    }
-
     async fn compress_context(&self, messages: &str) -> Result<String> {
         self.chat(json!({
             "model": self.model,
@@ -651,6 +583,20 @@ impl LlmClient for OpenAiClient {
             ]
         }))
         .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for OpenAiClient {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        let payload = json!({
+            "model": self.embedding_model,
+            "input": text
+        });
+        let resp_json = send_json("OpenAI", self.post("embeddings").json(&payload)).await?;
+        let embedding: Vec<f32> = serde_json::from_value(resp_json["data"][0]["embedding"].clone())
+            .map_err(|e| anyhow!("OpenAI embeddings: unexpected response shape: {e}"))?;
+        Ok(embedding)
     }
 }
 
@@ -701,7 +647,7 @@ impl GeminiClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for GeminiClient {
+impl ChatModel for GeminiClient {
     async fn extract_facts(
         &self,
         dialogue: &str,
@@ -742,6 +688,21 @@ impl LlmClient for GeminiClient {
         Ok(content.trim().to_string())
     }
 
+    async fn compress_context(&self, messages: &str) -> Result<String> {
+        self.generate(json!({
+            "system_instruction": {
+                "parts": [{"text": COMPRESS_SYSTEM}]
+            },
+            "contents": [{
+                "parts": [{"text": messages}]
+            }]
+        }))
+        .await
+    }
+}
+
+#[async_trait::async_trait]
+impl Embedder for GeminiClient {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let payload = json!({
             "model": format!("models/{}", self.embedding_model),
@@ -758,18 +719,6 @@ impl LlmClient for GeminiClient {
         let embedding: Vec<f32> = serde_json::from_value(resp_json["embedding"]["values"].clone())
             .map_err(|e| anyhow!("Gemini embeddings: unexpected response shape: {e}"))?;
         Ok(embedding)
-    }
-
-    async fn compress_context(&self, messages: &str) -> Result<String> {
-        self.generate(json!({
-            "system_instruction": {
-                "parts": [{"text": COMPRESS_SYSTEM}]
-            },
-            "contents": [{
-                "parts": [{"text": messages}]
-            }]
-        }))
-        .await
     }
 }
 
@@ -856,7 +805,7 @@ impl AnthropicClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for AnthropicClient {
+impl ChatModel for AnthropicClient {
     async fn extract_facts(
         &self,
         dialogue: &str,
@@ -872,12 +821,6 @@ impl LlmClient for AnthropicClient {
         let json_text = extract_json_object(&text)
             .ok_or_else(|| anyhow!("Anthropic reply contained no JSON object"))?;
         parse_facts(json_text)
-    }
-
-    async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
-        Err(anyhow!(
-            "Anthropic does not offer a native embedding API. Please use OpenAI/Gemini or an OpenAI-compatible custom endpoint for embeddings."
-        ))
     }
 
     async fn generate_ccl_description(&self, ccl_name: &str, context: &str) -> Result<String> {
@@ -970,23 +913,7 @@ impl VertexClient {
 }
 
 #[async_trait::async_trait]
-impl LlmClient for VertexClient {
-    async fn extract_facts(
-        &self,
-        _dialogue: &str,
-        _valid_ccls: &[crate::domain::models::CclDefinition],
-    ) -> Result<Vec<ExtractedFact>> {
-        Err(anyhow!(
-            "Vertex client is embeddings-only in NeuroLithe; use anthropic/gemini/custom for chat."
-        ))
-    }
-
-    async fn generate_ccl_description(&self, _ccl_name: &str, _context: &str) -> Result<String> {
-        Err(anyhow!(
-            "Vertex client is embeddings-only in NeuroLithe; use anthropic/gemini/custom for chat."
-        ))
-    }
-
+impl Embedder for VertexClient {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         let token = self.access_token().await?;
         let payload = json!({ "instances": [{ "content": text }] });
@@ -1008,12 +935,6 @@ impl LlmClient for VertexClient {
         }
         let embedding: Vec<f32> = serde_json::from_value(values)?;
         Ok(embedding)
-    }
-
-    async fn compress_context(&self, _messages: &str) -> Result<String> {
-        Err(anyhow!(
-            "Vertex client is embeddings-only in NeuroLithe; use anthropic/gemini/custom for chat."
-        ))
     }
 }
 
@@ -1104,34 +1025,60 @@ mod tests {
         );
     }
 
-    /// QA-10 / DEV-13: a missing key never becomes `dummy_key`; the half is
-    /// replaced by a stub that fails with an actionable message, and a startup
-    /// warning is produced.
+    /// QA-10 / DEV-13: a missing key never becomes `dummy_key`. A missing
+    /// embedding key gives a stub embedder that fails with an actionable
+    /// message; a missing chat key gives no chat model. Both warn at startup.
     #[tokio::test]
     async fn test_missing_key_yields_not_configured_error() {
-        let setup = create_llm_client(&test_config(LlmProvider::Openai, None), &env(&[]));
+        let setup = create_models(&test_config(LlmProvider::Openai, None), &env(&[]));
         assert!(
             setup
                 .warnings
                 .iter()
                 .any(|w| w.contains("LLM not configured") && w.contains("OPENAI_API_KEY"))
         );
-        let err = setup.client.embed_text("hi").await.unwrap_err().to_string();
+        let err = setup
+            .models
+            .embedder
+            .embed_text("hi")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err.starts_with("LLM not configured: set OPENAI_API_KEY"),
             "{err}"
         );
         assert!(!err.contains("dummy"));
+        assert!(setup.models.chat.is_none(), "no key, no chat model");
     }
 
-    /// The chat LLM is optional: `provider = none` gives a client whose chat
-    /// half reports "LLM not configured" (and `chat_available() == false`)
-    /// while embeddings still come from the configured embedder.
+    /// 3.7b: Anthropic can't be built as an embedder (it has no embeddings
+    /// API). Config validation rejects it at startup; the factory refuses
+    /// too, instead of returning a client that fails on the first embed.
+    #[tokio::test]
+    async fn test_anthropic_is_never_an_embedder() {
+        let cfg = test_config(LlmProvider::Anthropic, None);
+        let setup = create_models(&cfg, &env(&[("ANTHROPIC_API_KEY", "k")]));
+        assert!(setup.models.chat.is_some(), "anthropic chats");
+        assert!(
+            setup
+                .warnings
+                .iter()
+                .any(|w| w.contains("embedder unavailable") && w.contains("anthropic")),
+            "{:?}",
+            setup.warnings
+        );
+        let err = setup.models.embedder.embed_text("x").await.unwrap_err();
+        assert!(err.to_string().contains("no embeddings API"), "{err}");
+    }
+
+    /// The chat LLM is optional: `provider = none` gives no chat model (the
+    /// no-chat mode) while embeddings still come from the configured embedder.
     #[tokio::test]
     async fn test_no_chat_provider_is_store_and_search_mode() {
         let cfg = test_config(LlmProvider::None, Some(LlmProvider::Custom));
-        let setup = create_llm_client(&cfg, &env(&[]));
-        assert!(!setup.client.chat_available());
+        let setup = create_models(&cfg, &env(&[]));
+        assert!(setup.models.chat.is_none());
         assert!(
             setup
                 .warnings
@@ -1140,31 +1087,20 @@ mod tests {
             "{:?}",
             setup.warnings
         );
-        for err in [
-            setup.client.compress_context("x").await.unwrap_err(),
-            setup.client.extract_facts("x", &[]).await.unwrap_err(),
-            setup
-                .client
-                .generate_ccl_description("a", "b")
-                .await
-                .unwrap_err(),
-        ] {
-            assert!(err.to_string().starts_with(LLM_NOT_CONFIGURED), "{err}");
-        }
-        assert_eq!(setup.client.embedding_model_id(), "custom:e");
+        assert_eq!(setup.models.embedder.embedding_model_id(), "custom:e");
     }
 
     #[test]
-    fn test_chat_provider_reports_chat_available() {
+    fn test_chat_provider_gives_a_chat_model() {
         let cfg = test_config(LlmProvider::Custom, None);
-        let setup = create_llm_client(&cfg, &env(&[]));
-        assert!(setup.client.chat_available());
+        let setup = create_models(&cfg, &env(&[]));
+        assert!(setup.models.chat.is_some());
     }
 
     #[test]
     fn test_embedding_none_is_an_unusable_embedder() {
         let cfg = test_config(LlmProvider::None, Some(LlmProvider::None));
-        let setup = create_llm_client(&cfg, &env(&[]));
+        let setup = create_models(&cfg, &env(&[]));
         assert!(
             setup
                 .warnings
@@ -1189,9 +1125,12 @@ mod tests {
     #[tokio::test]
     async fn test_local_embedder_dim_and_id_without_io() {
         let dir = std::env::temp_dir().join("neurolithe-llm-test-never-created");
-        let setup = create_llm_client(&local_config(Some(dir.clone())), &env(&[]));
-        assert_eq!(setup.client.embedding_dim().await.unwrap(), 384);
-        assert_eq!(setup.client.embedding_model_id(), "local:bge-small-en-v1.5");
+        let setup = create_models(&local_config(Some(dir.clone())), &env(&[]));
+        assert_eq!(setup.models.embedder.embedding_dim().await.unwrap(), 384);
+        assert_eq!(
+            setup.models.embedder.embedding_model_id(),
+            "local:bge-small-en-v1.5"
+        );
         assert_eq!(
             embedding_model_id(&local_config(None)),
             "local:bge-small-en-v1.5"
@@ -1203,8 +1142,14 @@ mod tests {
     #[cfg(feature = "local-embeddings")]
     #[tokio::test]
     async fn test_local_embedder_requires_models_dir() {
-        let setup = create_llm_client(&local_config(None), &env(&[]));
-        let err = setup.client.embed_text("x").await.unwrap_err().to_string();
+        let setup = create_models(&local_config(None), &env(&[]));
+        let err = setup
+            .models
+            .embedder
+            .embed_text("x")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("model cache dir not set"), "{err}");
     }
 
@@ -1213,7 +1158,7 @@ mod tests {
     fn test_unknown_local_model_is_reported_at_startup() {
         let mut cfg = local_config(Some(std::env::temp_dir()));
         cfg.embedding_model = "text-embedding-3-small".into();
-        let setup = create_llm_client(&cfg, &env(&[]));
+        let setup = create_models(&cfg, &env(&[]));
         assert!(
             setup
                 .warnings
@@ -1239,7 +1184,7 @@ mod tests {
             Some("nl-key")
         );
         // Keyless custom is a valid setup: no warning, no stub.
-        let setup = create_llm_client(
+        let setup = create_models(
             &test_config(LlmProvider::Custom, None),
             &env(&[("OPENAI_API_KEY", "sk-real-openai")]),
         );
@@ -1254,8 +1199,8 @@ mod tests {
             one_shot_server(200, r#"{"data":[{"embedding":[0.5,0.25]}]}"#.into()).await;
         let mut cfg = test_config(LlmProvider::Custom, None);
         cfg.base_url = Some(url);
-        let setup = create_llm_client(&cfg, &env(&[("OPENAI_API_KEY", "sk-real-openai")]));
-        let v = setup.client.embed_text("hello").await.unwrap();
+        let setup = create_models(&cfg, &env(&[("OPENAI_API_KEY", "sk-real-openai")]));
+        let v = setup.models.embedder.embed_text("hello").await.unwrap();
         assert_eq!(v, vec![0.5, 0.25]);
         let request = server.await.unwrap().to_ascii_lowercase();
         assert!(!request.contains("sk-real-openai"));
@@ -1377,7 +1322,7 @@ mod tests {
         ]);
         let mut cfg = test_config(LlmProvider::Anthropic, Some(LlmProvider::Gemini));
         cfg.base_url = Some("http://10.0.0.5:8080/v1".into());
-        let setup = create_llm_client(&cfg, &keys);
+        let setup = create_models(&cfg, &keys);
         assert!(
             !setup.warnings.iter().any(|w| w.contains("plain HTTP")),
             "{:?}",
@@ -1386,7 +1331,7 @@ mod tests {
 
         let mut cfg = test_config(LlmProvider::Openai, None);
         cfg.base_url = Some("http://10.0.0.5:8080/v1".into());
-        let setup = create_llm_client(&cfg, &keys);
+        let setup = create_models(&cfg, &keys);
         assert!(
             setup.warnings.iter().any(|w| w.contains("plain HTTP")),
             "{:?}",

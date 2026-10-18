@@ -20,13 +20,13 @@
 
 # MCP Protocol Reference
 
+- [Tool reference (generated)](./mcp/tools.md)
 - [Tool: push_dialogue](./mcp/push-dialogue.md)
 - [Tool: store_memory](./mcp/store-memory.md)
 - [Tool: query_memory](./mcp/query-memory.md)
 - [Tool: remember_document](./mcp/remember-document.md)
 - [Tool: recall_ltm](./mcp/recall-ltm.md)
 - [Workspace tools](./mcp/workspaces.md)
-- [Introspection tools](./mcp/introspection.md)
 
 # Theory
 

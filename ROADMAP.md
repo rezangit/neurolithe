@@ -13,7 +13,7 @@ the original bytes. Close the loop with a fetch surface so an agent can go
 
 - An optional `fetch` capability (e.g. read the artifact from a configured
   store / local path by `dataId`), or a companion document-store MCP server
-  that owns the originals. Bonus: have `trace_dataId` include a ready-made
+  that owns the originals. Bonus: have the `inspect` tool's `trace` view include a ready-made
   fetch URI.
 
 ## 2. Sharper concept placement
@@ -26,7 +26,7 @@ category labels. Two rough edges observed:
   (representative examples/keywords per branch), or by averaging the branch's
   filed leaves into a centroid the concept vector tracks.
 - **Configurable threshold** — the placement distance cutoff is a tuned constant
-  (`DEFAULT_MAX_DISTANCE`, calibrated with the `placement_debug` tool). Promote
+  (`DEFAULT_MAX_DISTANCE`, calibrated with the `inspect` tool's `placement` view). Promote
   it to config (`[ltm] placement_max_distance`) so it can be retuned per corpus
   without a recompile.
 

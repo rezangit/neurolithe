@@ -271,6 +271,21 @@ fn p2r4_pinned_session_cannot_touch_other_workspaces() {
 
     let mut server = home.spawn_mcp(&[], &[]);
     server.initialize();
+    // 3.2: the tools that could reach another workspace aren't even listed.
+    let listed = server.request("tools/list", json!({}));
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    for hidden in ["workspace_switch", "workspace_create", "workspace_delete"] {
+        assert!(!names.contains(&hidden), "{hidden} listed: {names:?}");
+    }
+    for kept in ["workspace_current", "workspace_list", "workspace_export"] {
+        assert!(names.contains(&kept), "{kept} missing: {names:?}");
+    }
+    // Calling a hidden one anyway still explains why it's refused.
     let err = server
         .try_call_tool("workspace_switch", json!({"name": "other"}))
         .expect_err("switch allowed despite allow_workspace_switch = false");
@@ -454,8 +469,8 @@ fn two_servers_on_different_workspaces_do_not_share_data() {
         !b.call_tool("store_memory", json!({"fact_text": "beta secret"}))
             .is_error
     );
-    let a_facts = a.call_tool("stm_list", json!({})).text;
-    let b_facts = b.call_tool("stm_list", json!({})).text;
+    let a_facts = a.call_tool("inspect", json!({"view": "stm"})).text;
+    let b_facts = b.call_tool("inspect", json!({"view": "stm"})).text;
     assert!(a_facts.contains("alpha secret") && !a_facts.contains("beta secret"));
     assert!(b_facts.contains("beta secret") && !b_facts.contains("alpha secret"));
 }

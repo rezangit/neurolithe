@@ -10,6 +10,8 @@ use std::time::Duration;
 
 /// Config for the fake embedder with a given model name. The dimension is
 /// not configured: it is probed from the embedder (`dim` must match the fake).
+/// The ~100-year half-life keeps the legacy fixture's facts (last accessed
+/// when it was recorded) from being archived by the startup decay sweep.
 fn config(llm: &FakeLlm, model: &str, dim: usize) -> String {
     assert_eq!(llm.dim, dim, "the fake decides the dimension");
     let url = llm.base_url();
@@ -21,6 +23,9 @@ base_url = "{url}"
 embedding_provider = "openai"
 embedding_model = "{model}"
 embedding_base_url = "{url}"
+
+[decay]
+default_half_life_days = 36500.0
 "#
     )
 }

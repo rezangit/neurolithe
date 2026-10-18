@@ -1,5 +1,6 @@
 use crate::domain::models::{Edge, Episode, MemoryNode, MemoryResult, TenantId, TimeFilter};
 use anyhow::Result;
+use std::sync::Arc;
 
 pub trait MemoryRepository {
     /// Store a CCL definition in the registry
@@ -122,6 +123,22 @@ pub trait MemoryRepository {
     /// document into a shared node, in which case nothing distinct remains here.
     fn delete_nodes_by_data_id(&self, data_id: &str) -> Result<()>;
 
+    /// The **document facts** for a `dataId`: nodes whose payload carries that
+    /// `dataId` and no graph `kind` (so working-memory `subject` anchors and
+    /// turns about the document are excluded), any status, oldest first.
+    /// Normally at most one; the Kafka ingest uses it to detect a redelivery.
+    fn find_document_nodes(&self, data_id: &str) -> Result<Vec<MemoryNode>>;
+
+    /// Upsert a document fact: in **one transaction**, delete every document
+    /// fact for `data_id` (see [`Self::find_document_nodes`]; their vectors
+    /// and edges too) and store `node` with `embedding`. Returns the new id.
+    fn replace_document_node(
+        &self,
+        data_id: &str,
+        node: &MemoryNode,
+        embedding: &[f32],
+    ) -> Result<i64>;
+
     /// CT-scan statistics for the STM store (slice 9).
     fn stm_stats(&self) -> Result<StmStats>;
 
@@ -138,7 +155,7 @@ pub trait MemoryRepository {
         contains: Option<&str>,
     ) -> Result<Vec<StmNodeSummary>>;
 
-    /// How many STM nodes carry a given `dataId` (for `trace_dataId`).
+    /// How many STM nodes carry a given `dataId` (for the `inspect` tool's `trace` view).
     fn count_by_data_id(&self, data_id: &str) -> Result<i64>;
 
     /// Idempotency: has a `memory.command` with this `commandId` already been
@@ -217,52 +234,78 @@ pub struct ExtractedRelationship {
     pub valid_until: Option<String>,
 }
 
-// `Send + Sync` so `Arc<dyn LlmClient>` can be shared across tasks and composed
-// (e.g. the chat/embedding split in `SplitLlmClient`). Every implementor —
-// reqwest-based provider clients and test stubs — is genuinely thread-safe.
+/// Prefix of every "no chat model" error and of the `learning_error` that
+/// `push_dialogue` reports without one, so callers and tests can recognise it.
+pub const LLM_NOT_CONFIGURED: &str = "LLM not configured";
+
+/// Text → vector: the embedding model every store needs.
+///
+/// `Send + Sync` so `Arc<dyn Embedder>` can be shared and wrapped; every
+/// implementor (reqwest-based provider clients, the local ONNX model, test
+/// stubs) is genuinely thread-safe.
 #[async_trait::async_trait]
-pub trait LlmClient: Send + Sync {
-    /// Extract factual statements from given raw dialogue
+pub trait Embedder: Send + Sync {
+    /// The embedding of `text`.
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// The output dimension. The default probes by embedding a short text;
+    /// providers that know it statically (e.g. local models) override.
+    async fn embedding_dim(&self) -> Result<usize> {
+        Ok(self.embed_text("dimension probe").await?.len())
+    }
+
+    /// Stable identifier of the model, `"<provider>:<model>"` (e.g.
+    /// `"local:bge-small-en-v1.5"`). Recorded in store metadata; a change means
+    /// the stores must be re-embedded. Default: `"unknown"`.
+    fn embedding_model_id(&self) -> String {
+        "unknown".to_string()
+    }
+}
+
+/// The chat model: fact extraction, layer descriptions, compression and
+/// summaries. It is optional — services that can use one take
+/// `Option<Arc<dyn ChatModel>>`, and `None` is the no-chat mode (memory is
+/// still stored and searched; nothing is extracted or summarized).
+#[async_trait::async_trait]
+pub trait ChatModel: Send + Sync {
+    /// Extract factual statements from raw dialogue.
     async fn extract_facts(
         &self,
         dialogue: &str,
         valid_ccls: &[crate::domain::models::CclDefinition],
     ) -> Result<Vec<ExtractedFact>>;
 
-    /// Generate a short description for a new cognitive context layer
+    /// A short description for a new cognitive context layer.
     async fn generate_ccl_description(&self, ccl_name: &str, context: &str) -> Result<String>;
 
-    /// Generate a 1536d float vector for text
-    async fn embed_text(&self, text: &str) -> Result<Vec<f32>>;
-
-    /// Compress/summarize old dialogue messages into a dense summary
+    /// Compress/summarize text (old dialogue, a document) into a dense summary.
     async fn compress_context(&self, messages: &str) -> Result<String>;
+}
 
-    /// The embedder's output dimension. The default probes by embedding a short
-    /// text; providers that know it statically (e.g. local models) override.
-    async fn embedding_dim(&self) -> Result<usize> {
-        Ok(self.embed_text("dimension probe").await?.len())
+/// The models a process runs with: always an embedder, optionally a chat
+/// model. Composition roots build one and hand each service the part it uses.
+#[derive(Clone)]
+pub struct Models {
+    pub embedder: Arc<dyn Embedder>,
+    pub chat: Option<Arc<dyn ChatModel>>,
+}
+
+impl Models {
+    pub fn new(embedder: Arc<dyn Embedder>, chat: Option<Arc<dyn ChatModel>>) -> Self {
+        Self { embedder, chat }
     }
 
-    /// Stable identifier of the embedding model, `"<provider>:<model>"` (e.g.
-    /// `"local:bge-small-en-v1.5"`). Recorded in store metadata; a change means
-    /// the stores must be re-embedded. Default: `"unknown"`.
-    fn embedding_model_id(&self) -> String {
-        "unknown".to_string()
-    }
-
-    /// Whether a chat model is configured (fact extraction, compression,
-    /// summaries). Embeddings are independent of this. Default: `true`.
-    fn chat_available(&self) -> bool {
-        true
+    /// Embedder only: the no-chat mode.
+    pub fn embed_only(embedder: Arc<dyn Embedder>) -> Self {
+        Self::new(embedder, None)
     }
 }
 
-/// The [`EmbeddingIdentity`] of `llm`'s embedder: provider and model from
-/// [`LlmClient::embedding_model_id`] (`"provider:model"`; without a `:` the
-/// provider is `"unknown"`), dimension from [`LlmClient::embedding_dim`].
-pub async fn embedding_identity(llm: &dyn LlmClient) -> Result<EmbeddingIdentity> {
-    let id = llm.embedding_model_id();
+/// The [`EmbeddingIdentity`] of `embedder`: provider and model from
+/// [`Embedder::embedding_model_id`] (`"provider:model"`; without a `:` the
+/// provider is `"unknown"`), dimension from [`Embedder::embedding_dim`].
+pub async fn embedding_identity(embedder: &dyn Embedder) -> Result<EmbeddingIdentity> {
+    let id = embedder.embedding_model_id();
     let provider = match id.split_once(':') {
         Some((provider, _)) if !provider.is_empty() => provider.to_string(),
         _ => "unknown".to_string(),
@@ -270,6 +313,6 @@ pub async fn embedding_identity(llm: &dyn LlmClient) -> Result<EmbeddingIdentity
     Ok(EmbeddingIdentity {
         provider,
         model: id,
-        dim: llm.embedding_dim().await?,
+        dim: embedder.embedding_dim().await?,
     })
 }

@@ -34,7 +34,7 @@ fn example_config_starts_the_mcp_server() {
         "stderr: {}",
         server.stderr()
     );
-    let res = server.call_tool("health", json!({}));
+    let res = server.call_tool("inspect", json!({"view": "health"}));
     assert!(!res.is_error, "{}", res.text);
     let res = server.call_tool("store_memory", json!({"fact_text": "example works"}));
     assert!(!res.is_error, "{} / stderr: {}", res.text, server.stderr());

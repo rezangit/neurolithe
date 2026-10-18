@@ -1,4 +1,11 @@
-use crate::domain::models::{MemoryNode, WORKING_CCL};
+use crate::domain::models::WORKING_CCL;
+use crate::domain::tuning::ARCHIVE_THRESHOLD;
+
+/// Whether a decayed STM relevance score has faded enough to archive the node
+/// (below [`ARCHIVE_THRESHOLD`]).
+pub fn should_archive(score: f64) -> bool {
+    score < ARCHIVE_THRESHOLD
+}
 
 /// The forgetting curve for STM. Exponential half-life decay, resolved *per
 /// cognitive layer* (STM-WORKING-MEMORY slice 2): the `working` layer
@@ -42,13 +49,6 @@ impl DecayEngine {
         }
     }
 
-    /// Decay a score over `days_elapsed` using the **default** half-life.
-    /// Retained for back-compat; prefer [`Self::calculate_decay_for`] when the
-    /// node's CCL is known.
-    pub fn calculate_decay(&self, current_score: f64, days_elapsed: f64) -> f64 {
-        self.decay(current_score, days_elapsed, self.default_half_life_days)
-    }
-
     /// Decay a score over `days_elapsed` using the half-life for `ccl`.
     pub fn calculate_decay_for(&self, current_score: f64, days_elapsed: f64, ccl: &str) -> f64 {
         self.decay(current_score, days_elapsed, self.half_life_for(ccl))
@@ -69,35 +69,20 @@ impl DecayEngine {
         // score = current_score * (0.5 ^ (days_elapsed / half_life))
         current_score * 0.5f64.powf(days_elapsed / half_life_days)
     }
-
-    /// Apply decay to a specific node using *its own* CCL's half-life, returning
-    /// the modified node. If the score drops below 0.1 the node is `archived`.
-    pub fn apply_to_node(&self, mut node: MemoryNode, days_elapsed: f64) -> MemoryNode {
-        let new_score = self.calculate_decay_for(node.relevance_score, days_elapsed, &node.ccl);
-        node.relevance_score = new_score;
-
-        if new_score < 0.1 && node.status == "active" {
-            node.status = "archived".into();
-        }
-
-        node
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::models::TenantId;
-    use serde_json::json;
 
     #[test]
     fn test_decay_calculation() {
         let engine = DecayEngine::new(7.0); // 7 day half-life
 
-        let score = engine.calculate_decay(1.0, 7.0);
+        let score = engine.calculate_decay_for(1.0, 7.0, "reality");
         assert!((score - 0.5).abs() < 0.001);
 
-        let score_14 = engine.calculate_decay(1.0, 14.0);
+        let score_14 = engine.calculate_decay_for(1.0, 14.0, "reality");
         assert!((score_14 - 0.25).abs() < 0.001);
     }
 
@@ -105,23 +90,13 @@ mod tests {
     fn test_node_archiving() {
         let engine = DecayEngine::new(7.0);
 
-        let node = MemoryNode {
-            id: None,
-            tenant_id: TenantId("t1".into()),
-            source_episode_id: Some(1),
-            payload: json!({}),
-            status: "active".into(),
-            ccl: "reality".into(),
-            is_explicit: false,
-            support_count: 1,
-            relevance_score: 0.15,
-            context_key: None,
-        };
-
         // 7 days later, 0.15 becomes 0.075, which is < 0.1
-        let decayed = engine.apply_to_node(node, 7.0);
-        assert_eq!(decayed.status, "archived");
-        assert!(decayed.relevance_score < 0.1);
+        let decayed = engine.calculate_decay_for(0.15, 7.0, "reality");
+        assert!(decayed < 0.1);
+        assert!(should_archive(decayed));
+        assert!(!should_archive(
+            engine.calculate_decay_for(1.0, 7.0, "reality")
+        ));
     }
 
     /// The core of slice 2: at the *same age*, a `working` note decays below the

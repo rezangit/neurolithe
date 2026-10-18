@@ -102,10 +102,14 @@ has its own distance scale:
 | Key | Section | Decides |
 |---|---|---|
 | `placement_max_distance` | `[ltm]` | A document is filed under its nearest spine concept only within this distance; otherwise it goes to `inbox`. |
+| `placement_min_margin` | `[ltm]` | A document is filed only if its nearest concept is at least this much closer than the second-nearest one; otherwise it goes to `inbox`. `0` (the default for every model) turns the rule off. |
 | `assimilation_threshold` | `[stm]` | A new fact at or below this distance from an existing fact *is* that fact: the existing one is reinforced and keeps its text. |
 | `accommodation_threshold` | `[stm]` | At or below this distance (but beyond assimilation), the new fact *refines* the existing one, which takes the new text. Beyond it, a new fact is created. Must be larger than `assimilation_threshold`. |
 
-All three are optional. For each one, NeuroLithe uses the first of:
+The root of the tree is never a placement target: a document is filed under a
+real branch or goes to `inbox`.
+
+All of them are optional. For each one, NeuroLithe uses the first of:
 
 1. the value in your config;
 2. the embedding model's default from the table below;
@@ -153,12 +157,13 @@ assimilation_threshold = 0.15
 accommodation_threshold = 0.35
 ```
 
-`placement_debug` shows `source: model_default` (or `config` if pinned) with
+`inspect` with `view: "placement"` shows `source: model_default` (or `config` if pinned) with
 these values, which confirms that the legacy calibration is in effect.
 
 Distances are sqlite-vec L2 distances (for unit-length embeddings,
-L2 = √(2 − 2·cosine)). All values must be finite and greater than 0. A key in
-the wrong section is rejected, so it can't be silently ignored.
+L2 = √(2 − 2·cosine)). All values must be finite and greater than 0, except
+`placement_min_margin`, which may be 0. A key in the wrong section is rejected,
+so it can't be silently ignored.
 
 ```toml
 [ltm]
@@ -169,21 +174,31 @@ assimilation_threshold = 0.25
 accommodation_threshold = 0.40
 ```
 
-### Calibrating with `placement_debug`
+### Calibrating with `inspect` (`view: "placement"`)
 
-The `placement_debug` MCP tool reports the effective `thresholds`, each with its
-`source` (`config`, `model_default` or `fallback`). It also reports `probes`: for
-a sample of stored documents, the distance to their nearest concept. To tune
-placement:
+The `inspect` MCP tool with `view: "placement"` reports the effective `thresholds`, each with its
+`source` (`config`, `model_default` or `fallback`). It also reports `probes`.
+For each of a sample of stored documents, a probe gives:
+
+- `nearest_concept` and `distance`;
+- `runner_up_concept` and `runner_up_distance`, the second-nearest concept;
+- `margin`, the difference between the two distances;
+- `decision`, what placement would do with the current values: `file`,
+  `inbox_too_far` or `inbox_ambiguous`.
+
+The root is never a candidate. To tune placement:
 
 1. Store a representative set of documents (for example with
    `remember_document`).
-2. Call `placement_debug` with `sample` 100–500 and look at the `distance`
+2. Call `inspect` with `view: "placement"` and `sample` 100–500 and look at the `distance`
    values.
 3. Set `placement_max_distance` just above the distances of documents that
    clearly belong to their concept. Documents with larger distances go to
    `inbox`. A value below almost all probes files everything into `inbox`.
-4. Restart. The resolved values are also logged at startup.
+4. Optionally set `placement_min_margin`. Documents that belong to no single
+   branch tend to have a small `margin`, so a margin a little above theirs
+   sends them to `inbox` instead of a wrong branch.
+5. Restart. The resolved values are also logged at startup.
 
 The STM thresholds are tuned the same way, on the distance between facts you
 would or wouldn't want merged. Keep `assimilation_threshold` small (near

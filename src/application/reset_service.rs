@@ -227,7 +227,7 @@ mod tests {
     use crate::application::ingestion::tests::text_event;
     use crate::application::ingestion::{DocumentEvent, IngestionService};
     use crate::domain::models::{CclDefinition, TenantId};
-    use crate::domain::ports::{ExtractedFact, LlmClient};
+    use crate::domain::ports::{ChatModel, Embedder, ExtractedFact, Models};
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::repository::SqliteMemoryRepository;
@@ -240,7 +240,7 @@ mod tests {
 
     struct StubLlm;
     #[async_trait]
-    impl LlmClient for StubLlm {
+    impl ChatModel for StubLlm {
         async fn extract_facts(
             &self,
             _d: &str,
@@ -251,11 +251,15 @@ mod tests {
         async fn generate_ccl_description(&self, _n: &str, _c: &str) -> Result<String> {
             Ok(String::new())
         }
-        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
-            Ok(vec![0.25; DIM])
-        }
         async fn compress_context(&self, m: &str) -> Result<String> {
             Ok(format!("summary[{}]", m.len()))
+        }
+    }
+
+    #[async_trait]
+    impl Embedder for StubLlm {
+        async fn embed_text(&self, _t: &str) -> Result<Vec<f32>> {
+            Ok(vec![0.25; DIM])
         }
     }
 
@@ -284,7 +288,7 @@ mod tests {
         let ingest = IngestionService::new(
             stm.clone() as Arc<dyn MemoryRepository>,
             ltm.clone() as Arc<dyn LtmRepository>,
-            Arc::new(StubLlm),
+            Models::new(Arc::new(StubLlm), Some(Arc::new(StubLlm))),
             DIM,
             TENANT,
             &crate::domain::thresholds::Thresholds::text_embedding_004(),
@@ -393,7 +397,7 @@ mod tests {
 
         // The daemon's post-hard-reset step: embed the curated spine.
         let ltm_dyn: Arc<dyn LtmRepository> = h.ltm.clone();
-        let llm_dyn: Arc<dyn LlmClient> = Arc::new(StubLlm);
+        let llm_dyn: Arc<dyn Embedder> = Arc::new(StubLlm);
         let n = embed_spine_concepts(&ltm_dyn, &llm_dyn, DIM).await.unwrap();
         assert!(n > 0, "spine concepts were embedded");
 

@@ -7,12 +7,8 @@ layer filters. For the permanent document archive, use
 
 ## Input
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `query` | string | yes | Non-blank (≤ 4 KiB) |
-| `k` | integer | no | Max results, 1–100, default 10 |
-| `time_filter` | object | no | `{ "after"?: "YYYY-MM-DD", "before"?: "YYYY-MM-DD" }` |
-| `ccl_filter` | string[] | no | Layers to search, default `["reality"]` |
+See [`query_memory` in the tool reference](./tools.md#query_memory) for the arguments,
+their limits and the tool's annotations.
 
 ## Output
 
@@ -39,4 +35,5 @@ A JSON array, best match first:
   neighbours follow.
 - Reading a fact reinforces it: its relevance resets and its decay clock
   restarts.
-- Read-only hint: yes. The reinforcement is the only side effect.
+- Not read-only, because of that reinforcement (`readOnlyHint: false`,
+  `destructiveHint: false`, `idempotentHint: true`).

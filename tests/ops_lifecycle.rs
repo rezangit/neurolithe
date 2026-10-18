@@ -256,7 +256,7 @@ fn stdout_is_pure_jsonrpc_with_trace_logging() {
         "push_dialogue",
         json!({"new_message": "I moved to Lyon last week", "session_id": "s1"}),
     );
-    p.call("memory_stats", json!({}));
+    p.call("inspect", json!({"view": "stats"}));
     p.call("workspace_list", json!({}));
     // Error paths log too: a parse error and an unknown method.
     p.send("this is not json");

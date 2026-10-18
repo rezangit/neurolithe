@@ -6,8 +6,11 @@
 //! can fetch originals from their source.
 
 use crate::domain::ltm::{LtmRepository, Provenance, TreeNode, TreeNodeKind};
+use crate::domain::ranking::{fts_match_query, leg_depth, rrf_fuse};
+use crate::domain::tuning::Ranking;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Recall applies **no** distance cutoff: the nearest `k` nodes are always
@@ -22,7 +25,8 @@ pub const RECALL_MAX_K: usize = 50;
 
 /// Per hit, at most this many child concepts and this many document leaves are
 /// returned, so a broad concept with thousands of documents cannot flood the
-/// caller's context (ARC-15). Use `drill`/`inspect_node` to page further.
+/// caller's context (ARC-15). Use `drill` or the `inspect` tool's `node` view to
+/// page further.
 pub const RECALL_MAX_CHILDREN: usize = 20;
 pub const RECALL_MAX_LEAVES: usize = 20;
 
@@ -86,17 +90,34 @@ pub struct RecallResult {
     pub ancestors: Vec<NodeView>,
     pub children: Vec<NodeView>,
     pub leaves: Vec<LeafRef>,
+    /// Vector distance from the query to the entry (also for hits found by
+    /// the keyword leg alone).
     pub distance: f64,
+    /// The fused rank score (higher is better), when `[retrieval]
+    /// include_scores` is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
 }
 
 /// Read-only navigation over the LTM tree.
 pub struct LtmRetrieval {
     repo: Arc<dyn LtmRepository>,
+    /// How recall fuses its vector and keyword legs (`[retrieval]`).
+    ranking: Ranking,
 }
 
 impl LtmRetrieval {
     pub fn new(repo: Arc<dyn LtmRepository>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            ranking: Ranking::default(),
+        }
+    }
+
+    /// Use `ranking` for recall instead of the defaults.
+    pub fn with_ranking(mut self, ranking: Ranking) -> Self {
+        self.ranking = ranking;
+        self
     }
 
     /// The top `depth` concept layers from the roots — a compact map of the
@@ -191,20 +212,82 @@ impl LtmRetrieval {
         }))
     }
 
-    /// Vector-locate the `k` nearest nodes to `embedding` — concepts **and**
-    /// document leaves, with no distance cutoff — nearest
-    /// first, and assemble context for each. A concept hit returns its
-    /// ancestors + (bounded) children + (bounded) child document leaves. A leaf
-    /// hit returns the document itself (its `dataId`/provenance) framed by its
-    /// ancestors, so a document is recallable by meaning even while it sits
-    /// under the inbox. Empty only when nothing is vector-indexed.
-    pub fn recall(&self, embedding: &[f32], k: usize) -> Result<Vec<RecallResult>> {
+    /// Recall: the `k` best concepts and document leaves for a query, each
+    /// with its context. Two legs are fused by reciprocal rank (see
+    /// [`crate::domain::ranking`], configured by `[retrieval]`):
+    ///
+    /// - **vector**: concepts and leaves nearest `embedding`, no distance
+    ///   cutoff. Skipped when its weight is 0;
+    /// - **keyword**: leaves whose **full document text** matches `query`'s
+    ///   words. A leaf's summary and embedding only see the start of a long
+    ///   document, so this finds evidence deep inside one. Skipped when the
+    ///   query has no searchable words or its weight is 0.
+    ///
+    /// A concept hit returns its ancestors + (bounded) children + (bounded)
+    /// child document leaves. A leaf hit returns the document itself (its
+    /// `dataId`/provenance) framed by its ancestors, so a document is
+    /// recallable even while it sits under the inbox. Every hit reports its
+    /// vector distance, and its fused score when `include_scores` is on.
+    pub fn recall(&self, query: &str, embedding: &[f32], k: usize) -> Result<Vec<RecallResult>> {
         let k = k.clamp(1, RECALL_MAX_K);
-        self.repo
-            .find_similar_any(embedding, RECALL_NO_DISTANCE_CAP, k)?
+        let depth = leg_depth(k, &self.ranking);
+
+        // A leg with weight 0 is off: it contributes no candidates (as in
+        // STM search). Keyword hits still get their vector distance below.
+        let vector = if self.ranking.vector_weight > 0.0 {
+            self.repo
+                .find_similar_any(embedding, RECALL_NO_DISTANCE_CAP, depth)?
+        } else {
+            Vec::new()
+        };
+        let keyword: Vec<i64> = match fts_match_query(query, self.ranking.fts_stopwords) {
+            Some(q) if self.ranking.keyword_weight > 0.0 => {
+                self.repo.search_document_bodies(&q, depth)?
+            }
+            _ => Vec::new(),
+        };
+
+        let vector_ids: Vec<i64> = vector
+            .iter()
+            .map(|(n, _)| n.id.expect("stored node has id"))
+            .collect();
+        let mut nodes: HashMap<i64, (TreeNode, f64)> = vector
             .into_iter()
-            .map(|(entry, distance)| self.assemble_hit(entry, distance))
-            .collect()
+            .map(|(n, d)| (n.id.expect("stored node has id"), (n, d)))
+            .collect();
+        let fused: Vec<(i64, f64)> = rrf_fuse(&vector_ids, &keyword, &self.ranking)
+            .into_iter()
+            .take(k)
+            .collect();
+
+        // Keyword-only hits: their node and true vector distance.
+        let missing: Vec<i64> = fused
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| !nodes.contains_key(id))
+            .collect();
+        if !missing.is_empty() {
+            let distances = self.repo.leaf_distances(&missing, embedding)?;
+            for id in missing {
+                match (self.repo.get_node(id)?, distances.get(&id)) {
+                    (Some(node), Some(d)) => {
+                        nodes.insert(id, (node, *d));
+                    }
+                    _ => tracing::debug!("recall: keyword hit {id} has no leaf vector; skipped"),
+                }
+            }
+        }
+
+        let mut hits = Vec::with_capacity(fused.len());
+        for (id, score) in fused {
+            let Some((node, distance)) = nodes.remove(&id) else {
+                continue;
+            };
+            let mut hit = self.assemble_hit(node, distance)?;
+            hit.score = self.ranking.include_scores.then_some(score);
+            hits.push(hit);
+        }
+        Ok(hits)
     }
 
     fn assemble_hit(&self, entry: TreeNode, distance: f64) -> Result<RecallResult> {
@@ -255,6 +338,7 @@ impl LtmRetrieval {
             children,
             leaves,
             distance,
+            score: None,
         })
     }
 
@@ -425,7 +509,7 @@ mod tests {
 
         let recalled = f
             .ret
-            .recall(&[1.0, 0.0, 0.0, 0.0], 1)
+            .recall("", &[1.0, 0.0, 0.0, 0.0], 1)
             .unwrap()
             .into_iter()
             .next()
@@ -482,7 +566,7 @@ mod tests {
 
         let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
         let recalled = ret
-            .recall(&[0.0, 1.0, 0.0, 0.0], 1)
+            .recall("", &[0.0, 1.0, 0.0, 0.0], 1)
             .unwrap()
             .into_iter()
             .next()
@@ -544,14 +628,14 @@ mod tests {
         let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
 
         let two: Vec<i64> = ret
-            .recall(&[1.0, 0.0, 0.0, 0.0], 2)
+            .recall("", &[1.0, 0.0, 0.0, 0.0], 2)
             .unwrap()
             .iter()
             .map(|r| r.entry.id)
             .collect();
         assert_eq!(two, vec![ids[0], ids[1]], "top-2, nearest first");
 
-        let all = ret.recall(&[1.0, 0.0, 0.0, 0.0], 10).unwrap();
+        let all = ret.recall("", &[1.0, 0.0, 0.0, 0.0], 10).unwrap();
         assert_eq!(all.len(), 3);
         assert!(all.windows(2).all(|w| w[0].distance <= w[1].distance));
     }
@@ -571,7 +655,7 @@ mod tests {
             .unwrap();
         let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
 
-        let hits = ret.recall(&[0.0, 0.0, 3.0, 4.0], 5).unwrap();
+        let hits = ret.recall("", &[0.0, 0.0, 3.0, 4.0], 5).unwrap();
         assert_eq!(hits.len(), 1, "nearest node returned despite distance ~50");
         assert_eq!(hits[0].entry.id, far);
         assert!(hits[0].distance > 10.0);
@@ -594,9 +678,117 @@ mod tests {
         }
         let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>);
 
-        let hit = ret.recall(&[1.0, 0.0, 0.0, 0.0], 1).unwrap();
+        let hit = ret.recall("", &[1.0, 0.0, 0.0, 0.0], 1).unwrap();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0].leaves.len(), RECALL_MAX_LEAVES);
         assert!(hit[0].children.len() <= RECALL_MAX_CHILDREN);
+    }
+
+    /// A store with several documents: `near` sits by the query vector,
+    /// `deep` far from it but its full text holds the query words (beyond
+    /// what its summary shows).
+    fn keyword_fixture(ranking: crate::domain::tuning::Ranking) -> (LtmRetrieval, i64, i64) {
+        let conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&conn, DIM).unwrap();
+        let repo = Arc::new(SqliteLtmRepository::new(conn));
+        let inbox = repo
+            .create_node(&TreeNode::new("inbox", "", TreeNodeKind::Inbox), None)
+            .unwrap();
+        let file = |data_id: &str, emb: [f32; DIM], body: &str| {
+            repo.create_leaf_node(
+                &TreeNode::new(data_id, "a short summary", TreeNodeKind::Leaf),
+                &emb,
+                data_id,
+                &Provenance {
+                    source: "test".into(),
+                    ingested_at: None,
+                    confidence: 1.0,
+                },
+                inbox,
+                Some(&crate::domain::ltm::DocumentBody {
+                    title: data_id.into(),
+                    text: body.into(),
+                }),
+            )
+            .unwrap()
+        };
+        let near = file("near", [1.0, 0.0, 0.0, 0.0], "groceries and errands");
+        file("mid", [0.9, 0.4, 0.0, 0.0], "a letter to the bank");
+        let deep = file(
+            "deep",
+            [0.0, 0.0, 0.0, 1.0],
+            &format!("{} the lighthouse keeper retired", "filler ".repeat(300)),
+        );
+        let ret = LtmRetrieval::new(repo as Arc<dyn LtmRepository>).with_ranking(ranking);
+        (ret, near, deep)
+    }
+
+    /// E2: recall fuses the vector leg with a keyword leg over each
+    /// document's full text, so a document whose words match is found even
+    /// when its vector is far; without query words recall is vector-only.
+    #[test]
+    fn test_recall_fuses_full_text_keywords() {
+        let (ret, near, deep) = keyword_fixture(Default::default());
+        let q = [1.0, 0.0, 0.0, 0.0];
+        let ids = |hits: &[RecallResult]| hits.iter().map(|h| h.entry.id).collect::<Vec<_>>();
+
+        let vector_only = ret.recall("", &q, 2).unwrap();
+        assert!(
+            !ids(&vector_only).contains(&deep),
+            "the vector leg alone misses it"
+        );
+
+        let hits = ret
+            .recall("when did the lighthouse keeper retire?", &q, 2)
+            .unwrap();
+        let got = ids(&hits);
+        assert!(got.contains(&deep), "the keyword leg finds it: {got:?}");
+        assert!(got.contains(&near), "the nearest still comes back: {got:?}");
+        // A keyword-only hit still reports its true vector distance.
+        let deep_hit = hits.iter().find(|h| h.entry.id == deep).unwrap();
+        assert!((deep_hit.distance - std::f64::consts::SQRT_2).abs() < 1e-5);
+        assert_eq!(deep_hit.leaves[0].data_id, "deep");
+        // Scores are off by default.
+        assert!(hits.iter().all(|h| h.score.is_none()));
+    }
+
+    /// With `include_scores`, each hit carries its fused score, best first.
+    #[test]
+    fn test_recall_scores_when_enabled() {
+        let (ret, _near, _deep) = keyword_fixture(crate::domain::tuning::Ranking {
+            include_scores: true,
+            ..Default::default()
+        });
+        let hits = ret.recall("lighthouse", &[1.0, 0.0, 0.0, 0.0], 3).unwrap();
+        let scores: Vec<f64> = hits.iter().map(|h| h.score.unwrap()).collect();
+        assert_eq!(scores.len(), 3);
+        assert!(scores.windows(2).all(|w| w[0] >= w[1]), "{scores:?}");
+        assert!(scores[0] > 0.0);
+    }
+
+    /// A vector weight of 0 switches the vector leg off (pure keyword): no
+    /// score-0 vector hits fill the slots after the keyword hits, and the
+    /// keyword hits still report their vector distance.
+    #[test]
+    fn test_recall_vector_weight_zero_is_keyword_only() {
+        let (ret, _near, deep) = keyword_fixture(crate::domain::tuning::Ranking {
+            vector_weight: 0.0,
+            ..Default::default()
+        });
+        let hits = ret.recall("lighthouse", &[1.0, 0.0, 0.0, 0.0], 3).unwrap();
+        let ids: Vec<i64> = hits.iter().map(|h| h.entry.id).collect();
+        assert_eq!(ids, [deep], "only the keyword match");
+        assert!((hits[0].distance - std::f64::consts::SQRT_2).abs() < 1e-5);
+    }
+
+    /// A keyword weight of 0 switches the keyword leg off (pure vector).
+    #[test]
+    fn test_recall_keyword_weight_zero_is_vector_only() {
+        let (ret, _near, deep) = keyword_fixture(crate::domain::tuning::Ranking {
+            keyword_weight: 0.0,
+            ..Default::default()
+        });
+        let hits = ret.recall("lighthouse", &[1.0, 0.0, 0.0, 0.0], 2).unwrap();
+        assert!(hits.iter().all(|h| h.entry.id != deep));
     }
 }

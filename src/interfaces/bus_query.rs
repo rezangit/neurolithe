@@ -399,6 +399,7 @@ mod tests {
             }],
             data_id: Some("doc_dentist".to_string()),
             context_key: None,
+            score: None,
         };
         let entry = StmEntry::from_memory_result(&m);
         let v = serde_json::to_value(&entry).unwrap();
@@ -434,6 +435,7 @@ mod tests {
                 },
             ],
             distance: 0.12,
+            score: None,
         };
         let entries = flatten_recall(&r);
         assert_eq!(entries.len(), 2);
@@ -450,6 +452,7 @@ mod tests {
             children: vec![],
             leaves: vec![],
             distance: 0.3,
+            score: None,
         };
         let entries = flatten_recall(&r);
         assert_eq!(entries.len(), 1);

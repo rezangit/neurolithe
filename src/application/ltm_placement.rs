@@ -2,13 +2,21 @@
 //! rolling summaries in sync.
 //!
 //! V2 is deliberately **simple**: best-match-or-inbox placement and a
-//! concatenate-and-truncate roll-up. The hard "grow the right way" logic
+//! concatenate-and-truncate roll-up. A document is filed under its nearest
+//! concept when that concept is within `placement_max_distance` and, if the
+//! margin rule is on (`placement_min_margin` > 0), at least that much closer
+//! than the runner-up concept; otherwise it goes to the inbox. A root (`root`,
+//! a node without a parent) is never a placement target. The hard "grow the right way" logic
 //! (split fat nodes, merge similar branches, spawn new branches) is deferred —
 //! see `V2-DESIGN.md` §3.2.
 
-use crate::domain::ltm::{Leaf, LtmRepository, Provenance, TreeEdge, TreeNode, TreeNodeKind};
-use crate::domain::ports::LlmClient;
-use anyhow::{Result, anyhow, bail};
+use crate::domain::ltm::{
+    DocumentBody, LtmRepository, Provenance, TreeEdge, TreeNode, TreeNodeKind,
+};
+use crate::domain::ports::Embedder;
+use crate::infrastructure::embedding_codec::check_dim;
+use anyhow::{Result, anyhow};
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
@@ -20,7 +28,7 @@ use std::sync::Arc;
 /// `seed_spine` so placement has live match targets.
 pub async fn embed_spine_concepts(
     ltm: &Arc<dyn LtmRepository>,
-    llm: &Arc<dyn LlmClient>,
+    embedder: &Arc<dyn Embedder>,
     expected_dim: usize,
 ) -> Result<usize> {
     let mut embedded = 0;
@@ -31,15 +39,12 @@ pub async fn embed_spine_concepts(
         } else {
             format!("{}: {}", node.name, node.summary)
         };
-        let embedding = llm.embed_text(&text).await?;
-        if embedding.len() != expected_dim {
-            bail!(
-                "concept '{}' embedding dim {} != LTM dim {}",
-                node.name,
-                embedding.len(),
-                expected_dim
-            );
-        }
+        let embedding = embedder.embed_text(&text).await?;
+        check_dim(
+            &embedding,
+            expected_dim,
+            &format!("embedder (concept '{}')", node.name),
+        )?;
         ltm.set_concept_embedding(id, &embedding)?;
         embedded += 1;
     }
@@ -73,11 +78,49 @@ pub struct Placement {
     pub matched: bool,
 }
 
+/// A concept a document could be filed under, with its vector distance.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConceptMatch {
+    pub id: i64,
+    pub name: String,
+    pub distance: f64,
+}
+
+/// The two nearest placement targets for an embedding. Roots (nodes without a
+/// parent, e.g. `root`) are never targets.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Candidates {
+    pub best: Option<ConceptMatch>,
+    pub runner_up: Option<ConceptMatch>,
+}
+
+impl Candidates {
+    /// How much closer the best concept is than the runner-up, when both exist.
+    pub fn margin(&self) -> Option<f64> {
+        Some(self.runner_up.as_ref()?.distance - self.best.as_ref()?.distance)
+    }
+}
+
+/// What placement decides for a document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementDecision {
+    /// File under the best concept.
+    File,
+    /// No concept within `placement_max_distance`: the inbox.
+    InboxTooFar,
+    /// The best concept is within the cutoff, but doesn't beat the runner-up
+    /// by `placement_min_margin`: the inbox.
+    InboxAmbiguous,
+}
+
 /// Files documents into the LTM tree and rolls summaries up the affected
 /// ancestors.
 pub struct LtmPlacement {
     repo: Arc<dyn LtmRepository>,
     max_distance: f64,
+    /// The margin rule (`0` = off).
+    min_margin: f64,
     max_summary_len: usize,
 }
 
@@ -89,22 +132,100 @@ impl LtmPlacement {
         Self {
             repo,
             max_distance,
+            min_margin: 0.0,
             max_summary_len: DEFAULT_MAX_SUMMARY_LEN,
         }
+    }
+
+    /// Placement with the resolved cutoff and margin rule (see
+    /// `domain::thresholds`).
+    pub fn from_thresholds(
+        repo: Arc<dyn LtmRepository>,
+        thresholds: &crate::domain::thresholds::Thresholds,
+    ) -> Self {
+        Self::new(repo, thresholds.placement_max_distance.value)
+            .with_min_margin(thresholds.placement_min_margin.value)
+    }
+
+    /// Set the margin rule: file only if the best concept is at least
+    /// `min_margin` closer than the runner-up. `0` turns it off.
+    pub fn with_min_margin(mut self, min_margin: f64) -> Self {
+        self.min_margin = min_margin;
+        self
+    }
+
+    /// The two nearest concepts to `embedding`, roots excluded, at any
+    /// distance (the cutoff is applied by [`Self::decide`]).
+    pub fn candidates(&self, embedding: &[f32]) -> Result<Candidates> {
+        let roots: std::collections::HashSet<i64> = self
+            .repo
+            .get_roots()?
+            .into_iter()
+            .filter_map(|n| n.id)
+            .collect();
+        // Over-fetch by the number of roots: the KNN cut runs before we drop
+        // them, and an embedded root must not push the runner-up out.
+        let mut matches = self
+            .repo
+            .find_similar_concepts(embedding, f64::MAX, 2 + roots.len())?
+            .into_iter()
+            .filter_map(|(node, distance)| {
+                let id = node.id?;
+                (!roots.contains(&id)).then_some(ConceptMatch {
+                    id,
+                    name: node.name,
+                    distance,
+                })
+            });
+        Ok(Candidates {
+            best: matches.next(),
+            runner_up: matches.next(),
+        })
+    }
+
+    /// Apply the cutoff and the margin rule to `candidates`.
+    pub fn decide(&self, candidates: &Candidates) -> PlacementDecision {
+        let Some(best) = &candidates.best else {
+            return PlacementDecision::InboxTooFar;
+        };
+        if best.distance > self.max_distance {
+            return PlacementDecision::InboxTooFar;
+        }
+        match candidates.margin() {
+            Some(margin) if self.min_margin > 0.0 && margin < self.min_margin => {
+                PlacementDecision::InboxAmbiguous
+            }
+            _ => PlacementDecision::File,
+        }
+    }
+
+    /// The concept to file under, or `None` for the inbox.
+    fn target(&self, embedding: &[f32]) -> Result<Option<i64>> {
+        let candidates = self.candidates(embedding)?;
+        Ok(match (self.decide(&candidates), candidates.best) {
+            (PlacementDecision::File, Some(best)) => Some(best.id),
+            _ => None,
+        })
     }
 
     /// File a document: attach it under the best-matching concept (vector within
     /// threshold) or, failing that, under the inbox; then roll its summary up
     /// into the ancestors. Returns where it landed.
     pub fn place(&self, doc: &DocumentToPlace) -> Result<Placement> {
-        // 1. Best concept match, or fall back to the inbox.
-        let best = self
-            .repo
-            .find_similar_concepts(&doc.embedding, self.max_distance, 1)?
-            .into_iter()
-            .next();
-        let (parent_id, matched) = match best {
-            Some((node, _dist)) => (node.id.expect("stored node has id"), true),
+        self.place_with_body(doc, None)
+    }
+
+    /// [`place`](Self::place), storing the document's full `body` (for
+    /// keyword recall) in the same transaction as the leaf.
+    pub fn place_with_body(
+        &self,
+        doc: &DocumentToPlace,
+        body: Option<&DocumentBody>,
+    ) -> Result<Placement> {
+        // 1. Best concept match (cutoff + margin rule, never a root), or fall
+        //    back to the inbox.
+        let (parent_id, matched) = match self.target(&doc.embedding)? {
+            Some(concept_id) => (concept_id, true),
             None => {
                 let inbox = self
                     .repo
@@ -114,33 +235,25 @@ impl LtmPlacement {
             }
         };
 
-        // 2. Create the leaf node and its dataId link. The leaf IS vector-indexed
-        //    (its summary embedding), so `recall` can land on the document
-        //    directly by meaning — essential while docs pile in the inbox before
-        //    the tree grows real concepts around them. This does NOT affect
-        //    placement: step 1 uses the concept-only `find_similar_concepts`, so
-        //    an embedded leaf can never crowd out a concept match and misroute a
-        //    new document to the inbox.
-        let leaf_node_id = self.repo.create_node(
+        // 2. File the leaf: node, dataId link, provenance and parent edge in one
+        //    transaction, so a crash can't leave an unlinked leaf that no later
+        //    replace/forget of this dataId would find. The leaf IS
+        //    vector-indexed (its summary embedding), so `recall` can land on the
+        //    document directly by meaning — essential while docs pile in the
+        //    inbox before the tree grows real concepts around them. This does
+        //    NOT affect placement: step 1 uses the concept-only
+        //    `find_similar_concepts`, so an embedded leaf can never crowd out a
+        //    concept match and misroute a new document to the inbox. An unset
+        //    `provenance.ingested_at` is stamped from the node's DB-assigned
+        //    `created_at` (no wall-clock dependency).
+        let leaf_node_id = self.repo.create_leaf_node(
             &TreeNode::new(doc.name.clone(), doc.summary.clone(), TreeNodeKind::Leaf),
-            Some(&doc.embedding),
+            &doc.embedding,
+            &doc.data_id,
+            &doc.provenance,
+            parent_id,
+            body,
         )?;
-        // Stamp the ingest time from the DB-assigned `created_at` when the caller
-        // didn't supply one, so `provenance.ingested_at` is populated everywhere
-        // it surfaces (listings, recall, trace) — it was null on every leaf
-        // before (field-report §5). No wall-clock dependency: the tree node's
-        // created_at is the authoritative ingest instant.
-        let mut provenance = doc.provenance.clone();
-        if provenance.ingested_at.is_none() {
-            provenance.ingested_at = self.repo.get_node(leaf_node_id)?.and_then(|n| n.created_at);
-        }
-        self.repo.create_leaf(&Leaf {
-            tree_node_id: leaf_node_id,
-            data_id: doc.data_id.clone(),
-            provenance,
-        })?;
-        self.repo
-            .add_edge(&TreeEdge::new(parent_id, leaf_node_id))?;
 
         // 3. Roll the new summary up into the parent and its ancestors.
         self.roll_up_from(parent_id)?;
@@ -167,15 +280,9 @@ impl LtmPlacement {
         let mut touched: std::collections::HashSet<i64> = std::collections::HashSet::new();
         let mut moved = 0;
         for (leaf_id, embedding) in self.repo.inbox_leaf_embeddings()? {
-            let Some((concept, _dist)) = self
-                .repo
-                .find_similar_concepts(&embedding, self.max_distance, 1)?
-                .into_iter()
-                .next()
-            else {
-                continue; // still no concept within threshold — leave in inbox
+            let Some(concept_id) = self.target(&embedding)? else {
+                continue; // still no clear concept within threshold — leave in inbox
             };
-            let concept_id = concept.id.expect("stored node has id");
             self.repo.remove_edge(inbox_id, leaf_id)?;
             self.repo.add_edge(&TreeEdge::new(concept_id, leaf_id))?;
             touched.insert(concept_id);
@@ -197,6 +304,10 @@ impl LtmPlacement {
     /// was not in the tree.
     pub fn forget(&self, data_id: &str) -> Result<bool> {
         let removed = self.remove_leaves(data_id, None)?;
+        // The last leaf's delete drops the body (a trigger), but a body no
+        // leaf carried (an ingest that failed before filing) must go too: a
+        // forgotten document's text may not stay on disk (W3R-1).
+        self.repo.delete_document_body(data_id)?;
         Ok(removed > 0)
     }
 
@@ -210,13 +321,32 @@ impl LtmPlacement {
     /// removes all stale copies. Returns the placement and how many old leaves
     /// were replaced.
     pub fn replace(&self, doc: &DocumentToPlace) -> Result<(Placement, usize)> {
-        let placed = self.place(doc)?;
+        self.replace_with_body(doc, None)
+    }
+
+    /// [`replace`](Self::replace), storing the new version's full `body` in
+    /// the same transaction as its leaf, so a failed filing never leaves the
+    /// new text beside the old leaf (W3R-2).
+    pub fn replace_with_body(
+        &self,
+        doc: &DocumentToPlace,
+        body: Option<&DocumentBody>,
+    ) -> Result<(Placement, usize)> {
+        let placed = self.place_with_body(doc, body)?;
         let replaced = self.remove_leaves(&doc.data_id, Some(placed.leaf_node_id))?;
         Ok((placed, replaced))
     }
 
     /// Delete every leaf node carrying `data_id` except `keep`, then re-roll
-    /// each affected parent (once). Returns how many leaves were deleted.
+    /// each affected parent's ancestors (once). Returns how many leaves were
+    /// deleted.
+    ///
+    /// Each leaf is deleted in the same transaction that rewrites its parents'
+    /// summaries without it (W2R-2). Once a leaf is gone, a redelivery can no
+    /// longer find the parents it had, so a separate roll-up that a crash cut
+    /// off would leave them listing the removed document for good. Ancestors
+    /// above the parents list their children's names, not summaries, so the
+    /// roll-up afterwards only refreshes them for completeness.
     fn remove_leaves(&self, data_id: &str, keep: Option<i64>) -> Result<usize> {
         let mut parents: Vec<i64> = Vec::new();
         let mut removed = 0;
@@ -225,14 +355,21 @@ impl LtmPlacement {
             if Some(leaf_id) == keep {
                 continue;
             }
-            // Capture the parents before deletion so we know what to re-roll.
+            let mut summaries = Vec::new();
             for parent in self.repo.get_parents(leaf_id)? {
                 let pid = parent.id.expect("stored node has id");
+                let siblings: Vec<TreeNode> = self
+                    .repo
+                    .get_children(pid)?
+                    .into_iter()
+                    .filter(|c| c.id != Some(leaf_id))
+                    .collect();
+                summaries.push((pid, collection_summary(&siblings, self.max_summary_len)));
                 if !parents.contains(&pid) {
                     parents.push(pid);
                 }
             }
-            self.repo.delete_node(leaf_id)?;
+            self.repo.delete_node_with_summaries(leaf_id, &summaries)?;
             removed += 1;
         }
         for pid in parents {
@@ -334,6 +471,7 @@ fn collection_summary(children: &[TreeNode], max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::ltm::Leaf;
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::schema::init_ltm_schema;
@@ -614,5 +752,428 @@ mod tests {
         // Both leaves now hang under the concept.
         let children = f.repo.get_children(f.concept).unwrap();
         assert_eq!(children.len(), 2);
+    }
+
+    // --- Crash safety of leaf removal (W2R-2) ---------------------------------
+
+    /// An LTM repository that "crashes" right after the first leaf delete
+    /// commits: that delete is kept, and every later call fails, as if the
+    /// process died there. Reads before the crash pass through.
+    struct CrashAfterDelete {
+        inner: Arc<SqliteLtmRepository>,
+        crashed: std::cell::Cell<bool>,
+    }
+
+    impl CrashAfterDelete {
+        fn alive(&self) -> Result<()> {
+            if self.crashed.get() {
+                anyhow::bail!("simulated crash");
+            }
+            Ok(())
+        }
+    }
+
+    impl LtmRepository for CrashAfterDelete {
+        fn create_node(&self, node: &TreeNode, embedding: Option<&[f32]>) -> Result<i64> {
+            self.alive()?;
+            self.inner.create_node(node, embedding)
+        }
+        fn add_edge(&self, edge: &TreeEdge) -> Result<()> {
+            self.alive()?;
+            self.inner.add_edge(edge)
+        }
+        fn create_leaf(&self, leaf: &Leaf) -> Result<()> {
+            self.alive()?;
+            self.inner.create_leaf(leaf)
+        }
+        fn create_leaf_node(
+            &self,
+            node: &TreeNode,
+            embedding: &[f32],
+            data_id: &str,
+            provenance: &Provenance,
+            parent_id: i64,
+            body: Option<&DocumentBody>,
+        ) -> Result<i64> {
+            self.alive()?;
+            self.inner
+                .create_leaf_node(node, embedding, data_id, provenance, parent_id, body)
+        }
+        fn delete_document_body(&self, data_id: &str) -> Result<()> {
+            self.alive()?;
+            self.inner.delete_document_body(data_id)
+        }
+        fn get_node(&self, id: i64) -> Result<Option<TreeNode>> {
+            self.alive()?;
+            self.inner.get_node(id)
+        }
+        fn get_children(&self, parent_id: i64) -> Result<Vec<TreeNode>> {
+            self.alive()?;
+            self.inner.get_children(parent_id)
+        }
+        fn get_parents(&self, child_id: i64) -> Result<Vec<TreeNode>> {
+            self.alive()?;
+            self.inner.get_parents(child_id)
+        }
+        fn get_node_by_data_id(&self, data_id: &str) -> Result<Option<TreeNode>> {
+            self.alive()?;
+            self.inner.get_node_by_data_id(data_id)
+        }
+        fn get_nodes_by_data_id(&self, data_id: &str) -> Result<Vec<TreeNode>> {
+            self.alive()?;
+            self.inner.get_nodes_by_data_id(data_id)
+        }
+        fn find_similar_concepts(
+            &self,
+            embedding: &[f32],
+            max_distance: f64,
+            limit: usize,
+        ) -> Result<Vec<(TreeNode, f64)>> {
+            self.alive()?;
+            self.inner
+                .find_similar_concepts(embedding, max_distance, limit)
+        }
+        fn find_similar_any(
+            &self,
+            embedding: &[f32],
+            max_distance: f64,
+            limit: usize,
+        ) -> Result<Vec<(TreeNode, f64)>> {
+            self.alive()?;
+            self.inner.find_similar_any(embedding, max_distance, limit)
+        }
+        fn get_leaf(&self, tree_node_id: i64) -> Result<Option<Leaf>> {
+            self.alive()?;
+            self.inner.get_leaf(tree_node_id)
+        }
+        fn get_inbox(&self) -> Result<Option<TreeNode>> {
+            self.alive()?;
+            self.inner.get_inbox()
+        }
+        fn update_summary(&self, node_id: i64, summary: &str) -> Result<()> {
+            self.alive()?;
+            self.inner.update_summary(node_id, summary)
+        }
+        fn set_concept_embedding(&self, node_id: i64, embedding: &[f32]) -> Result<()> {
+            self.alive()?;
+            self.inner.set_concept_embedding(node_id, embedding)
+        }
+        fn concepts_missing_embedding(&self) -> Result<Vec<TreeNode>> {
+            self.alive()?;
+            self.inner.concepts_missing_embedding()
+        }
+        fn sample_leaf_embeddings(&self, sample: usize) -> Result<Vec<(i64, String, Vec<f32>)>> {
+            self.alive()?;
+            self.inner.sample_leaf_embeddings(sample)
+        }
+        fn delete_node(&self, node_id: i64) -> Result<()> {
+            self.alive()?;
+            self.inner.delete_node(node_id)?;
+            self.crashed.set(true);
+            Ok(())
+        }
+        fn delete_node_with_summaries(
+            &self,
+            node_id: i64,
+            summaries: &[(i64, String)],
+        ) -> Result<()> {
+            self.alive()?;
+            self.inner.delete_node_with_summaries(node_id, summaries)?;
+            self.crashed.set(true);
+            Ok(())
+        }
+        fn remove_edge(&self, parent_id: i64, child_id: i64) -> Result<()> {
+            self.alive()?;
+            self.inner.remove_edge(parent_id, child_id)
+        }
+        fn inbox_leaf_embeddings(&self) -> Result<Vec<(i64, Vec<f32>)>> {
+            self.alive()?;
+            self.inner.inbox_leaf_embeddings()
+        }
+        fn seed_spine_from(&self, seeds: &[crate::domain::ltm::SpineSeed]) -> Result<()> {
+            self.alive()?;
+            self.inner.seed_spine_from(seeds)
+        }
+        fn reset_store(&self) -> Result<()> {
+            self.alive()?;
+            self.inner.reset_store()
+        }
+        fn get_roots(&self) -> Result<Vec<TreeNode>> {
+            self.alive()?;
+            self.inner.get_roots()
+        }
+        fn get_child_leaves(&self, parent_id: i64) -> Result<Vec<Leaf>> {
+            self.alive()?;
+            self.inner.get_child_leaves(parent_id)
+        }
+        fn ltm_stats(&self) -> Result<crate::domain::ltm::LtmStats> {
+            self.alive()?;
+            self.inner.ltm_stats()
+        }
+        fn put_document_body(&self, data_id: &str, title: &str, body: &str) -> Result<()> {
+            self.alive()?;
+            self.inner.put_document_body(data_id, title, body)
+        }
+        fn search_document_bodies(&self, match_query: &str, limit: usize) -> Result<Vec<i64>> {
+            self.alive()?;
+            self.inner.search_document_bodies(match_query, limit)
+        }
+        fn leaf_distances(&self, leaf_ids: &[i64], embedding: &[f32]) -> Result<HashMap<i64, f64>> {
+            self.alive()?;
+            self.inner.leaf_distances(leaf_ids, embedding)
+        }
+    }
+
+    fn lease(name: &str, embedding: [f32; 4]) -> DocumentToPlace {
+        DocumentToPlace {
+            name: name.into(),
+            summary: format!("{name} body"),
+            embedding: embedding.to_vec(),
+            data_id: "doc_lease".into(),
+            provenance: provenance(),
+        }
+    }
+
+    fn summary_of(repo: &SqliteLtmRepository, id: i64) -> String {
+        repo.get_node(id).unwrap().unwrap().summary
+    }
+
+    /// W2R-2: a crash right after the old version's leaf is deleted (before any
+    /// roll-up runs) must not leave its old parent listing the removed
+    /// document, even after the redelivered update completes. The old leaf is
+    /// gone by then, so the redelivery alone can't find that parent again.
+    #[test]
+    fn test_crash_after_leaf_delete_leaves_no_stale_parent_summary() {
+        let f = fixture();
+        // v1 lands in the inbox (far from the concept).
+        f.svc
+            .place(&lease("Old lease", [0.0, 0.0, 0.0, 1.0]))
+            .unwrap();
+        assert!(summary_of(&f.repo, f.inbox).contains("Old lease"));
+
+        // v2 matches the concept; the process dies right after v1's leaf is
+        // deleted.
+        let crashy = Arc::new(CrashAfterDelete {
+            inner: f.repo.clone(),
+            crashed: std::cell::Cell::new(false),
+        });
+        let svc = LtmPlacement::new(
+            crashy as Arc<dyn LtmRepository>,
+            crate::domain::thresholds::TEXT_EMBEDDING_004.placement_max_distance,
+        );
+        let v2 = lease("New lease", [1.0, 0.0, 0.0, 0.0]);
+        assert!(svc.replace(&v2).is_err(), "the simulated crash surfaces");
+
+        // After the restart, the redelivered v2 completes.
+        f.svc.replace(&v2).unwrap();
+        let leaves = f.repo.get_nodes_by_data_id("doc_lease").unwrap();
+        assert_eq!(leaves.len(), 1, "{leaves:?}");
+        assert!(summary_of(&f.repo, f.concept).contains("New lease"));
+        let inbox = summary_of(&f.repo, f.inbox);
+        assert!(
+            !inbox.contains("Old lease"),
+            "old parent still lists the removed document: {inbox:?}"
+        );
+    }
+
+    /// The same for a tombstone: a crash right after the delete doesn't leave
+    /// the parent listing the forgotten document.
+    #[test]
+    fn test_crash_after_forget_delete_leaves_no_stale_parent_summary() {
+        let f = fixture();
+        f.svc
+            .place(&lease("Old lease", [0.0, 0.0, 0.0, 1.0]))
+            .unwrap();
+        let crashy = Arc::new(CrashAfterDelete {
+            inner: f.repo.clone(),
+            crashed: std::cell::Cell::new(false),
+        });
+        let svc = LtmPlacement::new(
+            crashy as Arc<dyn LtmRepository>,
+            crate::domain::thresholds::TEXT_EMBEDDING_004.placement_max_distance,
+        );
+        assert!(
+            svc.forget("doc_lease").is_err(),
+            "the simulated crash surfaces"
+        );
+
+        // The redelivered tombstone finds nothing left to delete.
+        assert!(!f.svc.forget("doc_lease").unwrap());
+        let inbox = summary_of(&f.repo, f.inbox);
+        assert!(!inbox.contains("Old lease"), "{inbox:?}");
+    }
+
+    // --- E3: placement targets and the margin rule ----------------------------
+
+    fn doc_at(name: &str, data_id: &str, embedding: [f32; 4]) -> DocumentToPlace {
+        DocumentToPlace {
+            name: name.into(),
+            summary: format!("{name} body"),
+            embedding: embedding.to_vec(),
+            data_id: data_id.into(),
+            provenance: provenance(),
+        }
+    }
+
+    /// E3a: the root is never a placement target, even when it's the nearest
+    /// embedded node. The document goes to the nearest real concept within
+    /// the cutoff, or to the inbox.
+    #[test]
+    fn test_root_is_never_a_placement_target() {
+        let f = fixture();
+        // The root sits exactly where the documents are.
+        f.repo
+            .set_concept_embedding(f.root, &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        f.repo
+            .set_concept_embedding(f.concept, &[0.0, 0.8, 0.0, 0.0])
+            .unwrap();
+
+        // Concept 0.2 away, root 0: files under the concept.
+        let near = f
+            .svc
+            .place(&doc_at("near", "doc_near", [0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(near.parent_id, f.concept);
+        assert!(near.matched);
+
+        // Only the root within the cutoff: the inbox, not the root.
+        f.repo
+            .set_concept_embedding(f.concept, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        let far = f
+            .svc
+            .place(&doc_at("far", "doc_far", [0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(far.parent_id, f.inbox);
+        assert!(!far.matched);
+        assert!(f.repo.get_child_leaves(f.root).unwrap().is_empty());
+    }
+
+    /// E3a: the inbox gardener never moves a document under the root either.
+    #[test]
+    fn test_garden_inbox_never_moves_to_root() {
+        let f = fixture();
+        let leaf = f
+            .svc
+            .place(&doc_at("stray", "doc_stray", [0.0, 1.0, 0.0, 0.0]))
+            .unwrap();
+        assert_eq!(leaf.parent_id, f.inbox);
+        // Later the root gets a vector right on top of the document.
+        f.repo
+            .set_concept_embedding(f.root, &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+
+        assert_eq!(f.svc.garden_inbox().unwrap(), 0);
+        let parents = f.repo.get_parents(leaf.leaf_node_id).unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].id, Some(f.inbox));
+    }
+
+    fn concept_at(name: &str, distance: f64) -> ConceptMatch {
+        ConceptMatch {
+            id: name.len() as i64,
+            name: name.into(),
+            distance,
+        }
+    }
+
+    /// E3b: the decision table. Cutoff first; then the margin rule, which only
+    /// applies when it's on and a runner-up exists.
+    #[test]
+    fn test_decide_applies_cutoff_then_margin() {
+        let repo = fixture().repo as Arc<dyn LtmRepository>;
+        let off = LtmPlacement::new(repo.clone(), 1.0);
+        let on = LtmPlacement::new(repo, 1.0).with_min_margin(0.05);
+        let both = |best: f64, runner: f64| Candidates {
+            best: Some(concept_at("best", best)),
+            runner_up: Some(concept_at("runner_up", runner)),
+        };
+
+        for p in [&off, &on] {
+            assert_eq!(
+                p.decide(&Candidates::default()),
+                PlacementDecision::InboxTooFar
+            );
+            assert_eq!(p.decide(&both(1.01, 1.5)), PlacementDecision::InboxTooFar);
+            // A lone concept has no runner-up to be ambiguous with.
+            let lone = Candidates {
+                best: Some(concept_at("best", 0.9)),
+                runner_up: None,
+            };
+            assert_eq!(p.decide(&lone), PlacementDecision::File);
+        }
+        assert_eq!(off.decide(&both(0.90, 0.91)), PlacementDecision::File);
+        assert_eq!(
+            on.decide(&both(0.90, 0.94)),
+            PlacementDecision::InboxAmbiguous
+        );
+        assert_eq!(on.decide(&both(0.90, 0.96)), PlacementDecision::File);
+        // The runner-up may sit beyond the cutoff; it still counts.
+        assert_eq!(
+            on.decide(&both(0.98, 1.02)),
+            PlacementDecision::InboxAmbiguous
+        );
+        assert_eq!(
+            both(0.90, 0.94).margin().map(|m| (m * 100.0).round()),
+            Some(4.0)
+        );
+    }
+
+    /// E3b: with the margin rule on, a document that is nearly as close to a
+    /// second concept goes to the inbox; a clear winner is still filed. The
+    /// runner-up is found even when it's beyond the cutoff.
+    #[test]
+    fn test_margin_rule_sends_ambiguous_documents_to_the_inbox() {
+        let f = fixture();
+        let home = f
+            .repo
+            .create_node(
+                &TreeNode::new("home", "home seed", TreeNodeKind::Spine),
+                Some(&[1.0, 0.04, 0.0, 0.0]),
+            )
+            .unwrap();
+        f.repo.add_edge(&TreeEdge::new(f.root, home)).unwrap();
+        let svc = |margin: f64| {
+            LtmPlacement::new(f.repo.clone() as Arc<dyn LtmRepository>, 1.10)
+                .with_min_margin(margin)
+        };
+        let doc = |id: &str| doc_at("contract", id, [1.0, 0.0, 0.0, 0.0]);
+
+        // "job" at 0, "home" at 0.04: a 0.04 margin.
+        let c = svc(0.05).candidates(&doc("x").embedding).unwrap();
+        assert_eq!(c.best.as_ref().map(|b| b.id), Some(f.concept));
+        assert_eq!(c.runner_up.as_ref().map(|r| r.id), Some(home));
+
+        let ambiguous = svc(0.05).place(&doc("doc_a")).unwrap();
+        assert_eq!(ambiguous.parent_id, f.inbox);
+        assert!(!ambiguous.matched);
+        let clear = svc(0.03).place(&doc("doc_b")).unwrap();
+        assert_eq!(clear.parent_id, f.concept);
+        let off = svc(0.0).place(&doc("doc_c")).unwrap();
+        assert_eq!(off.parent_id, f.concept);
+
+        // The gardener applies the same rule: with the rule on, the ambiguous
+        // document stays put.
+        assert_eq!(svc(0.05).garden_inbox().unwrap(), 0);
+        assert_eq!(svc(0.0).garden_inbox().unwrap(), 1);
+    }
+
+    /// `from_thresholds` takes both the cutoff and the margin.
+    #[test]
+    fn test_from_thresholds_carries_the_margin() {
+        use crate::domain::thresholds::{ThresholdOverrides, Thresholds};
+        let (t, _) = Thresholds::resolve(
+            "local:bge-small-en-v1.5",
+            ThresholdOverrides {
+                placement_max_distance: Some(0.5),
+                placement_min_margin: Some(0.07),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let p = LtmPlacement::from_thresholds(fixture().repo as Arc<dyn LtmRepository>, &t);
+        assert_eq!(p.max_distance, 0.5);
+        assert_eq!(p.min_margin, 0.07);
     }
 }

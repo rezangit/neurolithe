@@ -218,8 +218,8 @@ mod tests {
     use crate::application::query_service::QueryScope;
     use crate::application::retrieval::RetrievalService;
     use crate::domain::ltm::LtmRepository;
-    use crate::domain::models::{CclDefinition, MemoryNode, TenantId};
-    use crate::domain::ports::{ExtractedFact, LlmClient, MemoryRepository};
+    use crate::domain::models::{MemoryNode, TenantId};
+    use crate::domain::ports::{Embedder, MemoryRepository};
     use crate::infrastructure::database::init_db;
     use crate::infrastructure::ltm_repository::SqliteLtmRepository;
     use crate::infrastructure::repository::SqliteMemoryRepository;
@@ -255,17 +255,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl LlmClient for RecordingLlm {
-        async fn extract_facts(
-            &self,
-            _dialogue: &str,
-            _valid_ccls: &[CclDefinition],
-        ) -> anyhow::Result<Vec<ExtractedFact>> {
-            Ok(vec![])
-        }
-        async fn generate_ccl_description(&self, _n: &str, _c: &str) -> anyhow::Result<String> {
-            Ok("desc".into())
-        }
+    impl Embedder for RecordingLlm {
         async fn embed_text(&self, text: &str) -> anyhow::Result<Vec<f32>> {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.embeds.lock().unwrap().push(text.to_string());
@@ -273,9 +263,6 @@ mod tests {
                 anyhow::bail!("embed failed");
             }
             Ok(vec![0.1_f32; DIM])
-        }
-        async fn compress_context(&self, _m: &str) -> anyhow::Result<String> {
-            Ok("summary".into())
         }
     }
 
@@ -303,7 +290,7 @@ mod tests {
         let query_service = Arc::new(QueryService::new(
             retrieval,
             ltm_retrieval,
-            llm.clone() as Arc<dyn LlmClient>,
+            llm.clone() as Arc<dyn Embedder>,
         ));
 
         // A broker-less QueryConsumer: the loop/producer are never driven in unit

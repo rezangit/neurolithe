@@ -12,8 +12,8 @@
 
 use crate::application::ltm_retrieval::{LtmRetrieval, RecallResult};
 use crate::application::retrieval::RetrievalService;
-use crate::domain::models::{MemoryResult, TenantId, TimeFilter, WORKING_CCL};
-use crate::domain::ports::LlmClient;
+use crate::domain::models::{MemoryResult, REALITY_CCL, TenantId, TimeFilter, WORKING_CCL};
+use crate::domain::ports::Embedder;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ const SEED_FACT_COUNT: usize = 3;
 /// the MCP `query_memory` default and the agent-writes-default-`reality`
 /// convention (design §7 / plan finding). Callers wanting another layer pass it
 /// explicitly.
-const DEFAULT_CCL: &str = "reality";
+const DEFAULT_CCL: &str = REALITY_CCL;
 
 /// What kind of read a `memory.query` asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,14 +74,14 @@ pub struct QueryOutcome {
 pub struct QueryService {
     retrieval: RetrievalService,
     ltm: LtmRetrieval,
-    embedder: Arc<dyn LlmClient>,
+    embedder: Arc<dyn Embedder>,
 }
 
 impl QueryService {
     pub fn new(
         retrieval: RetrievalService,
         ltm: LtmRetrieval,
-        embedder: Arc<dyn LlmClient>,
+        embedder: Arc<dyn Embedder>,
     ) -> Self {
         Self {
             retrieval,
@@ -156,8 +156,8 @@ impl QueryService {
             .recent_in_context(&tenant, &ccl_filter, context_key, req.k)
     }
 
-    /// STM hybrid search, truncated to the requested breadth `k`. An empty CCL
-    /// list falls back to [`DEFAULT_CCL`] (the store cannot express match-all).
+    /// STM hybrid search for the requested breadth `k`. An empty CCL list
+    /// falls back to [`DEFAULT_CCL`] (the store cannot express match-all).
     async fn stm_search(&self, req: &QueryRequest) -> Result<Vec<MemoryResult>> {
         let tenant = TenantId(req.tenant.clone());
         let ccl_filter: Vec<String> = if req.ccl.is_empty() {
@@ -165,19 +165,16 @@ impl QueryService {
         } else {
             req.ccl.clone()
         };
-        let mut results = self
-            .retrieval
-            .query(&tenant, &req.query, &req.time_filter, &ccl_filter)
-            .await?;
-        results.truncate(req.k);
-        Ok(results)
+        self.retrieval
+            .query(&tenant, &req.query, &req.time_filter, &ccl_filter, req.k)
+            .await
     }
 
     /// Embed `text` and recall the `k` nearest LTM nodes within the recall
     /// distance cap (possibly none).
     async fn ltm_recall(&self, text: &str, k: usize) -> Result<Vec<RecallResult>> {
         let embedding = self.embedder.embed_text(text).await?;
-        self.ltm.recall(&embedding, k)
+        self.ltm.recall(text, &embedding, k)
     }
 
     /// The compound path: STM recall → seed(query ⊕ top-k fact texts) → one
@@ -200,12 +197,92 @@ impl QueryService {
         };
 
         let embedding = self.embedder.embed_text(&seed).await?;
-        let ltm = self.ltm.recall(&embedding, req.k)?;
+        // The keyword leg uses the query's own words, not the seed facts.
+        let ltm = self.ltm.recall(&req.query, &embedding, req.k)?;
 
         Ok(QueryOutcome {
             stm,
             ltm,
             seeded_by: seed_facts,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::ltm::LtmRepository;
+    use crate::domain::models::MemoryNode;
+    use crate::domain::ports::MemoryRepository;
+    use crate::infrastructure::database::init_db;
+    use crate::infrastructure::ltm_repository::SqliteLtmRepository;
+    use crate::infrastructure::repository::SqliteMemoryRepository;
+    use crate::infrastructure::schema::{init_ltm_schema, init_schema};
+
+    const DIM: usize = 4;
+
+    struct FixedEmbedder;
+
+    #[async_trait::async_trait]
+    impl Embedder for FixedEmbedder {
+        async fn embed_text(&self, _text: &str) -> Result<Vec<f32>> {
+            Ok(vec![1.0, 0.0, 0.0, 0.0])
+        }
+    }
+
+    fn service_with_facts(n: usize) -> QueryService {
+        let stm_conn = init_db(None as Option<&String>).unwrap();
+        init_schema(&stm_conn, DIM).unwrap();
+        let stm = Arc::new(SqliteMemoryRepository::new(stm_conn));
+        for i in 0..n {
+            stm.store_node(
+                &MemoryNode {
+                    id: None,
+                    tenant_id: TenantId("default".into()),
+                    source_episode_id: None,
+                    payload: serde_json::json!({ "fact": format!("fact {i}") }),
+                    status: "active".into(),
+                    ccl: REALITY_CCL.into(),
+                    is_explicit: true,
+                    support_count: 1,
+                    relevance_score: 1.0,
+                    context_key: None,
+                },
+                &[1.0, i as f32 * 0.01, 0.0, 0.0],
+            )
+            .unwrap();
+        }
+        let ltm_conn = init_db(None as Option<&String>).unwrap();
+        init_ltm_schema(&ltm_conn, DIM).unwrap();
+        let ltm: Arc<dyn LtmRepository> = Arc::new(SqliteLtmRepository::new(ltm_conn));
+        let embedder: Arc<dyn Embedder> = Arc::new(FixedEmbedder);
+        QueryService::new(
+            RetrievalService::new(embedder.clone(), stm as Arc<dyn MemoryRepository>),
+            LtmRetrieval::new(ltm),
+            embedder,
+        )
+    }
+
+    fn stm_request(k: usize) -> QueryRequest {
+        QueryRequest {
+            scope: QueryScope::Stm,
+            tenant: "default".into(),
+            query: "fact".into(),
+            k,
+            time_filter: TimeFilter::default(),
+            ccl: Vec::new(),
+            context_key: None,
+        }
+    }
+
+    /// STM recall honours `k` above 10 (it used to be capped at 10 inside the
+    /// retrieval service, whatever the caller asked for), and below it.
+    #[tokio::test]
+    async fn stm_search_honours_k() {
+        let svc = service_with_facts(30);
+        let many = svc.execute(&stm_request(25)).await.unwrap();
+        assert_eq!(many.stm.len(), 25);
+        let few = svc.execute(&stm_request(3)).await.unwrap();
+        assert_eq!(few.stm.len(), 3);
     }
 }

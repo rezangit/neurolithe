@@ -6,12 +6,8 @@ when nothing fits.
 
 ## Input
 
-| Field | Type | Required | Notes |
-|---|---|---|---|
-| `text` | string | yes | The document text (≤ 512 KiB) |
-| `title` | string | no | Leaf name; defaults to the first line of `text` |
-| `data_id` | string | no | Stable id; if omitted, a new `doc_<uuidv7>` is minted |
-| `tags` | string[] | no | Up to 64 tags |
+See [`remember_document` in the tool reference](./tools.md#remember_document) for the arguments,
+their limits and the tool's annotations.
 
 ## Output
 
@@ -32,7 +28,12 @@ when nothing fits.
 
 ## Behavior
 
-Idempotent by `data_id`: passing an existing id replaces that document (upsert).
+The document's full text (with its title and tags) is kept for keyword recall,
+so `recall_ltm` finds words anywhere in it, not just in the summary.
+
+Idempotent by `data_id`: passing an existing id replaces that document (upsert),
+its kept text included.
 The new copy is placed before the old one is removed, so a failure never loses
 the previous version. Find the document again with
-[`recall_ltm`](./recall-ltm.md) or `trace_dataId`.
+[`recall_ltm`](./recall-ltm.md), or locate it with
+[`inspect`](./tools.md#inspect) `view: "trace"`.
