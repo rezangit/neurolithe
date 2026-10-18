@@ -168,9 +168,18 @@ key is read as a dot. That lets secrets come from the environment:
 4. **Choose the consumer group (`[kafka] group_id`).**
    - Keep the old `group_id` to resume where the previous instance stopped.
    - A new `group_id` replays the whole documents topic from the start. That's
-     safe, because ingest is idempotent, but it costs one embedding per
-     document, and earlier poison messages are forwarded to `dlq.memory` /
-     `parking.lot` again.
+     safe, because ingest is idempotent, and earlier poison messages are
+     forwarded to `dlq.memory` / `parking.lot` again.
+     - Documents stored by 0.4.0 or later are recognised by their content
+       fingerprint and skipped at almost no cost.
+     - **Documents stored by 0.3.x have no fingerprint, so each one is fully
+       reprocessed once.** It is summarised again (a chat-model call, if
+       configured), embedded again and filed again under the current
+       placement rules. Its STM fact is also replaced by a fresh one, which
+       resets its decay, makes it active again if it had been archived, and
+       drops graph links other facts had to it.
+     - On a store upgraded from 0.3.x, budget one full ingest per old
+       document for a replay.
    - The commands group (`<group_id>-cmd`) starts at the end of
      `memory.command` when it has no committed offset, so old commands are
      never replayed (see [Redelivery and offsets](#redelivery-and-offsets)).

@@ -17,7 +17,9 @@
 //! - The event content (title, text, tags; not `ts`) is fingerprinted. If the
 //!   STM fact for the `dataId` already carries that fingerprint and LTM holds
 //!   exactly one leaf for it, the event is a duplicate: nothing is written and
-//!   nothing is distilled ([`IngestOutcome::Unchanged`]).
+//!   nothing is distilled ([`IngestOutcome::Unchanged`]). A fact written
+//!   before fingerprints existed (0.3.x) has none, so the first redelivery of
+//!   such a document is a full upsert, as if it had changed.
 //! - Otherwise the new version **replaces** the old one in both stores: the LTM
 //!   leaf via [`LtmPlacement::replace`], the STM fact via
 //!   [`MemoryRepository::replace_document_node`]. A changed payload never adds
