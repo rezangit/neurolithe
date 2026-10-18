@@ -3,7 +3,7 @@
 All notable changes to NeuroLithe are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions follow SemVer.
 
-## [Unreleased]
+## [0.4.0] — 2026-10-17
 
 **Better search.** `query_memory` and `recall_ltm` rank results by
 reciprocal rank fusion (RRF) of meaning-based and keyword matches, and
